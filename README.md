@@ -1,6 +1,6 @@
 # glass-services
 
-Clean-room Glass system services for Google Glass Explorer Edition: touchpad gestures, head gestures (look up to wake, nod), on-head and wink detection through the glasshub, and the screen wake and sleep policy. Written in Rust, with no Android dependency, so the same daemon runs on an open Android build and on plain Linux. Part of [OpenMyGlass](https://github.com/OpenMyGlass).
+Clean-room Glass system services for Google Glass Explorer Edition: touchpad gestures, head gestures (look up to wake, nudge), on-head and wink detection through the glasshub, and the screen wake and sleep policy. Written in Rust, with no Android dependency, so the same daemon runs on an open Android build and on plain Linux. Part of [OpenMyGlass](https://github.com/OpenMyGlass).
 
 | Document | Content |
 |---|---|

@@ -194,9 +194,9 @@ enum WearSource {
 
 message WearState {
   Wear wear = 1;
-  WearSource source = 4;
   bool snapshot = 2;                         // sent because of Subscribe or GetState, not because of a change
   uint64 timestamp_us = 3;                   // time of the change (for a snapshot: of the last change)
+  WearSource source = 4;
 }
 
 message Wink {
@@ -212,12 +212,12 @@ enum Screen {
 
 message ScreenState {
   Screen screen = 1;
-  string last_sleep_reason = 4;              // with a wake: why the screen last went off
-  uint32 off_ms = 5;                         // with a wake: how long the screen was off
   string reason = 2;                         // wake: "tap", "swipe-forward", "swipe-backward", "don", "look-up", "button",
                                              // "request"; sleep: "timeout", "two-finger-swipe-down", "nudge", "off-head",
-                                             // "request"; or "snapshot"
+                                             // "request"; "dim", "activity" (DIM to ON); or "snapshot"
   uint64 timestamp_us = 3;                   // time of the change (for a snapshot: of the last change)
+  string last_sleep_reason = 4;              // with a wake: why the screen last went off
+  uint32 off_ms = 5;                         // with a wake: how long the screen was off, including suspend (CLOCK_BOOTTIME)
 }
 
 enum ButtonId {

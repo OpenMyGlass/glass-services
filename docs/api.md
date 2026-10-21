@@ -26,7 +26,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 2. `glassd` answers `Welcome{api_version, service_version, capabilities}`, where `api_version` is the lower of the client's and the service's: an older client gets the older behaviour, a newer client learns which version it is talking to and decides whether to continue. `api_version` 0 is `ERROR_CODE_BAD_FRAME`.
    - A frame before `Hello` is `ERROR_CODE_BAD_FRAME` and the connection is closed.
    - A second `Hello` is answered with `Welcome` again and changes nothing else.
-3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
+3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`), and for `TOPIC_LOCATION` the current `LocationStatus` plus the last fix if there is one (`Location{snapshot: true}`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
 Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
@@ -45,7 +45,7 @@ Capabilities say which sources exist on this device or build: `touchpad`, `head`
 | `ERROR_CODE_UNSUPPORTED` | a request this build does not know or cannot serve |
 | `ERROR_CODE_INVALID_ARGUMENT` | a known request with an invalid value |
 | `ERROR_CODE_UNAVAILABLE` | the source exists but failed (for example the device was removed) |
-| `ERROR_CODE_NO_COMPANION` | dictation requested while no companion link is registered |
+| `ERROR_CODE_NO_COMPANION` | dictation requested while no companion link is registered (location reports this through `LocationStatus` instead) |
 
 ## Input focus
 
@@ -83,7 +83,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 ## Buttons (`TOPIC_BUTTON`)
 
 - `Button{BUTTON_ID_CAMERA, action, screen_off}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes, then `BUTTON_ACTION_RELEASE`. On Glass a press takes a picture and a long press records video; that is the app's decision. The camera button wakes the screen and, unlike the touchpad, the waking press is delivered, with `screen_off: true`, so a camera app can start at once.
-- `Button{BUTTON_ID_POWER, ...}` is reported for information. `glassd` itself handles a short press (manual off-head, see Wearing). On route 1, the Android glue keeps Android's own power-key handling out of the short press (a keylayout change for the `twl6030_pwrbutton` device, milestone 3) and leaves the long press to Android (shut-down menu); on route 2, `glassd` handles the long press by asking the init system to power off (milestone 4).
+- `Button{BUTTON_ID_POWER, ...}` is reported for information. `glassd` itself handles a short press (manual off-head, see Wearing). On route 1, the Android glue keeps Android's own power-key handling out of the short press (a keylayout change for the `twl6030_pwrbutton` device, milestone 3) and leaves the long press to Android (shut-down menu); on route 2, `glassd` handles the long press by asking the init system to power off (milestone 5).
 - The camera button still works while the Glass is off the head, as on stock Glass: the press is delivered (`screen_off: true`), but it does not wake the screen.
 - Broadcast to all subscribers.
 
@@ -147,10 +147,13 @@ Speech is not transcribed on Glass: it goes to the phone, which transcribes it o
 
 Glass gets its location from the phone, not from its own GPS chip, which stays asleep (owner decision, 2026-10-22; no GPS HAL is written). The fixes come through the OpenMyGlass companion's bridge protocol (`LocationSubscribe`, `LocationUpdate`, `LocationUnavailable` and the `location` Hello capability, added in [OpenMyGlass#84](https://github.com/OpenMyGlass/OpenMyGlass/pull/84); see its `docs/location.md`), relayed by the companion link provider, as for dictation.
 - A client sends `LocationRequest{interval_ms, high_accuracy}` and subscribes to `TOPIC_LOCATION`. `glassd` asks the phone for the shortest interval and the highest accuracy any client wants, and tells the phone to stop when no client wants fixes (`interval_ms: 0`, or the client disconnects). The phone only tracks while asked, to save its battery, and raises intervals under 1000 ms to 1000 ms. `accuracy_m` 0 means unknown.
-- `Location` frames are broadcast to subscribers. On `Subscribe` and `GetState`, the last known fix (if any) is sent with `snapshot: true`; a client checks `fix_time_ms` and `received_us` to judge its age. Fixes are kept in memory only, never written to storage.
-- `LocationStatus` reports whether fixes flow: `STATE_ACTIVE`, `STATE_IDLE`, `STATE_NO_COMPANION`, `STATE_UNSUPPORTED` (the phone does not list the `location` capability), or `STATE_UNAVAILABLE` with a reason (`permission`, `disabled`, `no-fix`).
-- **Android glue (route 1):** the glue registers a location provider (a mock/test-provider style `LocationProvider` in the system image, named e.g. `openmyglass`, and also feeding the `gps` and `network` names so legacy apps work), and pushes each `Location` into it. Apps then use Android's normal `LocationManager`. The glue holds a `LocationRequest` only while Android apps have location listeners.
+- `interval_ms` is passed to the phone as asked; the phone applies its 1000 ms floor, so a request for 200 ms gets about one fix per second.
+- `Location` frames are broadcast to subscribers; `provider` is copied from the phone's fix. On `Subscribe` and `GetState`, the current `LocationStatus` and the last known fix (if any, with `snapshot: true`) are sent; a client checks `fix_time_ms` and `received_us` to judge the fix's age.
+- `LocationStatus` reports whether fixes flow: `STATE_ACTIVE`, `STATE_IDLE`, `STATE_NO_COMPANION`, `STATE_UNSUPPORTED` (the phone's Hello lacks the `location` capability), or `STATE_UNAVAILABLE` with a reason (`permission`, `disabled`, `no-fix`). Every change is broadcast (for example `STATE_ACTIVE` again when fixes resume), and every `LocationRequest` is answered with the current `LocationStatus` to its sender, subscribed or not.
+- **Privacy:** fixes are kept in memory only and never logged or written to storage. `glassd` drops the last fix when the companion link goes away. Any client allowed on the socket (group `glass`) can read location; version 1 has no per-client permission.
+- **Android glue (route 1):** the glue provides Android's `network` location provider (and possibly `fused`) as a system app built on the platform's location-provider base class, selected through the framework overlay for network location providers; its fixes are then ordinary fixes, not mock ones. The provider's request (interval, accuracy) is mapped to `LocationRequest`, and it sends `interval_ms: 0` when Android no longer needs fixes. The `gps` provider stays absent, since there is no GPS HAL; feeding a `gps` provider from the phone would need either a small GPS HAL fed by `glassd` (it would never wake the chip) or a framework change: an open decision for the owner. Test (mock) providers are not used: they need a developer setting and apps flag or reject their fixes.
 - **Route 2:** apps use this topic directly; a small gpsd-compatible shim is a possible later addition.
+- The capability `location` means `glassd` has a companion link provider able to relay location; whether the phone supports it is reported by `STATE_UNSUPPORTED`.
 
 ## Mock
 

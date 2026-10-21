@@ -294,7 +294,7 @@ message Location {
   optional float speed_mps = 6;
   int64 fix_time_ms = 7;                     // UTC time of the fix, from the phone
   uint64 received_us = 8;                    // CLOCK_MONOTONIC on Glass when the fix arrived
-  string provider = 9;                       // the phone's provider: "gps", "network", "fused"
+  string provider = 9;                       // copied from the phone's fix: "gps", "network", "fused"
   bool snapshot = 10;                        // the last known fix, sent on Subscribe or GetState
 }
 

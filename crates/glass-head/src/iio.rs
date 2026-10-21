@@ -5,7 +5,9 @@
 //! - Records follow the IIO buffer rules: the enabled scan elements in index order, each
 //!   aligned to its storage size, then the 64-bit timestamp aligned to 8 bytes. The Glass
 //!   driver adds a *format byte* (`0x02` gyro, `0x04` accel, ...) in the last padding byte
-//!   before the timestamp; [`Layout`] finds it and [`Layout::decode`] returns it.
+//!   before the timestamp; [`Layout`] finds it and [`Layout::decode`] returns it. (With data
+//!   ending on an 8-byte boundary the driver overwrites the last data byte instead; see
+//!   [`Layout::format_byte`].)
 //! - Raw counts are signed 16-bit over the full scale; `in_anglvel_scale` and
 //!   `in_accel_scale` read back the full scale in degrees per second and in g (not a factor
 //!   per count). The driver does not rotate: `gyro_matrix` and `accl_matrix` are applied
@@ -139,7 +141,10 @@ pub struct Layout {
     /// Data elements with their byte offset, in scan order.
     pub fields: Vec<(Element, usize)>,
     pub timestamp: Option<(Element, usize)>,
-    /// Offset of the format byte, when there is padding before the timestamp for it.
+    /// Offset of the format byte: the last byte before the timestamp, when it is padding.
+    /// When the data end exactly on an 8-byte boundary the driver writes the format byte over
+    /// the last data byte instead (inv_mpu_ring.c); that byte is then not read as a format
+    /// byte. The channel sets glassd uses (6 or 12 data bytes) never end on the boundary.
     pub format_byte: Option<usize>,
     /// Record size in bytes.
     pub size: usize,
@@ -423,14 +428,17 @@ impl Imu {
         let dev = dev.unwrap_or_else(|| PathBuf::from("/dev").join(&base));
         let name = fs::read_to_string(dir.join("name"))?.trim().to_string();
         let cal = Calibration::read(&dir);
-        Ok(Imu {
+        let mut imu = Imu {
             dir,
             dev,
             name,
             cal,
             channels: Channels::default(),
             stream: None,
-        })
+        };
+        // Start from a known state: nothing streams until a detector needs it.
+        imu.power_down();
+        Ok(imu)
     }
 
     pub fn calibration(&self) -> &Calibration {
@@ -462,26 +470,46 @@ impl Imu {
         }
     }
 
-    fn stop(&mut self) -> io::Result<()> {
+    /// Stops the stream and powers the chip down, whatever state it is believed to be in;
+    /// errors are ignored (best effort). Done when opening, when a setup fails, and on drop.
+    pub fn power_down(&mut self) {
         self.stream = None;
-        self.write_if_present("buffer/enable", "0")
+        self.channels = Channels::default();
+        for (attr, v) in [
+            ("buffer/enable", "0"),
+            ("gyro_enable", "0"),
+            ("accl_enable", "0"),
+            ("power_state", "0"),
+        ] {
+            let _ = self.write_if_present(attr, v);
+        }
     }
 
-    /// Starts, reconfigures or stops the stream. With no channel the chip is powered down.
+    /// Starts, reconfigures or stops the stream. With no channel the chip is powered down;
+    /// if the setup fails, it is powered down too.
     pub fn set_channels(&mut self, ch: Channels) -> io::Result<()> {
         if ch == self.channels && (self.stream.is_some() || !ch.any()) {
             return Ok(());
         }
-        // Settings are refused while the buffer runs: stop it first.
-        let r = self.stop();
-        self.channels = Channels::default();
-        r?;
         if !ch.any() {
-            self.write_if_present("gyro_enable", "0")?;
-            self.write_if_present("accl_enable", "0")?;
-            return self.write_if_present("power_state", "0");
+            self.power_down();
+            return Ok(());
         }
+        let r = self.start(ch);
+        if r.is_err() {
+            self.power_down();
+        }
+        r
+    }
+
+    fn start(&mut self, ch: Channels) -> io::Result<()> {
+        // Settings are refused while the buffer runs: stop it first.
+        self.stream = None;
+        self.channels = Channels::default();
+        self.write_if_present("buffer/enable", "0")?;
         self.write_if_present("power_state", "1")?;
+        // The scales and matrices read back reliably only with the chip awake.
+        self.cal = Calibration::read(&self.dir);
         let rate = if ch.gyro { RATE_HZ } else { LOOK_UP_RATE_HZ };
         self.write_if_present("sampling_frequency", &rate.to_string())?;
         self.write_if_present("gyro_enable", if ch.gyro { "1" } else { "0" })?;
@@ -567,7 +595,7 @@ impl Imu {
 
 impl Drop for Imu {
     fn drop(&mut self) {
-        let _ = self.set_channels(Channels::default());
+        self.power_down();
     }
 }
 
@@ -663,7 +691,8 @@ mod tests {
             el(TIMESTAMP, 13, "le:s64/64>>0"),
         ]);
         assert_eq!((l.size, l.format_byte), (16, Some(7)));
-        // Four 16-bit values fill 8 bytes: no padding, so no format byte.
+        // Four 16-bit values end on the 8-byte boundary: the driver would overwrite the last
+        // data byte with its format byte, so none is read.
         let l = Layout::new(vec![
             el("in_anglvel_x", 4, "le:s16/16>>0"),
             el("in_anglvel_y", 5, "le:s16/16>>0"),
@@ -795,6 +824,53 @@ mod tests {
         assert!(imu.fd().is_none());
         assert_eq!(rd("buffer/enable"), "0\n");
         assert_eq!(rd("power_state"), "0\n");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn powers_down_on_open_failure_and_drop() {
+        let root = fake_device("powerdown");
+        let dir = root.join("iio:device0");
+        let rd = |f: &str| fs::read_to_string(dir.join(f)).unwrap();
+        for f in ["power_state", "buffer/enable", "gyro_enable", "accl_enable"] {
+            fs::write(dir.join(f), "1\n").unwrap();
+        }
+        // Open: powered down whatever state it was left in.
+        let mut imu = Imu::open(&dir, Some(root.join("no-such-node"))).unwrap();
+        for f in ["power_state", "buffer/enable", "gyro_enable", "accl_enable"] {
+            assert_eq!(rd(f), "0\n", "{f}");
+        }
+        // A setup that fails (no character device) powers down again.
+        let both = Channels {
+            accel: true,
+            gyro: true,
+        };
+        assert!(imu.set_channels(both).is_err());
+        assert_eq!(rd("power_state"), "0\n");
+        assert_eq!(rd("buffer/enable"), "0\n");
+        assert_eq!(imu.channels(), Channels::default());
+        // Drop: powered down even though it believes it is off.
+        fs::write(dir.join("power_state"), "1\n").unwrap();
+        drop(imu);
+        assert_eq!(rd("power_state"), "0\n");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scales_are_read_again_when_the_chip_wakes() {
+        let root = fake_device("rescale");
+        let dir = root.join("iio:device0");
+        let node = root.join("node");
+        fs::write(&node, b"").unwrap();
+        let mut imu = Imu::open(&dir, Some(node)).unwrap();
+        assert_eq!(imu.calibration().accel_full_g, 2.0);
+        fs::write(dir.join("in_accel_scale"), "4\n").unwrap();
+        imu.set_channels(Channels {
+            accel: true,
+            gyro: false,
+        })
+        .unwrap();
+        assert_eq!(imu.calibration().accel_full_g, 4.0);
         fs::remove_dir_all(&root).unwrap();
     }
 

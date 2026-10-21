@@ -101,4 +101,6 @@ Split into pull requests that each build and pass on their own.
 - [ ] Nudge: count detections and false positives over normal use (walking, talking, turning the head) and tune `NudgeConfig`.
 - [ ] Relative look-up fires at about 17° with a client's `HeadRequest`.
 - [ ] Power: with head wake on and the screen off, the 10 Hz accelerometer interrupt wakes the CPU; measure the battery drain and whether Android still suspends. Without the DMP firmware this is the cost of look-up to wake (owner decision if it is too high).
-- [ ] The IMU stops (`buffer/enable` 0, `power_state` 0) off the head and when no detector runs.
+- [ ] The IMU stops (`buffer/enable` 0, `power_state` 0) off the head, when no detector runs, at start and when `glassd` exits.
+- [ ] The scales read back after `power_state` 1 match the driver defaults (±2 g, ±2000 dps).
+- [ ] Open decision for the owner: on route 1 the IMU belongs to Android's sensors HAL, so `glassd` defaults to `--head off` on Android and head gestures would come through the M3 glue from Android sensors; alternatively the HAL is dropped and `glassd` takes the IMU (`--head on`). On route 2 `glassd` owns it.

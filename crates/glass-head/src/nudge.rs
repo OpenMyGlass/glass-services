@@ -9,7 +9,8 @@
 //! 2. A candidate starts when the pitch rate rises above [`NudgeConfig::up_rate`]
 //!    (1.2 rad/s, the "moderate" preset of the stock threshold detector).
 //! 3. It completes when the head comes back: the pitch rate falls below
-//!    `-return_rate` (0.4 rad/s, ours) within [`NudgeConfig::max_s`] (0.75 s, the stock
+//!    `-return_rate` (0.4 rad/s: the size of the "liberal" nod-down preset of the stock
+//!    detectors, head-gestures.md §7; using it for the return of a nudge is our choice) within [`NudgeConfig::max_s`] (0.75 s, the stock
 //!    wait-for-down timeout). A slower motion, such as looking up and staying up, is not a
 //!    nudge.
 //! 4. The other axes must be quiet over the last 1.0 s (stock limits): with the largest

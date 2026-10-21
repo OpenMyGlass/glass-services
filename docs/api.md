@@ -96,7 +96,9 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 - `HEAD_GESTURE_KIND_RELATIVE_LOOK_UP`: the pitch rose by 17° or more within 5 s, from any start angle (stock uses it to reveal a notification). It needs the gyroscope read every 20 ms, so it runs only while at least one client subscribed to `TOPIC_HEAD` has asked for it with `HeadRequest{relative_look_up: true}`, and while it runs it replaces the global look-up, as on stock Glass.
 - Inhibition windows: no nudge within 1000 ms of a look-up, relative look-up or nudge; no look-up within 500 ms of a nudge. A client can also inhibit look-up for a while with `HeadRequest{inhibit_look_up_ms}` (stock: the home card does it for 5 s while a notification is shown); 0 clears it. The inhibition is global.
 - `HeadRequest` replaces the sender's previous wishes (`relative_look_up`, `nudge`); they count while the client is subscribed to `TOPIC_HEAD` and end when it disconnects. `inhibit_look_up_ms` acts only when it is present.
-- Nothing runs off the head. Rates: 10 Hz for the accelerometer alone (look-up with the screen off; each sample wakes the CPU, see the device checklist), 50 Hz when the gyroscope runs.
+- `HeadRequest` is fire-and-forget: there is no answer, and with no head source it is accepted and has no effect.
+- Nothing runs off the head. Rates: 10 Hz for the accelerometer alone (look-up with the screen off; each sample wakes the CPU, see the device checklist), 50 Hz when the gyroscope runs. After a look-up the accelerometer keeps running until the look-down, so a user who keeps the head up keeps it streaming with the screen on; the same holds when detection starts with the head already up.
+- **Who owns the IMU (open, owner to confirm):** on route 2 `glassd` reads it through IIO. On route 1 the IMU belongs to Android's sensors HAL, so `glassd` does not open it by default on Android (`--head off`, the `head` capability is absent); head gestures there would come through the Android glue from Android's sensors (milestone 3), unless the owner drops the HAL and `glassd` takes the IMU (`--head on`).
 
 ## Wearing and wink (`TOPIC_WEAR`, milestone 2)
 

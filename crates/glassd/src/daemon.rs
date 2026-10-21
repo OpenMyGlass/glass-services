@@ -1295,6 +1295,8 @@ mod tests {
             power: Source::Off,
             touchpad_sysfs: None,
             state_dir: None,
+            iio: None,
+            iio_dev: None,
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

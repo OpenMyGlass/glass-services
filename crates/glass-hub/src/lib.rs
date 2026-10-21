@@ -4,9 +4,10 @@
 //!   enables, thresholds), with an allow-list of the attributes that may be written;
 //! - [`wear`]: the on-head state machine (sensor, forced, power key, hinge), pure.
 //!
-//! Wink: the firmware's low-power wink interrupt (`wink`) is taken as the wink. The stock
-//! system confirms it with a CPU classifier on the raw proximity stream; that classifier and
-//! its models are not reproduced, so this is the "low-confidence" path of glasshub.md §8.
+//! Wink: the firmware's low-power wink interrupt (`wink`) is taken as the wink, without the
+//! confirmation the stock system adds (a CPU classifier on the raw proximity stream, whose
+//! models are not reproduced). glasshub.md §8 offers this as an option; it is unconfirmed
+//! and expected to give false positives.
 
 pub mod sysfs;
 pub mod wear;

@@ -29,8 +29,8 @@ cargo run -p glassd -- --device-name sensor00fn11              # on a Glass (def
 
 On a Glass, `glassd` also opens the glasshub (`--glasshub`, default `/sys/bus/i2c/devices/4-0035`),
 the camera and power buttons (found by name, or `--camera-device` / `--power-device`), the touchpad's
-`sleepmode` (`--touchpad-sysfs`), and blanks the panel with `FBIOBLANK` (`--display fb[:path]`, or
-`--display log`). Settings are stored in `--state-dir` (default `$GLASSD_STATE_DIR`, else
+`sleepmode` (`--touchpad-sysfs`), and on Linux blanks the panel with `FBIOBLANK` (`--display
+fb[:path]`; on Android the framework does, and the default is `--display log`). Settings are stored in `--state-dir` (default `$GLASSD_STATE_DIR`, else
 `/data/glassd` on Android, `/var/lib/glassd` elsewhere). `glassd --help` lists every option.
 
 Cross builds (as in CI): `cargo build --release --target armv7-linux-androideabi` with the NDK's

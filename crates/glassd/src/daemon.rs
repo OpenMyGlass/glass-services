@@ -134,19 +134,25 @@ pub struct Daemon {
     store: Option<SettingsStore>,
 }
 
-/// Writes `v` with `write` unless it is the value last written.
+/// Writes `v` with `write` unless it is the value last written; true if it was written.
 fn sync_attr(
     cur: &mut Option<bool>,
     v: bool,
     name: &str,
     write: impl FnOnce(bool) -> io::Result<()>,
-) {
+) -> bool {
     if *cur == Some(v) {
-        return;
+        return false;
     }
     match write(v) {
-        Ok(()) => *cur = Some(v),
-        Err(e) => warn!("glasshub {name}: {e}"),
+        Ok(()) => {
+            *cur = Some(v);
+            true
+        }
+        Err(e) => {
+            warn!("glasshub {name}: {e}");
+            false
+        }
     }
 }
 
@@ -1055,11 +1061,25 @@ impl Daemon {
         let pause = self.wear.hub_paused();
         let Some(h) = &self.glasshub else { return };
         let w = &mut self.hub_written;
-        sync_attr(&mut w.detection, detection, "on-head detection", |v| {
+        let armed = sync_attr(&mut w.detection, detection, "on-head detection", |v| {
             h.set_on_head_detection(v)
-        });
+        }) && detection;
         sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
-        sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v));
+        let resumed = sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v)) && !pause;
+        // The state may have changed while detection was off or the hub paused, without a
+        // notification: read it again. (This ends: a second pass writes nothing.)
+        if armed || resumed {
+            self.read_don_doff();
+        }
+    }
+
+    /// The glasshub failed: stop using it. Without it there is no on-head sensing (forced on
+    /// the head) and no wink.
+    fn drop_glasshub(&mut self, why: &str) {
+        warn!("glasshub read failed ({why}); glasshub disabled");
+        self.glasshub = None;
+        let u = self.wear.set_detection(now().mono_us, false);
+        self.wear_update(u);
     }
 
     /// Re-reads `don_doff` after a notification (or at start).
@@ -1071,10 +1091,7 @@ impl Daemon {
                 self.wear_update(u);
             }
             Ok(None) => warn!("glasshub don_doff: unexpected value"),
-            Err(e) => {
-                warn!("glasshub read failed ({e}); glasshub disabled");
-                self.glasshub = None;
-            }
+            Err(e) => self.drop_glasshub(&e.to_string()),
         }
     }
 
@@ -1082,11 +1099,10 @@ impl Daemon {
     fn read_wink(&mut self) {
         let Some(h) = &mut self.glasshub else { return };
         match h.ack_wink() {
+            // 0: no wink pending (a spurious wake, or already acknowledged).
+            Ok(0) => {}
             Ok(_) => self.wink(now().mono_us),
-            Err(e) => {
-                warn!("glasshub read failed ({e}); glasshub disabled");
-                self.glasshub = None;
-            }
+            Err(e) => self.drop_glasshub(&e.to_string()),
         }
     }
 
@@ -1134,6 +1150,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn fake_hub_daemon(name: &str) -> (Daemon, PathBuf) {
+        let d = dir(name);
+        let hub = d.join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        for (f, v) in [("version", "1.14\n"), ("don_doff", "1\n"), ("wink", "0\n")] {
+            std::fs::write(hub.join(f), v).unwrap();
+        }
+        for f in glass_hub::sysfs::WRITABLE {
+            std::fs::write(hub.join(f), "").unwrap();
+        }
+        let opts = Options {
+            socket: d.join("glassd.sock"),
+            mock: false,
+            device: Some(d.join("no-touchpad")),
+            device_name: TOUCHPAD_NAME.into(),
+            invert_x: false,
+            invert_y: false,
+            screen_off_input: ScreenOffInput::Touches,
+            glasshub: Some(hub.clone()),
+            gaze_params: None,
+            camera: Source::Off,
+            power: Source::Off,
+            touchpad_sysfs: None,
+            state_dir: None,
+        };
+        let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        (daemon, hub)
+    }
+
+    fn detection_on(d: &mut Daemon) {
+        let mut s = d.settings();
+        s.on_head_detection_enabled = Some(true);
+        d.hub.set_settings_source(s);
+        d.settings_changed(&s);
+    }
+
+    #[test]
+    fn don_doff_is_read_again_when_detection_is_armed() {
+        let (mut d, hub) = fake_hub_daemon("rearm");
+        assert!(d.wear.on_head());
+        // Changed while detection was off: no notification came.
+        std::fs::write(hub.join("don_doff"), "0\n").unwrap();
+        detection_on(&mut d);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("don_doff_enable")).unwrap(),
+            "1\n"
+        );
+        assert!(!d.wear.on_head(), "read again after don_doff_enable = 1");
+    }
+
+    #[test]
+    fn don_doff_is_read_again_when_the_hub_resumes() {
+        let (mut d, hub) = fake_hub_daemon("resume");
+        detection_on(&mut d);
+        let u = d.wear.power_key(now().mono_us); // forced off: hub paused
+        d.wear_update(u);
+        assert_eq!(std::fs::read_to_string(hub.join("pause")).unwrap(), "1\n");
+        std::fs::write(hub.join("don_doff"), "0\n").unwrap();
+        // Power key again: timed on-head (detection on), hub resumed and read again; the
+        // timed period still reports on the head, but the reading is kept for the sensor.
+        let u = d.wear.power_key(now().mono_us);
+        d.wear_update(u);
+        assert_eq!(std::fs::read_to_string(hub.join("pause")).unwrap(), "0\n");
+        let u = d.wear.on_timeout(now().mono_us + 31_000_000);
+        assert_eq!(u.map(|u| u.state.wear), Some(Wear::OffHead as i32));
+    }
+
+    #[test]
+    fn a_failed_glasshub_forces_on_head_and_drops_wink() {
+        let (mut d, _hub) = fake_hub_daemon("drop");
+        detection_on(&mut d);
+        assert!(d.wear.detection());
+        d.drop_glasshub("test");
+        assert!(d.glasshub.is_none());
+        assert!(!d.wear.detection());
+        assert!(d.wear.on_head());
+        assert_eq!(d.wear.state().source, WearSource::Forced as i32);
+        // Turning detection on again has no effect without a hub.
+        detection_on(&mut d);
+        assert!(!d.wear.detection());
     }
 
     #[test]

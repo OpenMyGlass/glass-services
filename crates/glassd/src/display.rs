@@ -60,8 +60,16 @@ pub struct FbDisplay {
 }
 
 impl FbDisplay {
+    /// Opens a framebuffer; anything but a character device is refused.
     pub fn open(path: impl AsRef<Path>) -> io::Result<FbDisplay> {
+        use std::os::unix::fs::FileTypeExt;
         let path = path.as_ref();
+        if !std::fs::metadata(path)?.file_type().is_char_device() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a character device", path.display()),
+            ));
+        }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(FbDisplay {
             file,
@@ -151,13 +159,22 @@ mod tests {
     }
 
     #[test]
-    fn fb_on_a_regular_file_fails_quietly() {
+    fn fb_must_be_a_character_device() {
         let p = std::env::temp_dir().join(format!("glassd-fb-{}", std::process::id()));
         std::fs::write(&p, b"").unwrap();
-        let mut d = FbDisplay::open(&p).unwrap();
+        assert_eq!(
+            FbDisplay::open(&p).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn fb_ioctl_failure_is_logged() {
+        // /dev/null is a character device without FBIOBLANK.
+        let mut d = FbDisplay::open("/dev/null").unwrap();
         d.set(Screen::Off); // ENOTTY: logged, no panic
         assert_eq!(d.current, None);
-        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

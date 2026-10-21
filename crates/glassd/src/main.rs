@@ -21,7 +21,8 @@ usage: glassd [options]
   --display <fb[:path]|log>
                           screen back end: FBIOBLANK on the framebuffer (default
                           /dev/graphics/fb0 on Android, /dev/fb0 elsewhere), or log only
-                          (default: fb, log with --mock)
+                          (default: fb on Linux; log on Android, where the framework
+                          blanks the panel, and with --mock)
   --glasshub <dir|none>   glasshub sysfs directory (default /sys/bus/i2c/devices/4-0035)
   --gaze-params <path>    take the glasshub thresholds from this stock parameter file
                           (default /data/system/gaze/gaze_params.txt, if it exists)
@@ -135,7 +136,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
 fn display(choice: DisplayChoice, mock: bool) -> Box<dyn Display> {
     let path = match choice {
         DisplayChoice::Log => return Box::new(LoggingDisplay),
-        DisplayChoice::Default if mock => return Box::new(LoggingDisplay),
+        // On Android (route 1) the framework owns panel blanking (PowerManager, SurfaceFlinger,
+        // hwcomposer); the glue turns ScreenState into PowerManager calls (milestone 3).
+        DisplayChoice::Default if mock || cfg!(target_os = "android") => {
+            return Box::new(LoggingDisplay);
+        }
         DisplayChoice::Default | DisplayChoice::Fb(None) => default_fb(),
         DisplayChoice::Fb(Some(p)) => p,
     };

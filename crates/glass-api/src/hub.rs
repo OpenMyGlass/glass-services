@@ -6,8 +6,9 @@
 //! carry out. Both servers use it, so they behave the same.
 
 use crate::proto::{
-    ClientFrame, ErrorCode, FocusState, Hello, ScreenState, Scroll, ServiceError, ServiceFrame,
-    Settings, Topic, WearState, Welcome, client_frame, screen_request, service_frame,
+    ClientFrame, ErrorCode, FocusState, Hello, LocationStatus, ScreenState, Scroll, ServiceError,
+    ServiceFrame, Settings, Topic, WearState, Welcome, client_frame, location_status,
+    screen_request, service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -149,6 +150,7 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::Settings(_) => Topic::Settings,
         B::DictationState(_) | B::Transcript(_) => Topic::Dictation,
         B::Button(_) => Topic::Button,
+        B::Location(_) | B::LocationStatus(_) => Topic::Location,
         B::Welcome(_) | B::Error(_) | B::FocusState(_) => return None,
     })
 }
@@ -336,6 +338,17 @@ impl Hub {
             }
             // Nothing to cancel or confirm without a companion link.
             Some(B::DictationCancel(_)) | Some(B::DictationConfirm(_)) => {}
+            // Location comes from the phone (milestone 4); with no companion link there is none.
+            Some(B::LocationRequest(_)) => {
+                let status = LocationStatus {
+                    state: location_status::State::NoCompanion as i32,
+                    reason: String::new(),
+                };
+                fx.push(Effect::Send(
+                    id,
+                    frame(service_frame::Body::LocationStatus(status)),
+                ));
+            }
         }
         fx
     }
@@ -927,5 +940,27 @@ mod tests {
             code(&mut hub, start("poem", "")),
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn location_request_without_companion_reports_no_companion() {
+        use crate::proto::LocationRequest;
+        let mut hub = Hub::new("1", &[]);
+        let a = connect(&mut hub, &[]);
+        let fx = hub.on_frame(
+            a,
+            cf(C::LocationRequest(LocationRequest {
+                interval_ms: 1000,
+                high_accuracy: false,
+            })),
+        );
+        let out = sends(&fx);
+        assert_eq!(out.len(), 1);
+        match &out[0].1 {
+            service_frame::Body::LocationStatus(st) => {
+                assert_eq!(st.state, location_status::State::NoCompanion as i32)
+            }
+            other => panic!("expected LocationStatus, got {other:?}"),
+        }
     }
 }

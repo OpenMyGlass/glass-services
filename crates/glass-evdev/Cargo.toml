@@ -1,5 +1,6 @@
 [package]
 name = "glass-evdev"
+description = "Minimal evdev reader over libc: input_event parsing, EVIOCGNAME, EVIOCGABS, EVIOCSCLOCKID"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true

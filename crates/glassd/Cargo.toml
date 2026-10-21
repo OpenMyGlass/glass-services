@@ -1,0 +1,15 @@
+[package]
+name = "glassd"
+description = "Glass services daemon: touchpad gestures, screen policy, socket server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glass-api.workspace = true
+glass-evdev.workspace = true
+glass-gesture.workspace = true
+libc.workspace = true
+

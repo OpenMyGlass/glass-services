@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/glass-api", "crates/glass-gesture", "crates/glass-evdev", "crates/glassd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/OpenMyGlass/glass-services"
+rust-version = "1.88"
+
+[workspace.dependencies]
+glass-api = { path = "crates/glass-api" }
+glass-gesture = { path = "crates/glass-gesture" }
+glass-evdev = { path = "crates/glass-evdev" }
+libc = "0.2"
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.10"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

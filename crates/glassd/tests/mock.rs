@@ -1,13 +1,29 @@
 //! Spawns `glassd --mock` on a temporary socket and drives it through standard input.
 
 use glass_api::Client;
-use glass_api::proto::{GestureKind, Screen, ServiceFrame, Topic, service_frame::Body};
+use glass_api::proto::{
+    ButtonAction, GestureKind, Screen, ServiceFrame, SetSettings, Settings, Topic, Wear,
+    WearSource, client_frame::Body as Body2, service_frame::Body,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(5);
+/// Keeps a non-mock daemon away from the host's devices.
+const NO_HARDWARE: &[&str] = &[
+    "--display",
+    "log",
+    "--glasshub",
+    "none",
+    "--camera-device",
+    "none",
+    "--power-device",
+    "none",
+    "--touchpad-sysfs",
+    "none",
+];
 /// Handshake timeout for the integration tests (slow CI runners).
 const HANDSHAKE: Duration = Duration::from_secs(20);
 
@@ -25,6 +41,13 @@ fn spawn(cmd: &mut Command) -> ChildGuard {
     ChildGuard(cmd.spawn().expect("spawn glassd"))
 }
 
+fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("glassd-it-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 struct Mock {
     child: ChildGuard,
     stdin: ChildStdin,
@@ -34,14 +57,18 @@ struct Mock {
 
 impl Mock {
     fn start(name: &str) -> Mock {
-        let dir = std::env::temp_dir().join(format!("glassd-it-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        Mock::start_in(&test_dir(name), &[])
+    }
+
+    /// Starts in `dir` (kept when the mock is dropped and started again).
+    fn start_in(dir: &std::path::Path, args: &[&str]) -> Mock {
+        let dir = dir.to_path_buf();
         let socket = dir.join("glassd.sock");
         let mut child = spawn(
             Command::new(env!("CARGO_BIN_EXE_glassd"))
                 .args(["--mock", "--socket"])
                 .arg(&socket)
+                .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit()),
@@ -71,6 +98,12 @@ impl Mock {
     fn client(&self, topics: &[Topic]) -> Client {
         let mut c = Client::connect_with_timeout(&self.socket, "it", HANDSHAKE).unwrap();
         c.subscribe(topics).unwrap();
+        // Wait for the answer to a GetState, so the subscription is in place before a mock
+        // command (read from another descriptor) is sent.
+        c.send(Body2::GetState(Default::default())).unwrap();
+        c.recv_until(T, |f| matches!(f.body, Some(Body::FocusState(_))))
+            .unwrap()
+            .expect("GetState answer");
         c
     }
 }
@@ -164,9 +197,6 @@ fn scroll_then_swipe_ordering_over_the_socket() {
 fn two_finger_swipe_down_sleeps_and_the_waking_tap_is_consumed() {
     let mut m = Mock::start("screen");
     let mut c = m.client(&[Topic::Gesture, Topic::Screen]);
-    // Snapshot first.
-    let snap = c.recv(Some(T)).unwrap().unwrap();
-    assert!(matches!(snap.body, Some(Body::ScreenState(ref s)) if s.reason == "snapshot"));
     focused(&mut c);
 
     m.send("swipe down 2");
@@ -265,6 +295,9 @@ fn touchpad_events_from_a_fake_device() {
             .arg(&socket)
             .arg("--device")
             .arg(&fifo)
+            .args(NO_HARDWARE)
+            .arg("--state-dir")
+            .arg(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit()),
@@ -303,12 +336,37 @@ fn touchpad_events_from_a_fake_device() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn wear(f: &ServiceFrame) -> Option<(Wear, WearSource)> {
+    match &f.body {
+        Some(Body::WearState(w)) if !w.snapshot => Some((
+            Wear::try_from(w.wear).unwrap(),
+            WearSource::try_from(w.source).unwrap(),
+        )),
+        _ => None,
+    }
+}
+
+fn set_settings(c: &mut Client, s: Settings) -> Settings {
+    c.send(Body2::SetSettings(SetSettings { settings: Some(s) }))
+        .unwrap();
+    let f = c
+        .recv_until(T, |f| matches!(f.body, Some(Body::Settings(_))))
+        .unwrap()
+        .unwrap();
+    let Some(Body::Settings(s)) = f.body else {
+        unreachable!()
+    };
+    s
+}
+
 #[test]
 fn off_head_camera_is_delivered_without_waking() {
     let mut m = Mock::start("offhead");
-    let mut c = m.client(&[Topic::Screen, Topic::Button]);
-    let _snapshot = c.recv(Some(T)).unwrap().unwrap();
-    m.send("wear off");
+    let mut c = m.client(&[Topic::Screen, Topic::Button, Topic::Wear]);
+    // A short power press forces off the head.
+    m.send("power");
+    let f = c.recv_until(T, |f| wear(f).is_some()).unwrap().unwrap();
+    assert_eq!(wear(&f), Some((Wear::OffHead, WearSource::PowerKey)));
     let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
     assert_eq!(screen(&f), Some((Screen::Off, "off-head".into())));
     m.send("camera");
@@ -335,4 +393,239 @@ fn off_head_camera_is_delivered_without_waking() {
             .unwrap()
             .is_none()
     );
+    // The next power press puts it back on the head and wakes the screen (quick timeout).
+    m.send("power");
+    let f = c.recv_until(T, |f| wear(f).is_some()).unwrap().unwrap();
+    assert_eq!(wear(&f), Some((Wear::OnHead, WearSource::PowerKey)));
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "don".into())));
+}
+
+#[test]
+fn wear_sensor_needs_on_head_detection() {
+    let mut m = Mock::start("sensor");
+    let mut c = m.client(&[Topic::Screen, Topic::Wear, Topic::Settings]);
+    m.send("wear off");
+    assert!(
+        c.recv_until(Duration::from_millis(300), |f| wear(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+    // Turning detection on defers to the sensor at once: the stored reading applies.
+    let s = set_settings(
+        &mut c,
+        Settings {
+            on_head_detection_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    assert_eq!(s.on_head_detection_enabled, Some(true));
+    let f = c.recv_until(T, |f| wear(f).is_some()).unwrap().unwrap();
+    assert_eq!(wear(&f), Some((Wear::OffHead, WearSource::Sensor)));
+    m.send("wear on");
+    let f = c.recv_until(T, |f| wear(f).is_some()).unwrap().unwrap();
+    assert_eq!(wear(&f), Some((Wear::OnHead, WearSource::Sensor)));
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "don".into())));
+    // The hinge forces off the head.
+    m.send("hinge closed");
+    let f = c.recv_until(T, |f| wear(f).is_some()).unwrap().unwrap();
+    assert_eq!(wear(&f), Some((Wear::OffHead, WearSource::Hinge)));
+}
+
+#[test]
+fn wink_and_long_press() {
+    let mut m = Mock::start("wink");
+    let mut c = m.client(&[Topic::Wear, Topic::Button]);
+    m.send("wink");
+    assert!(
+        c.recv_until(Duration::from_millis(300), |f| matches!(
+            f.body,
+            Some(Body::Wink(_))
+        ))
+        .unwrap()
+        .is_none()
+    );
+    set_settings(
+        &mut c,
+        Settings {
+            wink_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    m.send("wink");
+    c.recv_until(T, |f| matches!(f.body, Some(Body::Wink(_))))
+        .unwrap()
+        .expect("wink");
+    m.send("camera long");
+    let mut actions = Vec::new();
+    while actions.len() < 2 {
+        let f = c
+            .recv_until(T, |f| matches!(f.body, Some(Body::Button(_))))
+            .unwrap()
+            .unwrap();
+        let Some(Body::Button(b)) = f.body else {
+            unreachable!()
+        };
+        actions.push(ButtonAction::try_from(b.action).unwrap());
+    }
+    assert_eq!(
+        actions,
+        vec![ButtonAction::LongPress, ButtonAction::Release]
+    );
+}
+
+#[test]
+fn settings_are_stored_across_restarts() {
+    // The state directory is outside the mock's directory, which is removed with the mock.
+    let state = test_dir("store-state");
+    let state_s = state.to_str().unwrap();
+    {
+        let m = Mock::start_in(&test_dir("store-1"), &["--state-dir", state_s]);
+        let mut c = m.client(&[]);
+        set_settings(
+            &mut c,
+            Settings {
+                screen_timeout_ms: Some(42_000),
+                head_wake_angle_deg: Some(20.0),
+                ..Default::default()
+            },
+        );
+        // Dropping the mock kills it.
+        drop(m);
+    }
+    assert!(state.join("settings").exists());
+    let m = Mock::start_in(&test_dir("store-2"), &["--state-dir", state_s]);
+    let mut c = m.client(&[Topic::Settings]);
+    c.send(Body2::GetState(Default::default())).unwrap();
+    let f = c
+        .recv_until(T, |f| matches!(f.body, Some(Body::Settings(_))))
+        .unwrap()
+        .unwrap();
+    let Some(Body::Settings(s)) = f.body else {
+        unreachable!()
+    };
+    assert!(s.snapshot);
+    assert_eq!(s.screen_timeout_ms, Some(42_000));
+    assert_eq!(s.head_wake_angle_deg, Some(20.0));
+    drop(m);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// A non-mock daemon on fake hardware: a glasshub sysfs directory, a camera button FIFO and
+/// a touchpad sysfs directory.
+#[test]
+fn fake_glasshub_camera_and_touchpad_sysfs() {
+    use glass_evdev::{EVENT_SIZE, RawInputEvent};
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = test_dir("hw");
+    let hub = dir.join("glasshub");
+    std::fs::create_dir_all(&hub).unwrap();
+    for (f, v) in [("version", "1.14\n"), ("don_doff", "1\n"), ("wink", "0\n")] {
+        std::fs::write(hub.join(f), v).unwrap();
+    }
+    for f in glass_hub::sysfs::WRITABLE {
+        std::fs::write(hub.join(f), "").unwrap();
+    }
+    let tp = dir.join("touchpad");
+    std::fs::create_dir_all(&tp).unwrap();
+    std::fs::write(tp.join("sleepmode"), "").unwrap();
+    let fifo = dir.join("camera");
+    let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: plain libc calls with a valid path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    assert!(fd >= 0);
+    let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    let socket = dir.join("glassd.sock");
+    let _child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(NO_HARDWARE)
+            .arg("--glasshub")
+            .arg(&hub)
+            .arg("--gaze-params")
+            .arg(dir.join("no-such-file"))
+            .arg("--camera-device")
+            .arg(&fifo)
+            .arg("--touchpad-sysfs")
+            .arg(&tp)
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    let deadline = Instant::now() + T;
+    while !socket.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut cl = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
+    for cap in ["wear", "wink", "button-camera", "screen"] {
+        assert!(cl.has_capability(cap), "{cap}");
+    }
+    for cap in ["mock", "touchpad", "button-power", "hinge"] {
+        assert!(!cl.has_capability(cap), "{cap}");
+    }
+    let read = |f: &str| std::fs::read_to_string(hub.join(f)).unwrap();
+    // Thresholds at start (defaults), detection and wink off, not paused.
+    assert_eq!(read("don_threshold"), "450\n");
+    assert_eq!(read("doff_threshold"), "400\n");
+    assert_eq!(read("don_max_threshold"), "2000\n");
+    assert_eq!(read("detector_gain"), "2\n");
+    assert_eq!(read("don_doff_enable"), "0\n");
+    assert_eq!(read("wink_enable"), "0\n");
+    assert_eq!(read("pause"), "0\n");
+    assert_eq!(
+        std::fs::read_to_string(tp.join("sleepmode")).unwrap(),
+        "0\n"
+    );
+
+    cl.subscribe(&[Topic::Button, Topic::Wear]).unwrap();
+    set_settings(
+        &mut cl,
+        Settings {
+            on_head_detection_enabled: Some(true),
+            wink_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    assert_eq!(read("don_doff_enable"), "1\n");
+    assert_eq!(read("wink_enable"), "1\n");
+    assert_eq!(read("wink_flag_enable"), "1\n");
+
+    let ev = |value: i32, ms: u64| RawInputEvent {
+        tv_sec: (ms / 1000) as _,
+        tv_usec: ((ms % 1000) * 1000) as _,
+        type_: 1,
+        code: 212,
+        value,
+    };
+    let mut bytes = Vec::new();
+    for raw in [ev(1, 1000), ev(0, 1100)] {
+        // SAFETY: RawInputEvent is plain old data.
+        let b: &[u8] = unsafe {
+            std::slice::from_raw_parts((&raw as *const RawInputEvent).cast(), EVENT_SIZE)
+        };
+        bytes.extend_from_slice(b);
+    }
+    writer.write_all(&bytes).unwrap();
+    let f = cl
+        .recv_until(T, |f| matches!(f.body, Some(Body::Button(_))))
+        .unwrap()
+        .unwrap();
+    let Some(Body::Button(b)) = f.body else {
+        unreachable!()
+    };
+    assert_eq!(b.button, glass_api::proto::ButtonId::Camera as i32);
+    assert_eq!(b.action, ButtonAction::Press as i32);
+    // The settings file was written.
+    assert!(dir.join("state/settings").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

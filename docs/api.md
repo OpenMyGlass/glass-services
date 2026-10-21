@@ -29,7 +29,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`), and for `TOPIC_LOCATION` the current `LocationStatus` plus the last fix if there is one (`Location{snapshot: true}`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
-Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
+Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent. `glassd` advertises a hardware source only when it found it at start: `touchpad`, `button-camera` and `button-power` by input device name, `wink` when the glasshub is present, `head` when the IMU is present; `screen` and `wear` are always there (without a glasshub the wear is forced or set with the power key); `hinge` only in the mock until the hinge switch is identified on a device.
 
 ### Requests and errors
 
@@ -82,7 +82,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 
 ## Buttons (`TOPIC_BUTTON`)
 
-- `Button{BUTTON_ID_CAMERA, action, screen_off}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes, then `BUTTON_ACTION_RELEASE`. On Glass a press takes a picture and a long press records video; that is the app's decision. The camera button wakes the screen and, unlike the touchpad, the waking press is delivered, with `screen_off: true`, so a camera app can start at once.
+- `Button{BUTTON_ID_CAMERA, action, screen_off}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes (500 ms, our value: Android's long-press time), then `BUTTON_ACTION_RELEASE`. `screen_off` is the screen state when the button went down, for every frame of that press. On Glass a press takes a picture and a long press records video; that is the app's decision. The camera button wakes the screen when it goes down and, unlike the touchpad, the waking press is delivered, with `screen_off: true`, so a camera app can start at once.
 - `Button{BUTTON_ID_POWER, ...}` is reported for information. `glassd` itself handles a short press (manual off-head, see Wearing). On route 1, the Android glue keeps Android's own power-key handling out of the short press (a keylayout change for the `twl6030_pwrbutton` device, milestone 3) and leaves the long press to Android (shut-down menu); on route 2, `glassd` handles the long press by asking the init system to power off (milestone 5).
 - The camera button still works while the Glass is off the head, as on stock Glass: the press is delivered (`screen_off: true`), but it does not wake the screen.
 - Broadcast to all subscribers.
@@ -103,9 +103,14 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
   - `WEAR_SOURCE_FORCED`: detection off, so the Glass is assumed on the head (`WEAR_ON_HEAD`); also during the 30 s after boot.
   - `WEAR_SOURCE_POWER_KEY`: a short power-key press toggles a manual off-head; the next press gives a timed on-head (30 s, then back to the sensor if detection is on).
   - `WEAR_SOURCE_HINGE`: closing the hinge forces off-head; opening it gives a timed on-head. The Linux input code of the hinge switch is not confirmed yet (device needed), so this source may be missing (`hinge` capability).
-  - `WEAR_UNKNOWN` only before the first state is known.
-- On off-head (any source), `glassd` turns the screen off, cancels every keep-on hold, puts the touchpad to sleep and stops head wake. While off the head nothing wakes the screen: touches are ignored, `ACTION_WAKE` and `ACTION_KEEP_ON` are ignored (no hold is recorded), and the camera button is delivered without a wake. On don it re-enables them and, if the screen is off, wakes it with the quick timeout.
-- `Wink` when the glasshub reports a deliberate wink and `wink_enabled` is true (default false; it needs a calibration, milestone 2). A wink does not wake the screen. What it does (on Glass, take a picture) is the app's decision.
+  - `WEAR_UNKNOWN` only before the first state is known. In practice `glassd` starts forced on the head, so it is never sent.
+  - A `WearState` is sent when the wear or its source changes (for example `FORCED` to `SENSOR` when the 30 s after boot end on the head); the off-head and don actions below run only when the wear itself changes. While detection is on but the sensor has not reported yet, the previous state stays.
+  - Turning `on_head_detection_enabled` on hands over to the sensor at once; turning it off forces on-head. A sensor reading taken while it did not count (detection off, forced or timed periods) is kept and applies when the sensor counts again.
+- On off-head (any source), `glassd` turns the screen off, cancels every keep-on hold, cancels a touch in progress, puts the touchpad to sleep (`sleepmode` 1) and stops head wake. While forced off the head (power key or hinge), the glasshub is paused. While off the head nothing wakes the screen: touches are ignored, `ACTION_WAKE` and `ACTION_KEEP_ON` are ignored (no hold is recorded), and the camera button is delivered without a wake. On don it re-enables them and, if the screen is off, wakes it with the quick timeout.
+- `Wink` when the glasshub reports a wink, `wink_enabled` is true (default false) and the Glass is on the head. A wink does not wake the screen. What it does (on Glass, take a picture) is the app's decision.
+  - The wink is the glasshub firmware's low-power wink interrupt, armed only while `wink_enabled` is true; a read of `wink` that gives 0 is not a wink. Stock Glass confirms the interrupt with a CPU classifier on the raw proximity stream and a per-user calibration; `glassd` does not reproduce that classifier, so false positives are likely until an open classifier and calibration exist (`docs/specs/glasshub.md` §6.4, §8).
+  - After it arms on-head detection or resumes the hub, `glassd` reads `don_doff` again, since the state may have changed without a notification. If the glasshub fails (a read error), `glassd` stops using it: the Glass is forced on the head and winks stop.
+  - At start `glassd` writes the firmware thresholds (on-head detection off while it does): don 450, doff 400, don max 2000, gain 2, or a user's calibration from the stock parameter file `/data/system/gaze/gaze_params.txt` if it is there (`--gaze-params`). It never writes `calibrate`, `update_fw_*` or anything outside a fixed list of attributes.
 
 ## Screen (`TOPIC_SCREEN`)
 
@@ -120,9 +125,14 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 
 The default timeout and the dim step follow the stock behaviour described in `docs/specs/`.
 
+Who switches the panel:
+- **Route 2 (Linux):** `glassd`, with `FBIOBLANK` on the panel framebuffer (`--display fb[:path]`, default `/dev/fb0`; it must be a character device): unblank for `SCREEN_ON` and `SCREEN_DIM`, power down for `SCREEN_OFF`.
+- **Route 1 (Android):** the framework owns blanking (`PowerManager`, SurfaceFlinger, hwcomposer), so `glassd` defaults to `--display log` there and the Android glue (milestone 3) turns `ScreenState` into `PowerManager` calls. `--display fb` still forces `FBIOBLANK` (for example to test without the framework).
+- The dim step is reported but does not change the panel yet: `glassd` never writes the brightness, nor `brightness_limit` or `brightness_multiplier`. `--display log` (also the default with `--mock`) only logs.
+
 ## Settings (`TOPIC_SETTINGS`)
 
-`SetSettings` changes only the fields that are present; `glassd` stores them, applies them, and sends the full `Settings` back. Values out of range are clamped, and the reply shows what was applied:
+`SetSettings` changes only the fields that are present; `glassd` stores them, applies them, and sends the full `Settings` back (before any frame the change causes, such as a `WearState`). They are kept in the file `settings` of the state directory (`--state-dir`, else `$GLASSD_STATE_DIR`, else `/data/glassd` on Android and `/var/lib/glassd` on Linux), written atomically, and read at start over the defaults; the mock keeps them in memory unless `--state-dir` is given. Values out of range are clamped, and the reply shows what was applied:
 
 | Field | Range |
 |---|---|
@@ -157,4 +167,4 @@ Glass gets its location from the phone, not from its own GPS chip, which stays a
 
 ## Mock
 
-`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `power [long]`, `hinge open|closed`, `lookup`, `lookdown`, `relative-lookup`, `nudge`, `wear on|off`, `wink`, `dim`, `location <lat> <lon> [accuracy_m]` and `location-status <state>` (milestone 4), `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.
+`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. `power` and `camera` go through the same button logic as the real keys (`power` toggles the manual off-head), `hinge` drives the hinge source, and `wear on|off` is a reading of the simulated on-head sensor: like the real one, it counts only while `on_head_detection_enabled` is true. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `power [long]`, `hinge open|closed`, `lookup`, `lookdown`, `relative-lookup`, `nudge`, `wear on|off`, `wink`, `dim`, `location <lat> <lon> [accuracy_m]` and `location-status <state>` (milestone 4), `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.

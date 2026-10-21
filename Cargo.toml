@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/OpenMyGlass/glass-services"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 glass-api = { path = "crates/glass-api" }

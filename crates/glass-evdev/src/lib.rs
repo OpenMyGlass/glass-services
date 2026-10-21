@@ -28,6 +28,10 @@ pub struct RawInputEvent {
 /// Size of one `input_event` on this target.
 pub const EVENT_SIZE: usize = std::mem::size_of::<RawInputEvent>();
 
+// The Glass kernel's 32-bit ARM ABI.
+#[cfg(target_arch = "arm")]
+const _: () = assert!(EVENT_SIZE == 16);
+
 /// One decoded event, time in µs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Event {
@@ -55,11 +59,47 @@ impl From<RawInputEvent> for Event {
 /// Decodes whole `input_event` records from `buf`; trailing bytes of a partial record are
 /// ignored (the kernel never returns one).
 pub fn parse_events(buf: &[u8]) -> impl Iterator<Item = Event> + '_ {
-    buf.chunks_exact(EVENT_SIZE).map(|c| {
+    buf.as_chunks::<EVENT_SIZE>().0.iter().map(|c| {
         // SAFETY: `c` has exactly EVENT_SIZE bytes and RawInputEvent is plain old data.
         let raw: RawInputEvent = unsafe { std::ptr::read_unaligned(c.as_ptr().cast()) };
         Event::from(raw)
     })
+}
+
+/// Decodes a byte stream into events, keeping a partial record until the rest arrives.
+#[derive(Debug, Default)]
+pub struct EventReader {
+    partial: Vec<u8>,
+}
+
+impl EventReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes of an incomplete record waiting for the rest.
+    pub fn pending(&self) -> usize {
+        self.partial.len()
+    }
+
+    /// Appends the events in `bytes` (after any buffered partial record) to `out`.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Event>) {
+        let mut bytes = bytes;
+        if !self.partial.is_empty() {
+            let need = EVENT_SIZE - self.partial.len();
+            let take = need.min(bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.partial.len() < EVENT_SIZE {
+                return;
+            }
+            out.extend(parse_events(&self.partial));
+            self.partial.clear();
+        }
+        let whole = bytes.len() / EVENT_SIZE * EVENT_SIZE;
+        out.extend(parse_events(&bytes[..whole]));
+        self.partial.extend_from_slice(&bytes[whole..]);
+    }
 }
 
 /// The kernel's `struct input_absinfo`.
@@ -126,6 +166,7 @@ pub struct Device {
     fd: OwnedFd,
     path: PathBuf,
     monotonic: bool,
+    reader: EventReader,
 }
 
 impl Device {
@@ -146,6 +187,7 @@ impl Device {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             path: path.to_path_buf(),
             monotonic: false,
+            reader: EventReader::new(),
         })
     }
 
@@ -245,12 +287,12 @@ impl Device {
             }
             let now = (!self.monotonic).then(monotonic_us);
             let before = out.len();
-            out.extend(parse_events(&buf[..n as usize]).map(|mut e| {
-                if let Some(t) = now {
+            self.reader.feed(&buf[..n as usize], out);
+            if let Some(t) = now {
+                for e in &mut out[before..] {
                     e.time_us = t;
                 }
-                e
-            }));
+            }
             total += out.len() - before;
             if (n as usize) < buf.len() {
                 return Ok(total);
@@ -377,6 +419,40 @@ mod tests {
         b.extend(bytes_of(&raw));
         let e = parse_events(&b[1..]).next().unwrap();
         assert_eq!((e.time_us, e.type_, e.code, e.value), (1_000_002, 3, 4, 5));
+    }
+
+    #[test]
+    fn partial_records_are_kept_until_complete() {
+        let raw: Vec<RawInputEvent> = (0..3)
+            .map(|i| RawInputEvent {
+                tv_sec: 1,
+                tv_usec: i,
+                type_: 3,
+                code: 0x35,
+                value: i as i32,
+            })
+            .collect();
+        let b = bytes_of(&raw);
+        let mut r = EventReader::new();
+        let mut out = Vec::new();
+        // Split inside the first and inside the third record.
+        r.feed(&b[..5], &mut out);
+        assert!(out.is_empty());
+        assert_eq!(r.pending(), 5);
+        r.feed(&b[5..2 * EVENT_SIZE + 3], &mut out);
+        assert_eq!(out.len(), 2);
+        r.feed(&b[2 * EVENT_SIZE + 3..], &mut out);
+        assert_eq!(
+            out.iter().map(|e| e.value).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(r.pending(), 0);
+        // Byte by byte.
+        let mut out = Vec::new();
+        for x in &b {
+            r.feed(std::slice::from_ref(x), &mut out);
+        }
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

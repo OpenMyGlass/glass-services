@@ -83,6 +83,8 @@ pub struct Client {
     decoder: FrameDecoder,
     welcome: Welcome,
     next_seq: u32,
+    /// Closed after a protocol error (docs/api.md: the client closes the connection).
+    closed: bool,
 }
 
 impl Client {
@@ -109,6 +111,7 @@ impl Client {
             decoder: FrameDecoder::new(),
             welcome: Welcome::default(),
             next_seq: 1,
+            closed: false,
         };
         c.send_frame(&ClientFrame {
             seq: 0,
@@ -139,6 +142,9 @@ impl Client {
 
     /// Sends a raw frame as is.
     pub fn send_frame(&mut self, frame: &ClientFrame) -> Result<(), ClientError> {
+        if self.closed {
+            return Err(ClientError::Closed);
+        }
         let mut buf = Vec::new();
         encode_frame(frame, &mut buf)?;
         self.stream.write_all(&buf)?;
@@ -172,12 +178,23 @@ impl Client {
     }
 
     /// Receives the next frame. `timeout` `None` blocks; on timeout, returns `Ok(None)`.
+    /// A malformed or oversize frame is a protocol error: the connection is closed and every
+    /// later call returns [`ClientError::Closed`].
     pub fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<ServiceFrame>, ClientError> {
         let deadline = timeout.map(|t| Instant::now() + t);
         let mut buf = [0u8; 8192];
         loop {
-            if let Some(f) = self.decoder.next_message::<ServiceFrame>()? {
-                return Ok(Some(f));
+            if self.closed {
+                return Err(ClientError::Closed);
+            }
+            match self.decoder.next_message::<ServiceFrame>() {
+                Ok(Some(f)) => return Ok(Some(f)),
+                Ok(None) => {}
+                Err(e) => {
+                    self.closed = true;
+                    let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                    return Err(e.into());
+                }
             }
             let wait = match deadline {
                 None => None,
@@ -231,6 +248,44 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_error_closes_the_connection() {
+        use crate::codec::frame_bytes;
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("glass-client-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut d = FrameDecoder::new();
+            let mut buf = [0u8; 256];
+            while d.next_message::<ClientFrame>().unwrap().is_none() {
+                let n = s.read(&mut buf).unwrap();
+                d.push(&buf[..n]);
+            }
+            let welcome = ServiceFrame {
+                body: Some(service_frame::Body::Welcome(Welcome::default())),
+            };
+            s.write_all(&frame_bytes(&welcome).unwrap()).unwrap();
+            s.write_all(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01]).unwrap();
+            // The client must close: read returns 0.
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest).unwrap()
+        });
+        let mut c = Client::connect_as(&path, "t").unwrap();
+        assert!(matches!(
+            c.recv(Some(Duration::from_secs(5))),
+            Err(ClientError::Frame(FrameError::BadVarint))
+        ));
+        assert_eq!(server.join().unwrap(), 0);
+        assert!(matches!(c.recv(None), Err(ClientError::Closed)));
+        assert!(matches!(c.subscribe(&[]), Err(ClientError::Closed)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn socket_path_resolution() {

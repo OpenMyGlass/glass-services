@@ -647,3 +647,53 @@ fn syn_dropped_ignores_the_rest_of_the_touch() {
     assert!(gestures(&out).is_empty(), "{out:?}");
     assert_eq!(counts(&out), vec![(0, 1), (1, 0)]);
 }
+
+#[test]
+fn bare_report_after_an_encoded_frame_is_not_an_all_up() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.encoded(0, 0);
+    s.bare_report();
+    s.advance_ms(10);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.lift();
+    let out = decoding(&c, &s.take());
+    assert_eq!(screen_off(&out), vec![ScreenOffGesture::Tap]);
+    assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
+}
+
+#[test]
+fn partial_frame_right_after_an_encoded_frame_is_skipped() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.frame(&[(0.0, 0.0), (60.0, 0.0)]);
+    s.advance_ms(10);
+    s.encoded(1, 1);
+    s.frame(&[(0.0, 0.0)]); // partial: one of the two fingers only
+    s.advance_ms(10);
+    s.frame(&[(0.0, 0.0), (60.0, 0.0)]);
+    s.advance_ms(10);
+    s.lift();
+    let out = decoding(&c, &s.take());
+    assert_eq!(counts(&out), vec![(0, 2), (2, 0)], "{out:?}");
+}
+
+#[test]
+fn bare_report_never_ends_a_protocol_a_touch() {
+    // A frame with no SYN_MT_REPORT carries no contact data (a switch event, for example).
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.bare_report();
+    s.advance_ms(10);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.lift();
+    let out = Recognizer::new(c).feed(&s.take());
+    assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
+    assert_eq!(gestures(&out), vec![(GestureKind::Tap, 1)]);
+}

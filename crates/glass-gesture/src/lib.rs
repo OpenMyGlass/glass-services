@@ -117,6 +117,8 @@ struct FrameBuilder {
     /// Protocol A: the contact being reported, and the contacts of this frame.
     pending: Partial,
     contacts: Vec<Contact>,
+    /// A `SYN_MT_REPORT` was seen in the current frame.
+    mt_report: bool,
     /// Protocol B (also filled while the protocol is unknown).
     slot: usize,
     slots: [Partial; MAX_SLOTS],
@@ -134,6 +136,7 @@ impl FrameBuilder {
             protocol: Protocol::Unknown,
             pending: Partial::default(),
             contacts: Vec::new(),
+            mt_report: false,
             slot: 0,
             slots: [Partial::default(); MAX_SLOTS],
             dropping: false,
@@ -144,6 +147,7 @@ impl FrameBuilder {
         match (e.type_, e.code) {
             (ev::SYN, syn::DROPPED) => {
                 self.dropping = true;
+                self.mt_report = false;
                 self.pending = Partial::default();
                 self.contacts.clear();
                 self.slots = [Partial::default(); MAX_SLOTS];
@@ -156,6 +160,7 @@ impl FrameBuilder {
             _ if self.dropping => None,
             (ev::SYN, syn::MT_REPORT) => {
                 self.protocol = Protocol::A;
+                self.mt_report = true;
                 let p = std::mem::take(&mut self.pending);
                 if let Some(c) = p.contact(self.contacts.len() as i32) {
                     self.contacts.push(c);
@@ -165,6 +170,12 @@ impl FrameBuilder {
             (ev::SYN, syn::REPORT) => {
                 if self.protocol == Protocol::Unknown && self.slots.iter().any(|s| s.any) {
                     self.protocol = Protocol::B;
+                }
+                if self.protocol == Protocol::A && !std::mem::take(&mut self.mt_report) {
+                    // No contact data at all (a bare SYN_REPORT after an encoded frame, or a
+                    // switch event): not a frame of contacts, in particular not an all-up.
+                    self.pending = Partial::default();
+                    return None;
                 }
                 Some(FrameEvent::Frame(match self.protocol {
                     Protocol::A => std::mem::take(&mut self.contacts),
@@ -455,8 +466,13 @@ impl Recognizer {
                     timestamp_us: t,
                 });
             }
-            self.encoded_seen = had;
+            let just_after = std::mem::replace(&mut self.encoded_seen, had);
             if had && real.is_empty() {
+                return;
+            }
+            // The driver may close a real-finger frame early around an encoded one, so the
+            // frame right after it can be partial: do not read fewer fingers from it.
+            if just_after && !had && self.phase != Phase::Idle && real.len() < self.prev.len() {
                 return;
             }
             contacts = real;

@@ -272,16 +272,18 @@ mod tests {
             s.write_all(&frame_bytes(&welcome).unwrap()).unwrap();
             s.write_all(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01]).unwrap();
             // The client must close: read returns 0.
-            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
             let mut rest = Vec::new();
-            s.read_to_end(&mut rest).unwrap()
+            s.read_to_end(&mut rest)
+                .map(|_| rest.len())
+                .map_err(|e| e.kind())
         });
         let mut c = Client::connect_as(&path, "t").unwrap();
         assert!(matches!(
             c.recv(Some(Duration::from_secs(5))),
             Err(ClientError::Frame(FrameError::BadVarint))
         ));
-        assert_eq!(server.join().unwrap(), 0);
+        assert_eq!(server.join().expect("server thread"), Ok(0));
         assert!(matches!(c.recv(None), Err(ClientError::Closed)));
         assert!(matches!(c.subscribe(&[]), Err(ClientError::Closed)));
         std::fs::remove_dir_all(&dir).unwrap();

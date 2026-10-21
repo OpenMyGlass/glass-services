@@ -127,6 +127,12 @@ impl Synth {
         self.push(ev::SYN, syn::REPORT, 0);
     }
 
+    /// A `SYN_REPORT` with nothing before it, as the driver sends after an encoded frame
+    /// (kernel-interfaces.md §1.5).
+    pub fn bare_report(&mut self) {
+        self.push(ev::SYN, syn::REPORT, 0);
+    }
+
     /// One frame with real contacts and an encoded contact after them.
     pub fn frame_with_encoded(&mut self, contacts: &[(f32, f32)], dx: i32, dy: i32) {
         let mut real = self.clone();

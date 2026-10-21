@@ -306,6 +306,26 @@ mod tests {
     }
 
     #[test]
+    fn waking_touch_with_encoded_frame_and_bare_report_is_consumed_to_the_end() {
+        let mut r = Rig::new(ScreenOffInput::Encoded);
+        r.policy.sleep(Now::at(S), "request");
+        let steps = r.run(|s| {
+            s.frame(&[(0.0, 0.0)]);
+            s.advance_ms(10);
+            s.encoded(0, 0);
+            s.bare_report();
+            s.advance_ms(10);
+            s.frame(&[(0.0, 0.0)]);
+            s.advance_ms(10);
+            s.lift();
+        });
+        assert_eq!(changes(&steps), vec![(Screen::On, "tap")]);
+        assert!(delivered(&steps).is_empty(), "{steps:?}");
+        // The next touch is delivered.
+        assert!(has_gesture(&r.run(|s| s.tap(1, 50))));
+    }
+
+    #[test]
     fn off_head_ignores_touches() {
         let mut r = Rig::new(ScreenOffInput::Touches);
         r.policy.set_on_head(Now::at(S), false);

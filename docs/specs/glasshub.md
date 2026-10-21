@@ -19,19 +19,20 @@ or described beyond what user space needs (§7).
 | Layer | Stock component | Notes |
 |---|---|---|
 | Kernel | `glasshub` I2C driver, address `0x35` on `omap_i2c.4` | sysfs + misc device `/dev/glasshub` |
-| Native service | `glass::GazeService` singleton in `libglassgaze.so` (version string `GazeServiceVersion`) with modules `WinkModule`, `DonDoffModule`, `DoubleBlinkModule`, `LookAtScreenModule`, and the device wrapper `GlasshubProximitySensor` | runs inside `system_server` |
-| JNI | `glass::NativeEyeGestureService` in `libglass_services_jni.so` | bridge to `EyeGestureService` |
+| Native service | gaze service singleton in `libglassgaze.so`, with one module each for wink, on-head, double blink and look-at-screen, over a glasshub device wrapper | runs inside `system_server` |
+| JNI | native eye-gesture bridge in `libglass_services_jni.so` | bridge to `EyeGestureService` |
 | Java | `com.google.android.glass.eye.EyeGestureService` (binder name `eye_gesture`) and `DonManager` | see `glass-services-jni.md`, `wake-policy.md` |
 
 ## 2. Device paths and ownership **[C]**
 
 - sysfs directory: `/sys/devices/platform/omap_i2c.4/i2c-4/4-0035/`
-  (string in `GlasshubProximitySensor`; all attribute paths are built by
-  appending the attribute name).
+  (string constant in `libglassgaze.so`; all attribute paths are built by
+  appending the attribute name). It is the same kernel node as
+  `/sys/bus/i2c/devices/4-0035/` (the bus path is a symlink to it).
 - Raw stream: `/dev/glasshub` (misc device, opened read-only).
 - Presence test: the attribute `version` exists in the directory
-  (`GlasshubProximitySensor::existsOnDevice`). If absent, the gaze service is
-  "non-functional" and every eye gesture reports unsupported.
+  (behaviour of `libglassgaze.so`). If absent, the gaze service does not run
+  and every eye gesture reports unsupported.
 - The stock init script (`init.omap4430.rc`, section "glasshub") changes the
   owner of `/dev/glasshub` and of every glasshub attribute to `system:system`.
   A replacement daemon needs the same (or runs as root).
@@ -44,13 +45,13 @@ or described beyond what user space needs (§7).
 - The library reads up to 64 records per `read()` (640-byte buffer) and treats
   a short read that is not a multiple of 10 as an error.
 - `value`: proximity reading, 14 bits (`& 0x3fff`). If `wink_flag_enable` is
-  1, bit 14 (`0x4000`) is also passed through and marks "firmware wink
-  detected" on that sample (`glasshub.c:195-198`, `673-683`).
+  1, bit 14 (`0x4000`) is also passed through and marks a wink detected by the hub
+  firmware on that sample (`glasshub.c:195-198`, `673-683`).
 - Timestamps are synthesized by the driver from the interrupt time and an
   averaged sample interval; nominal rate **32 Hz** (`PROX_INTERVAL`,
   `glasshub.c:184-192`; the library also hard-codes an expected data rate of
-  32.0 Hz, `glass::GazeService::kExpectedDataRateHertz`). Clock: the driver's
-  "robust clock" in ns; `current_timestamp` returns the same clock, which the
+  32.0 Hz, a constant in `libglassgaze.so`). Clock: the driver's
+  clock in ns (`read_robust_clock`); `current_timestamp` returns the same clock, which the
   library uses to align history with "now".
 - Only one opener at a time (`-EBUSY` otherwise); opening flushes the FIFO;
   `lseek(fd, 0, SEEK_END)` flushes it too (`glasshub.c:2164-2246`). The
@@ -69,7 +70,7 @@ All writes are ASCII decimal, opened and written per call.
 | `wink_flag_enable` | `1` / `0` | written together with `wink_enable` (same value) |
 | `don_doff_enable` | `1` / `0` | arm / disarm the firmware's on-head detection |
 | `don_threshold`, `doff_threshold`, `don_max_threshold` | `%u` | after don/doff calibration, and at load from the parameter file |
-| `detector_gain`, `wink_min`, `wink_max` | `%u` | when applying wink calibration ("MCU params") |
+| `detector_gain`, `wink_min`, `wink_max` | `%u` | when applying wink calibration |
 | `pause` | `1` / `0` | master disable / enable of the gaze service (§6) |
 | `activity_threshold` | `%u` | setter exists; no caller seen **[I]** |
 | `update_fw_enable`, `update_fw_data` | see §7 | firmware update at boot when needed |
@@ -93,18 +94,17 @@ Kernel clamps on writes (`glasshub.c:976-1360`): `doff_threshold` 0..10000,
 
 ## 5. Event delivery **[C]**
 
-- One worker thread (`GazeService::GlasshubProximitySensor::GlasshubThread`)
-  blocks in `poll()` with no timeout on:
+- One worker thread in `libglassgaze.so` blocks in `poll()` with no timeout on:
   1. a control FIFO (named pipe) `/data/system/gaze/gaze_service_control_pipe`
      (created with `mknod`) used to wake the thread for commands
-     (start/stop streaming, pause, flush, "stream history to new listener");
+     (start/stop streaming, pause, flush, send recent history to a new listener);
   2. sysfs `don_doff`, polled for `POLLPRI | POLLERR`;
   3. sysfs `wink`, polled for `POLLPRI | POLLERR`;
   4. `/dev/glasshub` for `POLLIN | POLLERR` while streaming.
 - The kernel signals 2 and 3 with `sysfs_notify` from its interrupt handler
   (`glasshub.c:748-770`).
 - On a `don_doff` event: `lseek(0)` then `read()` up to 64 bytes; the state is
-  the parsed number (the library expects 2 bytes, e.g. `"1\n"`); **1 = on head
+  the parsed number (the library expects 2 bytes, a digit and a newline); **1 = on head
   (donned), 0 = off head (doffed)** **[I]** (value semantics taken from the
   names; the kernel just reads firmware register 6). Listeners are called
   only when the state changes.
@@ -115,7 +115,7 @@ Kernel clamps on writes (`glasshub.c:976-1360`): `doff_threshold` 0..10000,
   `Glasshub_ProxData_WakeLock` (reference counted). The thread sleeps 1 ms
   between loop iterations.
 - Raw packets are kept in a ring buffer so a new listener can ask for recent
-  history ("stream historical data for N ms").
+  history (the last N ms).
 
 ## 6. Gaze service behaviour
 
@@ -125,17 +125,17 @@ Gesture ids are the ordinals of `com.google.android.glass.eye.EyeGesture`:
 
 | Id | Gesture | Module | Hardware gate |
 |---|---|---|---|
-| 0 | WINK | WinkModule | serial number's first character `> 'F'` (hardware rev G or later) |
+| 0 | WINK | wink module | serial number's first character `> 'F'` (hardware rev G or later) |
 | 1 | DOUBLE_WINK | none | same gate, but no module: unsupported |
 | 2 | BLINK | none | unsupported |
-| 3 | DOUBLE_BLINK | DoubleBlinkModule | none |
-| 4 | DON | DonDoffModule | none |
+| 3 | DOUBLE_BLINK | double-blink module | none |
+| 4 | DON | on-head module | none |
 | 5 | DOFF | same module as DON | none |
-| 6 | LOOK_AT_SCREEN | LookAtScreenModule | none |
+| 6 | LOOK_AT_SCREEN | look-at-screen module | none |
 | 7 | LOOK_AWAY_FROM_SCREEN | same module as LOOK_AT_SCREEN | none |
 
 Ids >= 8 are clamped to 8 ("invalid"). The serial number comes from
-`glass::Utils::getGlassSerialNumber` in `libglassutils.so` (uses the CPU
+a helper in `libglassutils.so` (uses the CPU
 serial / `ro.serialno` **[I]**). `isSupported(g)` = hardware present and a
 module exists for `g`.
 
@@ -158,11 +158,20 @@ module exists for `g`.
 - Thresholds live in the firmware (`don_threshold`, `doff_threshold`,
   `don_max_threshold`). Defaults when nothing is calibrated: don **450**,
   doff **400**, don max **2000**, detector gain **2**
-  (`glass::MCUParams::kDefault*`).
+  (constants in `libglassgaze.so`).
+- Persistence: the GPL driver writes these thresholds, `detector_gain`,
+  `wink_min` and `wink_max` as plain I2C register writes (`store_reg`,
+  `glasshub.c:852-870`); it never copies them to MCU flash. The only flash
+  writes from the driver are `calibrate` (LED-drive calibration table at
+  MCU address `0x9ff0`, `glasshub.c:1071-1143`) and firmware update, which
+  preserves flash page 123 (`glasshub.c:151`, `1777`). Whether the firmware
+  itself keeps the thresholds across a hub reset is not visible from the
+  GPL source **[?]**; the stock library re-applies them from its parameter
+  file (§6.6), which suggests they are volatile **[I]**.
 - Calibration (used by the settings app): begin interval -> stream raw
   samples (`passthru_enable = 1`) while the user wears and removes the
   device -> end interval. Samples are clamped to **250..4000**
-  (`DonDoffCalibrator::DON_VALUE_LOWER_BOUND/UPPER_BOUND`); the interval
+  (constants in `libglassgaze.so`); the interval
   closes itself after too many samples. The samples are split into two
   clusters (k-means style, 5 iterations); calibration fails when a cluster
   is too small or the two centres are too close. New don / doff / don-max
@@ -185,8 +194,7 @@ Two-stage design:
    classifier for **52 samples** (about 1.6 s at 32 Hz) after the interrupt;
    then stop streaming. A gap in timestamps or a stale (backward) timestamp
    resets the counters.
-3. The CPU classifier (`CalibratedMultiDurationWinkDetector`, version
-   "Multi-Duration 0.1.0") runs several boosted-cascade detectors for
+3. The CPU classifier in `libglassgaze.so` runs several boosted-cascade detectors for
    different wink durations (model set
    `/system/etc/gaze/multi_dur_wink_detector.txt` listing
    `wink-300-550ms-detector.txt`, `wink-300-650ms-detector.txt`,
@@ -210,15 +218,15 @@ Two-stage design:
 
 ### 6.5 Look at screen and double blink **[C]**
 
-- LOOK_AT_SCREEN / LOOK_AWAY_FROM_SCREEN: `LookAtScreenModule` (version
-  0.3.4) streams raw data and runs a boosted detector
+- LOOK_AT_SCREEN / LOOK_AWAY_FROM_SCREEN: the look-at-screen module
+  streams raw data and runs a boosted detector
   (`/system/etc/gaze/laser_detector_set.txt` -> `laser_1000ms_detector.txt`)
   with a single threshold from the user calibration file
   `/data/system/gaze/laser_params.txt`. It refuses to start when not
   calibrated. Supports one-shot and timeout starts. Used by the notification
   "glance" feature (setting `notification_glance_enabled`, default false; lab
   property `persist.lab.laser_rlu`, default true).
-- DOUBLE_BLINK: `DoubleBlinkModule` with
+- DOUBLE_BLINK: the double-blink module with
   `/system/etc/gaze/two_blink_detector_set.txt` (300-550 ms and 300-900 ms
   models); one-shot or timeout start; no stock caller seen. **[I]**
 
@@ -234,23 +242,17 @@ does not need to read this file, but may, to inherit a user's calibration.
 
 `activateGazeLogging(true)` writes raw samples to
 `/data/system/gaze/prox_data_<time>_<n>.txt` with a header of version,
-device, epoch / uptime / elapsed times.
+device and the current epoch, uptime and elapsed times.
 
 ## 7. Firmware check at start (note only) **[C]**
 
-At service start the library compares the hub's application version
-(`version`, format `major.minor`) with the version embedded in the first
-record of `/system/vendor/firmware/glasshub.s19` (the record must start with
-`S1058480`; the next two hex bytes are major and minor). If they differ it
-flashes: `update_fw_enable = 1`, write the S-record lines to
-`update_fw_data`, `update_fw_enable = 254` (checksum), read `flash_status`
-(must be `0`), `update_fw_enable = 0`. Experimental firmware (version with
-bit 15 set) is reported but kept. The kernel side is in
-`glasshub.c:1438-1956`.
+The stock library reflashes the hub through `update_fw_enable` /
+`update_fw_data` when the version in `/system/vendor/firmware/glasshub.s19`
+differs from the hub's `version`; kernel side `glasshub.c:1438-1956`.
 
 **OpenMyGlass must not reflash the hub** (roadmap rule: device tests are
 `fastboot boot` only, and the firmware blob is not ours). An open replacement
-should only *read* `version` and log a mismatch.
+should only *read* `version` and log it.
 
 ## 8. Minimal compatible behaviour for an open daemon
 
@@ -264,6 +266,9 @@ should only *read* `version` and log a mismatch.
 4. Pause the hub (`pause = 1`) when the user forces "off head" and resume
    on exit from that state.
 5. Never write `update_fw_*`.
+6. Never write `calibrate`: it rewrites the LED-drive calibration table in
+   the hub's flash (`glasshub.c:1071-1143`). Reading `calibration_values` is
+   harmless.
 
 ## 9. Open questions (need a device)
 

@@ -241,14 +241,19 @@ operations, **[I]** for the AOSP flag names.
 ### 5.2 Screen off (XE path, also forced with `glass.usersim=true`) **[C]**
 
 While the screen is off the kernel driver (early suspend) suppresses normal
-touches and instead emits at most one *encoded gesture frame* per
-suspend cycle (`rmi_f11.c:1756-1790`, `1960-2090`): one pointer at
+touches and instead emits *encoded gesture frames*
+(`rmi_f11.c:1756-1790`, `1960-2090`; see `kernel-interfaces.md` §1.5): one
+pointer at
 `(100 + ox, 100 + oy)`, `ABS_MT_PRESSURE = 1`, `TOUCH_MAJOR = TOUCH_MINOR = 15`,
 followed by a 250 ms wake lock. Offsets: single tap (0, 0), double tap
 (-1, -1), press (1, 1), flick (x_flick_dist, y_flick_dist). The driver
 also synthesizes a tap itself when all samples stay in a 90 x 90 box, more
 than one sample, one finger, and the contact lasts more than 5 and less than
-250 ms (`rmi_f11.c:93-97`, `1852-1857`).
+250 ms (`rmi_f11.c:93-97`, `1852-1857`). Rate limits: the press frame is sent
+at most once per touch sequence; the driver-synthesized tap only exists when
+the F11 `gesture` attribute is 1 and is sent at most once per suspend cycle
+(`rmi_f11.c:1842`, `2089-2119`); controller taps, double taps and flicks are
+not limited.
 
 User space recognises such a frame when the event has exactly one pointer,
 normalized pressure `<= 0.01` and touch major and minor `>= 14.8`. It then
@@ -270,9 +275,9 @@ On non-XE products any touchpad UP while the screen is off counts as TAP.
 
 | Event | Code | Handling |
 |---|---|---|
-| Key | 24 / 25 (VOLUME_UP / DOWN) | on release: adjust stream 1 (`STREAM_SYSTEM`) by +1/-1 with flag 4 (`FLAG_PLAY_SOUND`) |
-| Key | 27 (CAMERA) | press/long-press detector (long = `getLongPressTimeout`), see `wake-policy.md` |
-| Key | 110 (Glass power key, `KEYCODE_POWER` constant in `InputHub`) | short press: manual on/off-head override; long press: shutdown |
+| Key | Android 24 / 25 (VOLUME_UP / DOWN); XE has no volume buttons, so these only come from external keyboards or Bluetooth devices (Linux `KEY_VOLUMEUP` 115 / `KEY_VOLUMEDOWN` 114 via the stock `Generic.kl`) **[I]** | on release: adjust stream 1 (`STREAM_SYSTEM`) by +1/-1 with flag 4 (`FLAG_PLAY_SOUND`) |
+| Key | Android 27 (`KEYCODE_CAMERA`), from Linux `KEY_CAMERA` (212) on the `gpio-keys` device (`board-notle.c:1250-1254`), mapped by `/system/usr/keylayout/keys.kl` | press/long-press detector (long = `getLongPressTimeout`), see `wake-policy.md` |
+| Key | Android 110 (`KEYCODE_BUTTON_MODE`; the filter calls it its power key), from Linux `KEY_POWER` (116) on `twl6030_pwrbutton`, mapped by `keys.kl` (`key 116 BUTTON_MODE`); both `gpio-keys.idc` and `twl6030_pwrbutton.idc` select `keyboard.layout = keys`. So the power button never reaches Android as `KEYCODE_POWER` (26) | short press: manual on/off-head override; long press: shutdown |
 | Switch | code 0 (camera switch / lens cover) | camera preload when lab property `persist.lab.chvr` is true |
 | Switch | code 1 (hinge) | closed = forced off head; opened = timed forced on head |
 
@@ -321,5 +326,6 @@ uinput device lazily, and calls *finish* when the proto action's low byte is
   turn slop and velocities into device units. **[?]**
 - Exact Linux switch code to filter code mapping for the hinge and camera
   switch. **[?]**
-- Whether the touchpad reports `ABS_MT_TOOL_TYPE` always or only with pen
-  support. **[?]**
+- (Answered) `ABS_MT_TOOL_TYPE` is always declared; its range is
+  `0..MT_TOOL_FINGER` unless the controller reports pen support
+  (`rmi_f11.c:2716-2722`).

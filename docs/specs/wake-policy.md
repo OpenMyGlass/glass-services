@@ -13,7 +13,7 @@ words.
 |---|---|---|
 | Default screen-off timeout | 15000 ms | `PowerManagerService` constant `DEFAULT_SCREEN_OFF_TIMEOUT` |
 | Minimum screen-off timeout | 3000 ms | `MINIMUM_SCREEN_OFF_TIMEOUT` |
-| Dim duration before off | `min(3000 ms, 20 % of timeout)` | AOSP rule, unchanged |
+| Dim duration before off | `min(3000 ms, 20 % of timeout)` | XE24 `PowerManagerService` (`SCREEN_DIM_DURATION = 3000`; AOSP 4.4 uses 7000 ms with the same 20 % cap, so Glass lowered it) |
 | **Quick timeout** | 3000 ms, with **no dim phase** | `DEFAULT_SCREEN_OFF_QUICK_TIMEOUT`, `SCREEN_DIM_DURATION_FOR_QUICK_TIMEOUT = 0` |
 | Home reset timeout | 5000 ms | resource `integer/home_reset_timeout_ms` |
 | Forced-donned timer | 30000 ms | resource `integer/force_donned_timeout_ms` |
@@ -61,6 +61,12 @@ off" **[I]**.)
 | GLOBAL_LOOK_UP (head wake) | screen off, `head_wake_up_enabled`, on head | **quick timeout** + wake; home if "should reset to home" | `HEAD_LOOK_UP` |
 | Don (put on) | screen off | quick timeout + wake; home if "should reset to home" | `DEVICE_DONNED` |
 | Eye gesture other than WINK and LOOK_AT_SCREEN | after the ordered broadcast completes | wake in place | `UNCATEGORIZED` |
+
+Note on the eye-gesture row: the system server registers only WINK (when
+`wink_for_picture_enabled`), and WINK is excluded from waking, so in the
+stock configuration **no eye gesture wakes the screen** through this path;
+the rule only matters if more gestures are registered. DON/DOFF go through
+`DonManager` (§4), not this path. **[C]**
 | Power key long press | | wake in place, close system dialogs, then shut down | `UNCATEGORIZED` |
 
 Enum order of `WakeUpReason`: TOUCHPAD_TAP, TOUCHPAD_SWIPE_LEFT,
@@ -83,7 +89,10 @@ SCREEN_OFF.
 
 ## 4. On-head state machine (`DonManager`) **[C]**
 
-States reported to the policy: DONNED, DOFFED, UNKNOWN. Internally the
+States: DONNED, DOFFED, UNKNOWN. UNKNOWN exists internally (sensor state
+before the first DON/DOFF event) but is never passed to the policy: the
+manager does not notify while it defers to sensors with an unknown sensor
+state, and the policy also ignores UNKNOWN if it ever arrived. Internally the
 manager combines a *sensor state* (from DON/DOFF eye gestures) with a
 *manual mode*:
 

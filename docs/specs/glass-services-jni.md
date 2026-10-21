@@ -25,8 +25,8 @@ class, method and binder names) and are listed for compatibility only.
 
 | Java static native | JNI signature | Behaviour |
 |---|---|---|
-| `nativeInit(EyeGestureService)` | `(Lcom/google/android/glass/eye/EyeGestureService;)I` | create the native bridge, keep a global ref to the service object; look up the gaze service if the glasshub hardware exists ("Found gaze hardware!") |
-| `nativeStart(int)` | `(I)V` | start the gaze service (`GazeService::start`) |
+| `nativeInit(EyeGestureService)` | `(Lcom/google/android/glass/eye/EyeGestureService;)I` | create the native bridge, keep a global ref to the service object; look up the gaze service, which exists only when the glasshub hardware is present |
+| `nativeStart(int)` | `(I)V` | start the gaze service (in `libglassgaze.so`) |
 | `nativeDump(int)` | `(I)Ljava/lang/String;` | text dump for `dumpsys eye_gesture` |
 | `nativeEnableGazeService(int, boolean)` | `(IZ)V` | master enable (pause/resume of the hub) |
 | `nativeStartGazeLogging(int)` / `nativeStopGazeLogging(int)` | `(I)V` | raw data log on/off |
@@ -44,7 +44,7 @@ class, method and binder names) and are listed for compatibility only.
 Callback: instance method `handleEyeGestureDetected(int gestureId, long
 timestamp)` (`(IJ)V`), called from the gaze worker thread (attached to the
 VM) for each detected eye gesture. The timestamp is the native detection time
-**[I]** (the log line pairs it with "up time now"; units probably ms).
+**[I]** (it appears to be an uptime value; units probably ms).
 Exceptions thrown by the callback are logged and cleared.
 
 ## 3. `HeadGestureService` natives **[C]**
@@ -166,7 +166,7 @@ default:
   three tips flags `GLASS_TIPS_SAY_OK_GLASS`, `GLASS_TIPS_TAP_TO_EXPAND`,
   `GLASS_TIPS_TAP_TO_VIEW_MENU`.
 
-## 7. Native parameter text format (`glass::SensorParamsBase`) **[C]**
+## 7. Native parameter text format (`libglass_sensorsutils.so`) **[C]**
 
 Used for the look-up parameters (`libglass_sensorsutils.so`):
 

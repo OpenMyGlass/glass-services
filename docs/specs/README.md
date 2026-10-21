@@ -42,7 +42,7 @@ Stock components studied:
 | [glasshub.md](glasshub.md) | what user space does with the glasshub driver: sysfs writes, `/dev/glasshub` stream, poll events, on-head, wink, look at screen, calibration files, firmware check (do not reflash) |
 | [glass-services-jni.md](glass-services-jni.md) | JNI methods and callbacks, binder services and AIDL transaction codes, the Glass settings provider and its keys |
 | [wake-policy.md](wake-policy.md) | screen wake/sleep rules, quick timeout, on-head state machine, broadcasts, wake locks, system properties |
-| `kernel-interfaces.md` (separate branch `specs-kernel`) | kernel-side view of the same devices, from GPL source |
+| [kernel-interfaces.md](kernel-interfaces.md) | kernel-side view of the same devices, from GPL source |
 
 ## Certainty legend
 

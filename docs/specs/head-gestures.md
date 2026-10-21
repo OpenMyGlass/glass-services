@@ -53,11 +53,15 @@ parameters are listed in §7 for reference only. **[C]**
 
 ### 2.2 Axes and angles **[C]/[I]**
 
-- Gyroscope X is the **pitch rate**; positive X rate = head tilting up.
-  Both RELATIVE_LOOK_UP (integrates +X) and NUDGE (classifies X, checks
-  Y and Z are quiet) rely on this. **[C]** The kernel orientation matrix that
-  produces this frame is in `board-notle.c:1608-1621` (MPU-9150
-  `orientation = {0,1,0, 0,0,1, 1,0,0}`). **[C]**
+- In the **Android sensor frame** (the values a `SensorEvent` carries after
+  the InvenSense HAL), gyroscope X is the **pitch rate**; positive X rate =
+  head tilting up. Both RELATIVE_LOOK_UP (integrates +X) and NUDGE
+  (classifies X, checks Y and Z are quiet) rely on this. **[C]** for the
+  Android frame. How raw IIO axes map to it depends on the board orientation
+  matrix (`board-notle.c:1608-1621`, MPU-9150
+  `orientation = {0,1,0, 0,0,1, 1,0,0}`, exported by the driver) and on any
+  remapping the HAL applies; a reader of `/dev/iio:device0` must apply the
+  same matrix, and the result must be checked on a device. **[I]**
 - Head pitch from gravity, as used by the settings UI that picks the wake
   angle: `pitch_deg = -atan2(gz, sqrt(gx^2 + gy^2))` in degrees, using the
   InvenSense gravity sensor (type 9, vendor `Invensense`, name containing
@@ -89,7 +93,7 @@ Parameters are carried as a text property list `KEY=VALUE;KEY=VALUE`
 (keys sorted, floats printed with `%f`), handed to the HAL with the
 vendor NDK call `ASensorEventQueue_setParameters(queue, gluSensor, string)`;
 the HAL routes it when the sensor handle is 7 (GLU). The keys and defaults
-(from `glass::NewGluParams` in `libglass_sensorsutils.so`):
+(constants in `libglass_sensorsutils.so`):
 
 | Key | Default | Meaning | DMP value written |
 |---|---|---|---|

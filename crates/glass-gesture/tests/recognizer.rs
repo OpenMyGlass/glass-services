@@ -697,3 +697,22 @@ fn bare_report_never_ends_a_protocol_a_touch() {
     assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
     assert_eq!(gestures(&out), vec![(GestureKind::Tap, 1)]);
 }
+
+#[test]
+fn real_all_up_right_after_an_encoded_frame_ends_the_touch() {
+    let c = cfg();
+    for (dx, dy) in [(1, 1), (3, 0)] {
+        // An encoded press, or a flick too short to decode: neither wakes.
+        let mut s = Synth::new(&c, T0);
+        s.frame(&[(0.0, 0.0)]);
+        s.advance_ms(10);
+        s.encoded(dx, dy);
+        s.advance_ms(10);
+        s.lift();
+        let mut r = Recognizer::new(c.clone());
+        r.set_screen_off_decoding(true);
+        let out = r.feed(&s.take());
+        assert!(!r.touching(), "({dx},{dy}) {out:?}");
+        assert_eq!(counts(&out), vec![(0, 1), (1, 0)]);
+    }
+}

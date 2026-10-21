@@ -8,9 +8,25 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const T: Duration = Duration::from_secs(5);
+/// Handshake timeout for the integration tests (slow CI runners).
+const HANDSHAKE: Duration = Duration::from_secs(20);
+
+/// Kills and reaps the daemon when dropped, also when a test panics.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn(cmd: &mut Command) -> ChildGuard {
+    ChildGuard(cmd.spawn().expect("spawn glassd"))
+}
 
 struct Mock {
-    child: Child,
+    child: ChildGuard,
     stdin: ChildStdin,
     dir: PathBuf,
     socket: PathBuf,
@@ -22,15 +38,15 @@ impl Mock {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("glassd.sock");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_glassd"))
-            .args(["--mock", "--socket"])
-            .arg(&socket)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn glassd");
-        let stdin = child.stdin.take().unwrap();
+        let mut child = spawn(
+            Command::new(env!("CARGO_BIN_EXE_glassd"))
+                .args(["--mock", "--socket"])
+                .arg(&socket)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit()),
+        );
+        let stdin = child.0.stdin.take().unwrap();
         let deadline = Instant::now() + T;
         while !socket.exists() {
             assert!(
@@ -53,7 +69,7 @@ impl Mock {
     }
 
     fn client(&self, topics: &[Topic]) -> Client {
-        let mut c = Client::connect_as(&self.socket, "it").unwrap();
+        let mut c = Client::connect_with_timeout(&self.socket, "it", HANDSHAKE).unwrap();
         c.subscribe(topics).unwrap();
         c
     }
@@ -61,8 +77,8 @@ impl Mock {
 
 impl Drop for Mock {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.0.kill();
+        let _ = self.child.0.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -243,21 +259,22 @@ fn touchpad_events_from_a_fake_device() {
     let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
 
     let socket = dir.join("glassd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_glassd"))
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--device")
-        .arg(&fifo)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+    let _child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--device")
+            .arg(&fifo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
     let deadline = Instant::now() + T;
     while !socket.exists() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
-    let mut c = Client::connect_as(&socket, "it").unwrap();
+    let mut c = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
     assert!(c.has_capability("touchpad"));
     assert!(!c.has_capability("mock"));
     c.subscribe(&[Topic::Gesture]).unwrap();
@@ -283,8 +300,6 @@ fn touchpad_events_from_a_fake_device() {
     writer.write_all(&bytes).unwrap();
     let g = c.recv_until(T, |f| gesture(f).is_some()).unwrap().unwrap();
     assert_eq!(gesture(&g), Some((GestureKind::Tap, 2)));
-    let _ = child.kill();
-    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -47,7 +47,7 @@ pub enum ClientError {
     Closed,
     /// The service answered `Hello` with something other than `Welcome`.
     Handshake(Box<ServiceFrame>),
-    /// No `Welcome` within [`HANDSHAKE_TIMEOUT`].
+    /// No `Welcome` within the handshake timeout.
     HandshakeTimeout,
 }
 
@@ -105,6 +105,15 @@ impl Client {
 
     /// Connects to `path` with the given client name.
     pub fn connect_as(path: impl AsRef<Path>, client_name: &str) -> Result<Client, ClientError> {
+        Self::connect_with_timeout(path, client_name, HANDSHAKE_TIMEOUT)
+    }
+
+    /// Like [`connect_as`](Self::connect_as), waiting up to `handshake` for `Welcome`.
+    pub fn connect_with_timeout(
+        path: impl AsRef<Path>,
+        client_name: &str,
+        handshake: Duration,
+    ) -> Result<Client, ClientError> {
         let stream = UnixStream::connect(path)?;
         let mut c = Client {
             stream,
@@ -120,7 +129,7 @@ impl Client {
                 client_name: client_name.into(),
             })),
         })?;
-        match c.recv(Some(HANDSHAKE_TIMEOUT))? {
+        match c.recv(Some(handshake))? {
             Some(ServiceFrame {
                 body: Some(service_frame::Body::Welcome(w)),
             }) => c.welcome = w,

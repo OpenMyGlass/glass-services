@@ -471,8 +471,14 @@ impl Recognizer {
                 return;
             }
             // The driver may close a real-finger frame early around an encoded one, so the
-            // frame right after it can be partial: do not read fewer fingers from it.
-            if just_after && !had && self.phase != Phase::Idle && real.len() < self.prev.len() {
+            // frame right after it can be partial: do not read fewer fingers from it. A real
+            // all-up (an empty frame with SYN_MT_REPORT) still ends the touch.
+            if just_after
+                && !had
+                && self.phase != Phase::Idle
+                && !real.is_empty()
+                && real.len() < self.prev.len()
+            {
                 return;
             }
             contacts = real;

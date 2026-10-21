@@ -11,5 +11,6 @@ rust-version.workspace = true
 glass-api.workspace = true
 glass-evdev.workspace = true
 glass-gesture.workspace = true
+glass-head.workspace = true
 glass-hub.workspace = true
 libc.workspace = true

@@ -67,7 +67,7 @@ Split into pull requests that each build and pass on their own.
 2. [x] Buttons: camera (`gpio-keys`) and power (`twl6030_pwrbutton`) by device name; press, long press, release; a short power press toggles the manual off-head.
 3. [x] Back ends: `FBIOBLANK` on the panel framebuffer, touchpad `sleepmode` on off-head and don.
 4. [x] Settings stored in a file, written atomically, read at start.
-5. [ ] `glass-head`: IIO buffer reader for the MPU-9150, look-up and look-down from the accelerometer, nudge and relative look-up from the gyroscope, inhibition windows; `HeadRequest` in the interface (next pull request).
+5. [x] `glass-head`: IIO buffer reader for the MPU-9150 (scan elements, the Glass format byte, timestamps, scales, board matrix), look-up and look-down from the accelerometer, our nudge detector and relative look-up from the gyroscope, inhibition windows, sensors run only when needed; `HeadRequest` in the interface.
 6. [x] Mock commands for buttons, hinge, wear and wink through the same logic as the hardware; capabilities only for the sources found.
 
 ## Later milestones
@@ -94,3 +94,10 @@ Split into pull requests that each build and pass on their own.
 - [ ] `FBIOBLANK` on `/dev/graphics/fb0` turns the panel off and on (find which fb drives the panel); nothing writes the brightness attributes.
 - [ ] The settings survive a restart of `glassd` (`/data/glassd/settings`).
 - [ ] The daemon still uses no CPU when idle with the glasshub and buttons open.
+- [ ] The IMU is the IIO device `mpu9150`; dump a few records with gyro and accel enabled and check the layout (24 bytes, format byte 0x06 at offset 15, timestamp at 16) and the scales.
+- [ ] Axes: with the board matrix applied, +y is up with the head level, looking up gives positive pitch, and gyro x is positive when tilting the head up; roll stays under 10° when looking straight up.
+- [ ] Look-up wakes the screen at the set angle (10° to 40°) and not when starting with the head up; look-down re-arms it.
+- [ ] Nudge: count detections and false positives over normal use (walking, talking, turning the head) and tune `NudgeConfig`.
+- [ ] Relative look-up fires at about 17° with a client's `HeadRequest`.
+- [ ] Power: with head wake on and the screen off, the 10 Hz accelerometer interrupt wakes the CPU; measure the battery drain and whether Android still suspends. Without the DMP firmware this is the cost of look-up to wake (owner decision if it is too high).
+- [ ] The IMU stops (`buffer/enable` 0, `power_state` 0) off the head and when no detector runs.

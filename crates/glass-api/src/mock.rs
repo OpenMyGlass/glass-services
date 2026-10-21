@@ -312,7 +312,7 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
                     }));
                 }
             }
-            Effect::SettingsChanged(_) => {}
+            Effect::SettingsChanged(_) | Effect::Head { .. } => {}
         }
     }
 }

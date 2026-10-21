@@ -481,6 +481,8 @@ fn screen_off_encoded_frames() {
     // Without decoding (screen on), the same frame is an ordinary touch.
     let mut s = Synth::new(&c, T0);
     s.encoded(0, 0);
+    s.advance_ms(10);
+    s.lift();
     let out = Recognizer::new(c.clone()).feed(&s.take());
     assert_eq!(gestures(&out), vec![(GestureKind::Tap, 1)]);
 }
@@ -538,4 +540,110 @@ fn scroll_reports_only_when_delta_is_nonzero() {
     });
     let sc = scrolls(&out);
     assert!(sc[..sc.len() - 1].iter().all(|s| s.delta != 0.0));
+}
+
+fn screen_off(out: &[Output]) -> Vec<ScreenOffGesture> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::ScreenOff { gesture, .. } => Some(*gesture),
+            _ => None,
+        })
+        .collect()
+}
+
+fn decoding(c: &Config, events: &[RawEvent]) -> Vec<Output> {
+    let mut r = Recognizer::new(c.clone());
+    r.set_screen_off_decoding(true);
+    r.feed(events)
+}
+
+#[test]
+fn encoded_frame_between_real_contacts_is_not_an_all_up() {
+    // Early suspend: real contacts keep arriving, the encoded frame comes in between.
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.encoded(0, 0);
+    s.advance_ms(10);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(10);
+    s.lift();
+    let out = decoding(&c, &s.take());
+    assert_eq!(screen_off(&out), vec![ScreenOffGesture::Tap]);
+    assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
+    assert!(scrolls(&out).is_empty());
+}
+
+#[test]
+fn encoded_contact_in_the_same_frame_as_real_ones_is_kept_out_of_tracking() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.stroke(1, (-200.0, 0.0), (100.0, 0.0), 50);
+    s.advance_ms(10);
+    s.frame_with_encoded(&[(-100.0, 0.0)], 9, 0);
+    s.advance_ms(10);
+    s.frame(&[(-90.0, 0.0)]);
+    s.advance_ms(10);
+    s.lift();
+    let out = decoding(&c, &s.take());
+    assert_eq!(screen_off(&out), vec![ScreenOffGesture::SwipeForward]);
+    assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
+    // No jump towards the encoded position (raw X 109, far behind the finger).
+    let sc = scrolls(&out);
+    assert!(
+        sc.windows(2)
+            .all(|w| w[1].displacement >= w[0].displacement),
+        "{sc:?}"
+    );
+    assert!((sc.last().unwrap().displacement - 0.11).abs() < 0.01);
+}
+
+#[test]
+fn encoded_frame_alone_starts_no_touch() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.encoded(1, 1);
+    s.advance_ms(10);
+    s.lift();
+    let out = decoding(&c, &s.take());
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(screen_off(&out), vec![ScreenOffGesture::LongPress]);
+}
+
+#[test]
+fn a_repeated_encoded_frame_is_reported_once() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.encoded(0, 0);
+    s.advance_ms(10);
+    s.encoded(0, 0);
+    s.advance_ms(10);
+    s.lift();
+    s.advance_ms(10);
+    s.encoded(-1, -1);
+    let out = decoding(&c, &s.take());
+    assert_eq!(
+        screen_off(&out),
+        vec![ScreenOffGesture::Tap, ScreenOffGesture::Tap]
+    );
+}
+
+#[test]
+fn syn_dropped_ignores_the_rest_of_the_touch() {
+    let c = cfg();
+    let mut s = Synth::new(&c, T0);
+    s.frame(&[(0.0, 0.0)]);
+    let mut events = s.take();
+    let t = s.time_us() + 5_000;
+    events.push(ev_at(t, ev::SYN, syn::DROPPED, 0));
+    events.push(ev_at(t, ev::SYN, syn::REPORT, 0));
+    s.advance_ms(20);
+    s.frame(&[(0.0, 0.0)]);
+    s.advance_ms(20);
+    s.lift();
+    events.extend(s.take());
+    let out = Recognizer::new(c).feed(&events);
+    assert!(gestures(&out).is_empty(), "{out:?}");
+    assert_eq!(counts(&out), vec![(0, 1), (1, 0)]);
 }

@@ -13,8 +13,9 @@
 //!   Horizontal scrolls send `Scroll` frames. On lift, a one-finger scroll is classified from
 //!   its entry point (angle limits and release velocity); a two-finger scroll needs both lifts
 //!   within the release window; three fingers never swipe.
-//! - While screen-off decoding is on, the kernel's encoded screen-off frames
-//!   (touchpad-gestures.md §5.2) produce [`Output::ScreenOff`] instead of a touch.
+//! - While screen-off decoding is on, contacts with the markers of the kernel's encoded
+//!   screen-off frames (touchpad-gestures.md §5.2) produce [`Output::ScreenOff`] and are kept
+//!   out of touch tracking; real contacts around them are recognized as usual.
 //!
 //! Positions are oriented first (forward and down positive, see [`Config`]), so all the logic
 //! works in the Glass frame.
@@ -271,10 +272,9 @@ enum Phase {
     Tap,
     /// Left the tap radius; `dir` fixed at entry (`None` if no axis dominated).
     Scroll { dir: Option<Dir> },
-    /// The touch produces no more gestures: long press fired, four fingers, three fingers
-    /// moved (`silent: false`, finger counts are still reported), or an encoded screen-off
-    /// frame (`silent: true`, nothing is reported until all fingers are up).
-    Dead { silent: bool },
+    /// The touch produces no more gestures (long press fired, four fingers, three fingers
+    /// moved, events dropped); finger counts are still reported until all fingers are up.
+    Dead,
 }
 
 /// The recognizer. Feed it events with [`push`](Self::push) or [`feed`](Self::feed).
@@ -304,6 +304,8 @@ pub struct Recognizer {
     last_scroll: Option<Scroll>,
     /// Two-finger scroll: time of the first lift, and whether its direction matched.
     first_lift: Option<(u64, bool)>,
+    /// The previous frame carried an encoded screen-off contact.
+    encoded_seen: bool,
 }
 
 impl Recognizer {
@@ -324,6 +326,7 @@ impl Recognizer {
             long_press_at: None,
             last_scroll: None,
             first_lift: None,
+            encoded_seen: false,
         }
     }
 
@@ -360,15 +363,16 @@ impl Recognizer {
                     velocity: 0.0,
                     timestamp_us: at,
                 }));
-                self.phase = Phase::Dead { silent: false };
+                self.phase = Phase::Dead;
             }
         }
     }
 
-    /// Ends the current touch without a gesture (device lost, for example).
+    /// Ends the current touch now, without a gesture (device lost, for example).
     pub fn cancel(&mut self, now_us: u64, out: &mut Vec<Output>) {
         self.cancel_touch(now_us, out);
         self.frames = FrameBuilder::new();
+        self.encoded_seen = false;
     }
 
     /// Feeds a batch of events, returning the outputs.
@@ -384,21 +388,22 @@ impl Recognizer {
     pub fn push(&mut self, e: &RawEvent, out: &mut Vec<Output>) {
         match self.frames.push(e) {
             None => {}
-            Some(FrameEvent::Dropped) => self.cancel_touch(e.time_us, out),
+            Some(FrameEvent::Dropped) => self.dropped(out),
             Some(FrameEvent::Frame(contacts)) => self.frame(e.time_us, contacts, out),
         }
     }
 
     fn orient(&self, c: &Contact) -> Point {
+        let (x, y) = (i64::from(c.x), i64::from(c.y));
         let x = if self.cfg.forward_is_positive_x {
-            c.x - self.cfg.x.min
+            x - i64::from(self.cfg.x.min)
         } else {
-            self.cfg.x.max - c.x
+            i64::from(self.cfg.x.max) - x
         };
         let y = if self.cfg.down_is_positive_y {
-            c.y - self.cfg.y.min
+            y - i64::from(self.cfg.y.min)
         } else {
-            self.cfg.y.max - c.y
+            i64::from(self.cfg.y.max) - y
         };
         Point {
             id: c.id,
@@ -407,22 +412,24 @@ impl Recognizer {
         }
     }
 
-    /// `Some(decoded)` if the frame is an encoded screen-off frame.
-    fn decode_encoded(&self, contacts: &[Contact]) -> Option<Option<ScreenOffGesture>> {
-        let [c] = contacts else { return None };
+    /// Whether a contact carries the markers of an encoded screen-off frame
+    /// (touchpad-gestures.md §5.2: pressure ≤ 0.01, touch major and minor ≥ 14.8).
+    fn is_encoded(&self, c: &Contact) -> bool {
         let p = c.pressure as f32 / self.cfg.pressure_max.max(1) as f32;
-        if p > self.cfg.encoded_max_pressure
-            || (c.major as f32) < self.cfg.encoded_min_size
-            || (c.minor as f32) < self.cfg.encoded_min_size
-        {
-            return None;
-        }
-        let (dx, dy) = (c.x - 100, c.y - 100);
+        p <= self.cfg.encoded_max_pressure
+            && c.major as f32 >= self.cfg.encoded_min_size
+            && c.minor as f32 >= self.cfg.encoded_min_size
+    }
+
+    /// The gesture encoded at (100 + dx, 100 + dy), if any.
+    fn decode_encoded(&self, c: &Contact) -> Option<ScreenOffGesture> {
+        let dx = i64::from(c.x) - 100;
+        let dy = i64::from(c.y) - 100;
         let forward = (dx > 0) == self.cfg.forward_is_positive_x;
-        Some(match (dx, dy) {
+        match (dx, dy) {
             (0, 0) | (-1, -1) => Some(ScreenOffGesture::Tap),
             (1, 1) => Some(ScreenOffGesture::LongPress),
-            _ if dx.abs() >= self.cfg.encoded_min_flick && dx.abs() > dy.abs() => {
+            _ if dx.abs() >= i64::from(self.cfg.encoded_min_flick) && dx.abs() > dy.abs() => {
                 Some(if forward {
                     ScreenOffGesture::SwipeForward
                 } else {
@@ -430,30 +437,33 @@ impl Recognizer {
                 })
             }
             _ => None,
-        })
+        }
     }
 
-    fn frame(&mut self, t: u64, contacts: Vec<Contact>, out: &mut Vec<Output>) {
-        if self.phase == Phase::Idle && contacts.is_empty() {
-            return;
-        }
-        if self.phase == Phase::Idle
-            && self.screen_off_decoding
-            && let Some(g) = self.decode_encoded(&contacts)
-        {
-            if let Some(gesture) = g {
+    fn frame(&mut self, t: u64, mut contacts: Vec<Contact>, out: &mut Vec<Output>) {
+        if self.screen_off_decoding {
+            // Encoded contacts are interleaved with real ones: report them, keep them out of
+            // the touch, and do not take a frame that only carried one for an all-up.
+            let (encoded, real): (Vec<Contact>, Vec<Contact>) =
+                contacts.into_iter().partition(|c| self.is_encoded(c));
+            let had = !encoded.is_empty();
+            if !self.encoded_seen
+                && let Some(gesture) = encoded.first().and_then(|c| self.decode_encoded(c))
+            {
                 out.push(Output::ScreenOff {
                     gesture,
                     timestamp_us: t,
                 });
             }
-            self.phase = Phase::Dead { silent: true };
-            return;
-        }
-        if self.phase == (Phase::Dead { silent: true }) {
-            if contacts.is_empty() {
-                self.phase = Phase::Idle;
+            self.encoded_seen = had;
+            if had && real.is_empty() {
+                return;
             }
+            contacts = real;
+        } else {
+            self.encoded_seen = false;
+        }
+        if self.phase == Phase::Idle && contacts.is_empty() {
             return;
         }
         // A frame later than the hold time fires the long press first.
@@ -495,7 +505,7 @@ impl Recognizer {
                 if self.beyond_slop(&points, self.cfg.touch_slop * factor) {
                     self.long_press_at = None;
                     if n >= 3 {
-                        self.phase = Phase::Dead { silent: false };
+                        self.phase = Phase::Dead;
                     } else {
                         let (dx, dy) = mean_delta(&self.reference, &points);
                         self.entry = self.cum;
@@ -508,7 +518,7 @@ impl Recognizer {
                 }
             }
             Phase::Scroll { .. } => self.maybe_scroll(t, n, out),
-            Phase::Dead { .. } | Phase::Idle => {}
+            Phase::Dead | Phase::Idle => {}
         }
         self.prev = points;
         self.last_t = t;
@@ -532,7 +542,7 @@ impl Recognizer {
         self.reference = points.clone();
         self.prev = points;
         if n >= 4 {
-            self.phase = Phase::Dead { silent: false };
+            self.phase = Phase::Dead;
             self.long_press_at = None;
         } else {
             self.phase = Phase::Tap;
@@ -551,7 +561,7 @@ impl Recognizer {
         if n >= 4 {
             self.long_press_at = None;
             self.cancel_scroll(out);
-            self.phase = Phase::Dead { silent: false };
+            self.phase = Phase::Dead;
             return;
         }
         self.reference = points.to_vec();
@@ -652,8 +662,18 @@ impl Recognizer {
         }
     }
 
+    /// Events were lost (`SYN_DROPPED`): the touch produces nothing more until all fingers are
+    /// up.
+    fn dropped(&mut self, out: &mut Vec<Output>) {
+        if self.phase != Phase::Idle {
+            self.cancel_scroll(out);
+            self.long_press_at = None;
+            self.phase = Phase::Dead;
+        }
+    }
+
     fn cancel_touch(&mut self, t: u64, out: &mut Vec<Output>) {
-        if matches!(self.phase, Phase::Idle | Phase::Dead { silent: true }) {
+        if self.phase == Phase::Idle {
             self.reset();
             return;
         }
@@ -711,7 +731,7 @@ impl Recognizer {
                     }));
                 }
             }
-            Phase::Dead { .. } | Phase::Idle => {}
+            Phase::Dead | Phase::Idle => {}
         }
         if prev_n > 0 {
             out.push(Output::FingerCount(FingerCount {

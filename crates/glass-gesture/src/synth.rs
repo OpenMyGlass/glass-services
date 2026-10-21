@@ -110,18 +110,32 @@ impl Synth {
         self.frame(&[]);
     }
 
-    /// A screen-off encoded frame at raw (100 + dx, 100 + dy), as the driver sends it in early
-    /// suspend (kernel-interfaces.md §1.5), followed by the all-up frame 10 ms later.
-    pub fn encoded(&mut self, dx: i32, dy: i32) {
+    fn encoded_contact(&mut self, dx: i32, dy: i32) {
         self.push(ev::ABS, abs::MT_PRESSURE, 1);
         self.push(ev::ABS, abs::MT_TOUCH_MAJOR, 15);
         self.push(ev::ABS, abs::MT_TOUCH_MINOR, 15);
         self.push(ev::ABS, abs::MT_POSITION_X, 100 + dx);
         self.push(ev::ABS, abs::MT_POSITION_Y, 100 + dy);
         self.push(ev::SYN, syn::MT_REPORT, 0);
+    }
+
+    /// One screen-off encoded frame at raw (100 + dx, 100 + dy), as the driver sends it in
+    /// early suspend (kernel-interfaces.md §1.5): one contact with pressure 1, size 15 and no
+    /// tracking id. No all-up frame follows; real contacts may keep arriving around it.
+    pub fn encoded(&mut self, dx: i32, dy: i32) {
+        self.encoded_contact(dx, dy);
         self.push(ev::SYN, syn::REPORT, 0);
-        self.advance_ms(10);
-        self.lift();
+    }
+
+    /// One frame with real contacts and an encoded contact after them.
+    pub fn frame_with_encoded(&mut self, contacts: &[(f32, f32)], dx: i32, dy: i32) {
+        let mut real = self.clone();
+        real.events.clear();
+        real.frame(contacts);
+        // Drop the SYN_REPORT of the real contacts, then add the encoded one.
+        real.events.pop();
+        self.events.extend(real.events);
+        self.encoded(dx, dy);
     }
 
     /// The events so far, emptying the buffer.

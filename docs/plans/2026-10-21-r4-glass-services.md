@@ -8,7 +8,7 @@ Roadmap phase R4 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGl
 - **Android glue in its own layer** (`android/`, later milestone): an init service entry, SELinux policy if needed, and a small Java system service or app that turns our events into what Android expects (key events for legacy apps, `PowerManager` wake and sleep, settings). It talks to the daemon over the same socket as any other client.
 - **Clean room.** Facts come from:
   1. the GPL kernel drivers (read directly, `docs/specs/kernel-interfaces.md`);
-  2. the reverse-engineering specs in `docs/specs/` (written by a separate agent who studied the stock libraries; the implementers read only the specs);
+  2. the reverse-engineering specs in `docs/specs/` (to be written by a separate agent who studied the stock libraries; the implementers read only the specs);
   3. Glass behaviour as publicly documented (GDK reference, Glass design guidelines).
 - **Hardware:** OMAP4430, two Cortex-A9 at up to 1 GHz. The daemon must be idle when nothing happens (block on `poll`, no busy timers), and cheap when the touchpad reports at its full rate.
 - **Safety (rule 6):** nothing here touches voltages, frequencies, thermal limits or charging. The screen policy only blanks and unblanks the display and holds wake locks.
@@ -28,8 +28,8 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 
 - One daemon, `glassd`, with one module per source: touchpad, head (IMU), glasshub, screen policy. The modules are libraries (crates) with pure logic separated from device I/O, so the logic is tested on the host with recorded or synthetic event streams.
 - Clients (the launcher, apps, the Android glue) connect to a Unix stream socket. The interface is in [`../api.md`](../api.md).
-- Framing and encoding follow OpenMyGlass's bridge protocol: a varint32 length followed by one protobuf message. Rust uses `prost` with hand-written derives (no `protoc` needed in the build); Java glue can use protobuf-lite with the same `.proto`.
-- `glassd --mock` (or the `glass-services-mock` library) serves the same socket with scripted or keyboard-driven events, so apps are built and tested without a Glass.
+- Framing and encoding follow OpenMyGlass's bridge protocol: a varint32 length followed by one protobuf message. Rust generates its types from the `.proto` at build time with `prost-build` and `protox` (a pure-Rust protobuf compiler, so no `protoc` is needed), so the Rust types cannot drift from the `.proto`; Java glue uses protobuf-lite with the same file.
+- `glassd --mock` (and the in-process mock in `glass-api`) serves the same socket with scripted or keyboard-driven events, so apps are built and tested without a Glass.
 
 ### Crates
 
@@ -70,3 +70,6 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 - [ ] `glassd` finds the touchpad by name and reads its axis ranges.
 - [ ] Taps, swipes in both directions, swipe down, two-finger tap and swipe are recognized with the stock feel.
 - [ ] The daemon uses no CPU when idle (`top`), and less than 2 % of one core while a finger moves.
+- [ ] Two clients: the focus moves to the second and back when it disconnects; the first gets a cancelled `Scroll` if the hand-off happens mid-touch.
+- [ ] A tap on a dark screen wakes it and selects nothing.
+- [ ] evdev timestamps are monotonic after `EVIOCSCLOCKID`.

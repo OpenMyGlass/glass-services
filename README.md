@@ -7,10 +7,10 @@ Clean-room Glass system services for Google Glass Explorer Edition: touchpad ges
 | [`docs/api.md`](docs/api.md) | The interface between `glassd` and clients (launcher, apps, Android glue) |
 | [`proto/glass/services/v1/services.proto`](proto/glass/services/v1/services.proto) | Its messages |
 | [`docs/plans/`](docs/plans/) | Plans and decisions |
-| [`docs/specs/`](docs/specs/) | Facts: kernel interfaces (from the GPL kernel source) and clean-room specs of the stock components |
+| `docs/specs/` | Facts: kernel interfaces (from the GPL kernel source) and clean-room specs of the stock components (added by their own PRs) |
 
 ## Clean room
 
-The stock Glass libraries were studied by a separate reverse-engineering agent, who wrote only the specs in `docs/specs/`. The code here is written from those specs, the GPL kernel source and public Glass documentation, by people and agents who did not see the decompiled code. No Google file, and nothing derived by copying from one, is in this repository.
+The stock Glass libraries are studied by a separate reverse-engineering agent, who writes only the specs in `docs/specs/`. The code here is written from those specs, the GPL kernel source and public Glass documentation, by people and agents who did not see the decompiled code. No Google file, and nothing derived by copying from one, is in this repository.
 
 License: Apache-2.0 (see `LICENSE`).

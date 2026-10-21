@@ -63,7 +63,8 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 
 - **M2:** head gestures, glasshub (on-head, wink), screen policy; device checklist.
 - **M3:** Android glue (init service, system app, key event injection for legacy apps, `PowerManager` wake and sleep).
-- **M4:** route 2 packaging (OpenRC service for Alpine, udev-free device discovery).
+- **M4:** location feed from the phone (owner decision 2026-10-22: the GPS chip stays asleep and no GPS HAL is written): relay of the bridge's location messages through the companion link provider, `TOPIC_LOCATION` in glassd, mock commands; in the Android glue, a location provider fed from it.
+- **M5:** route 2 packaging (OpenRC service for Alpine, udev-free device discovery).
 
 ## Device checklist (not run: no Glass available)
 

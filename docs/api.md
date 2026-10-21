@@ -29,7 +29,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
-Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button`, `dictation`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
+Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
 
 ### Requests and errors
 
@@ -37,7 +37,7 @@ Capabilities say which sources exist on this device or build: `touchpad`, `head`
 - A frame with no known body (an empty frame, or a request newer than this `glassd`) gets `ERROR_CODE_UNSUPPORTED`.
 - A known request with an invalid value gets `ERROR_CODE_INVALID_ARGUMENT`: `ACTION_UNSPECIFIED`, an unknown dictation `purpose`, a missing `notification_key` for `"notification-reply"`. In `Subscribe`, `TOPIC_UNSPECIFIED` and unknown topic values are ignored.
 - `SetSettings` is always answered with the full `Settings` to the sender, once even if it is subscribed to `TOPIC_SETTINGS`; the other subscribers get it too.
-- Unknown fields in a known message are ignored (normal protobuf rules), so fields can be added without a version bump. A change that alters the meaning of an existing field goes into a new package `glass.services.v2`; `glassd` may serve both.
+- Unknown fields in a known message are ignored (normal protobuf rules), so fields can be added without a version bump. A change that alters the meaning of an existing field goes into a new package `glass.services.v2`; `glassd` may serve both. This rule applies from the first release; until then version 1 is still being aligned with the specs.
 
 | `ErrorCode` | Meaning |
 |---|---|
@@ -68,7 +68,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 | `GESTURE_KIND_LONG_PRESS` | touch and hold without moving | reserved by the stock system; delivered to the app here |
 | `GESTURE_KIND_SWIPE_FORWARD` | horizontal stroke toward the front of the frame (the eye) | move through the timeline to older cards |
 | `GESTURE_KIND_SWIPE_BACKWARD` | horizontal stroke toward the ear | move through the timeline to newer cards and settings |
-| `GESTURE_KIND_SWIPE_DOWN` | downward stroke anywhere on the pad | back, dismiss; on the home card, turn the screen off |
+| `GESTURE_KIND_SWIPE_DOWN` | downward stroke anywhere on the pad | back, dismiss; on the home card, turn the screen off. With two fingers it is handled by `glassd` (see Screen) and not delivered |
 | `GESTURE_KIND_SWIPE_UP` | upward stroke | reserved |
 
 - `Gesture.fingers` is the largest number of fingers seen during the gesture (1, 2 or 3). A two-finger tap is `TAP` with `fingers: 2`.
@@ -77,34 +77,46 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 - `Scroll` is sent while fingers move horizontally, once the movement passes the slop threshold. `displacement` and `velocity` are in pad widths (1.0 = the full horizontal travel) and per second, positive forward. The last `Scroll` of a touch has `ended: true`.
 - For a horizontal swipe a client gets both: the `Scroll` frames, the final `Scroll{ended:true}`, then the `SWIPE_*` gesture. A list that follows the finger uses `Scroll` while dragging and the gesture (or the final velocity) to decide where to settle.
 - `FingerCount` reports changes in the number of fingers on the pad.
-- **Waking touch.** While the screen is `SCREEN_OFF`, touchpad events are not delivered: the touch that wakes the screen is consumed, so a tap on a dark screen never selects anything. While the screen is `SCREEN_DIM`, a touch restores `SCREEN_ON` and is delivered normally.
-- Thresholds (slop, hold time, minimum swipe distance and velocity) are tuned to match the stock feel; their values come from the specs in `docs/specs/` (added by separate PRs) and live in the `glass-gesture` crate.
+- **Waking touch.** While the screen is `SCREEN_OFF`, touchpad events are not delivered. A tap or a forward or backward swipe wakes the screen and is consumed; other touches are ignored. On route 1 (Android early suspend) the touchpad controller adds encoded wake gestures to its reports while the screen is off, and `glassd` uses only those, ignoring the real contacts that still arrive (`docs/specs/kernel-interfaces.md` §1.5, `docs/specs/touchpad-gestures.md` §5). On route 2 there is no early suspend and no encoded frames, so `glassd` classifies screen-off touches itself with the same recognizer. A tap on a dark screen never selects anything. While the screen is `SCREEN_DIM`, a touch restores `SCREEN_ON` and is consumed too (as on stock Glass): only the next touch reaches the app.
+- Thresholds (slop, hold time, minimum swipe distance and velocity) are tuned to match the stock feel; their values come from `docs/specs/touchpad-gestures.md` §4.2 and live in the `glass-gesture` crate.
 
-## Camera button (`TOPIC_BUTTON`)
+## Buttons (`TOPIC_BUTTON`)
 
-`Button{BUTTON_ID_CAMERA, action}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes, then `BUTTON_ACTION_RELEASE`. On Glass a press takes a picture and a long press records video; that is the app's decision. The button wakes the screen and, unlike the touchpad, the waking press is also delivered. Broadcast to all subscribers.
+- `Button{BUTTON_ID_CAMERA, action, screen_off}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes, then `BUTTON_ACTION_RELEASE`. On Glass a press takes a picture and a long press records video; that is the app's decision. The camera button wakes the screen and, unlike the touchpad, the waking press is delivered, with `screen_off: true`, so a camera app can start at once.
+- `Button{BUTTON_ID_POWER, ...}` is reported for information. `glassd` itself handles a short press (manual off-head, see Wearing). On route 1, the Android glue keeps Android's own power-key handling out of the short press (a keylayout change for the `twl6030_pwrbutton` device, milestone 3) and leaves the long press to Android (shut-down menu); on route 2, `glassd` handles the long press by asking the init system to power off (milestone 4).
+- The camera button still works while the Glass is off the head, as on stock Glass.
+- Broadcast to all subscribers.
 
 ## Head gestures (`TOPIC_HEAD`, milestone 2)
 
-- Pitch is the head's angle above the horizon, from the accelerometer's gravity vector, positive up.
-- `HEAD_GESTURE_KIND_LOOK_UP` when the pitch rises past `Settings.head_wake_angle_deg`; `HEAD_GESTURE_KIND_LOOK_DOWN` when it falls below the wake angle minus 5°. When `head_wake_enabled` is true, `glassd`'s screen policy wakes the screen on `LOOK_UP`; clients do not need to.
-- `HEAD_GESTURE_KIND_NOD` for a quick down-up movement.
+- Pitch is the head's angle above the horizon, from the accelerometer's gravity vector, positive up. On stock Glass the look-up is detected by the IMU's DMP, which reports no angle; `pitch_deg` and `LOOK_DOWN` are ours, computed in software from the accelerometer.
+- `HEAD_GESTURE_KIND_LOOK_UP` when the pitch rises past `Settings.head_wake_angle_deg` (default 30°) with the roll under 10°. As on stock Glass it is detected only while the screen is off, the Glass is on the head and `head_wake_enabled` is true (the sensor is not run otherwise). `glassd` then wakes the screen with the quick timeout (see Screen); clients do not need to.
+- `HEAD_GESTURE_KIND_LOOK_DOWN` (ours): the pitch fell back below the wake angle minus 7°, which re-arms look-up. It is sent with the screen in any state while look-up detection runs.
+- `HEAD_GESTURE_KIND_NUDGE`: a quick upward head nudge while the screen is on. When `nudge_sleep_enabled` is true (default false), `glassd` turns the screen off, unless a touch is in progress.
+- `HEAD_GESTURE_KIND_RELATIVE_LOOK_UP`: the pitch rose by 17° or more within 5 s, from any start angle (stock uses it to reveal a notification). It needs the gyro read every 20 ms, so it runs only while at least one client is subscribed to `TOPIC_HEAD` and has asked for it (a request added in milestone 2), and while it runs it replaces the global look-up, as on stock Glass.
+- Inhibition windows: no nudge within 1000 ms of a look-up or nudge; no look-up within 500 ms of a nudge. Stock also lets an app inhibit look-up for a while (the home card does it for 5 s while a notification is shown); the request for it is added in milestone 2.
 
 ## Wearing and wink (`TOPIC_WEAR`, milestone 2)
 
-- `WearState` from the glasshub proximity sensor: `WEAR_ON_HEAD`, `WEAR_OFF_HEAD`, or `WEAR_UNKNOWN` when detection is disabled or unavailable.
-- `Wink` when the glasshub reports a deliberate wink and `wink_enabled` is true. What a wink does (on Glass, take a picture) is the app's decision.
-- Whether disabling wink or on-head detection also powers the sensor down, and how wink calibration is exposed, is decided in milestone 2 from the glasshub spec.
+- `WearState{wear, source}`:
+  - `WEAR_SOURCE_SENSOR`: the glasshub on-head detection, when `on_head_detection_enabled` is true (default false).
+  - `WEAR_SOURCE_FORCED`: detection off, so the Glass is assumed on the head (`WEAR_ON_HEAD`); also during the 30 s after boot.
+  - `WEAR_SOURCE_POWER_KEY`: a short power-key press toggles a manual off-head; the next press gives a timed on-head (30 s, then back to the sensor if detection is on).
+  - `WEAR_SOURCE_HINGE`: closing the hinge forces off-head; opening it gives a timed on-head. The Linux input code of the hinge switch is not confirmed yet (device needed), so this source may be missing (`hinge` capability).
+  - `WEAR_UNKNOWN` only before the first state is known.
+- On off-head (any source), `glassd` turns the screen off, puts the touchpad to sleep and stops head wake. On don it re-enables them and, if the screen is off, wakes it with the quick timeout.
+- `Wink` when the glasshub reports a deliberate wink and `wink_enabled` is true (default false; it needs a calibration, milestone 2). A wink does not wake the screen. What it does (on Glass, take a picture) is the app's decision.
 
 ## Screen (`TOPIC_SCREEN`)
 
 `glassd` owns the screen policy, so every app does not need to:
-- **Wakes** on a touchpad touch, on `LOOK_UP` when head wake is on, on the camera button, and on `ACTION_WAKE`.
-- **Sleeps** after `screen_timeout_ms` without user activity (with a dim step before), on `WEAR_OFF_HEAD` when on-head detection is on, and on `ACTION_SLEEP` (the launcher sends it on `SWIPE_DOWN` at the home card).
+- **Wakes** on a touchpad tap or forward or backward swipe, on `LOOK_UP` when head wake is on, on don, on the camera button, and on `ACTION_WAKE`. `ScreenState` for a wake carries `reason`, `last_sleep_reason` and `off_ms`, so the launcher can decide whether to return to the home card (stock: it returns home unless the last sleep was a timeout or a gesture and either the screen was off for 5 s or less or an immersive app was in front; a swipe always returns home). The sleep reasons that count as a gesture are `nudge` (as on stock) and `two-finger-swipe-down` (our choice). `off_ms` counts time in suspend too (`CLOCK_BOOTTIME`), so a Glass left off overnight reports the real time.
+- **Quick timeout:** a wake by look-up or by don uses a one-shot 3 s timeout with no dim step; the next user activity switches back to the normal timeout.
+- **Sleeps** after `screen_timeout_ms` (default 15 s) without user activity, with a dim step before; on a **two-finger swipe down anywhere** (handled by `glassd`, not delivered to apps, as on stock Glass); on a nudge when `nudge_sleep_enabled`; on `WEAR_OFF_HEAD`; and on `ACTION_SLEEP` (the launcher sends it on a one-finger `SWIPE_DOWN` at the home card).
 - **Keep-on holds:** `ACTION_KEEP_ON` wakes the screen if needed and holds it on, without dimming, for `duration_ms` (0, or more than 10 minutes, means 10 minutes: a client renews it to hold longer). A repeated `ACTION_KEEP_ON` from the same client replaces its hold. The screen stays on while any client holds it. A hold ends on `ACTION_RELEASE_KEEP_ON`, when its time runs out, or when the client disconnects.
-- **Overrides:** `ACTION_SLEEP` and `WEAR_OFF_HEAD` turn the screen off even with holds, and cancel every hold. Taking the Glass off always wins, for battery and for heat against the temple.
+- **Overrides:** every explicit sleep (`ACTION_SLEEP`, the two-finger swipe down, a nudge with `nudge_sleep_enabled`, `WEAR_OFF_HEAD`) turns the screen off even with holds, and cancels every hold; only the timeout respects holds. An `ACTION_KEEP_ON` during the quick timeout wins over it. Taking the Glass off always wins, for battery and for heat against the temple.
 - `ACTION_USER_ACTIVITY` restarts the timer, for activity `glassd` cannot see.
-- `ScreenState` reports every change with a `reason`.
+- `ScreenState` reports every change with a `reason`; `dim` for the dim step and `activity` when a touch or `ACTION_USER_ACTIVITY` restores `SCREEN_ON` from `SCREEN_DIM`.
 
 The default timeout and the dim step follow the stock behaviour described in `docs/specs/`.
 
@@ -114,13 +126,17 @@ The default timeout and the dim step follow the stock behaviour described in `do
 
 | Field | Range |
 |---|---|
-| `head_wake_angle_deg` | 10 to 60 (degrees above the horizon) |
-| `screen_timeout_ms` | 3000 to 600000; there is no "never" |
+| `head_wake_enabled` | default true |
+| `head_wake_angle_deg` | 10 to 40 (degrees above the horizon), default 30 |
+| `wink_enabled` | default false |
+| `on_head_detection_enabled` | default false |
+| `screen_timeout_ms` | 3000 to 600000, default 15000; there is no "never" |
+| `nudge_sleep_enabled` | default false |
 
 ## Dictation (`TOPIC_DICTATION`, milestone 3)
 
 Speech is not transcribed on Glass: it goes to the phone, which transcribes it offline, through the OpenMyGlass companion and its bridge protocol ([`openmyglass.v1`](https://github.com/OpenMyGlass/OpenMyGlass/blob/main/protocol/openmyglass/v1/bridge.proto): `DictationStart`, `AudioChunk`, `DictationEnd`, `Transcript`, `ReplyConfirm`, `ReplyResult`).
-- An app sends `DictationStart{request_id, purpose}`. `purpose` is `"notification-reply"` (with the notification key and action index, as in the bridge protocol) or `"free"` (any text, for example a note). Bridge v1 supports only notification replies: `"free"` needs a small bridge change, proposed in OpenMyGlass.
+- An app sends `DictationStart{request_id, purpose}`. `purpose` is `"notification-reply"` (with the notification key and action index, as in the bridge protocol) or `"free"` (any text, for example a note). `"free"` maps to the bridge's `DictationStart.free` (added in [OpenMyGlass#83](https://github.com/OpenMyGlass/OpenMyGlass/pull/83)), available when the phone's Hello lists the `dictation-free` capability; without it, `glassd` answers `ERROR_CODE_UNSUPPORTED`. The phone forgets a request 60 s after its start, so `glassd` ends a free dictation after 55 s and reports `STATE_FAILED` with `error: "expired"` if no transcript came.
 - `request_id` is per connection; `glassd` maps it to its own id on the companion link, so two clients cannot collide.
 - `glassd` relays the request to the companion link provider, the process that holds the phone connection. The provider captures the microphone and streams audio to the phone, so audio never passes through `glassd`. How the provider registers is defined in milestone 3.
 - The app receives `DictationState` and `Transcript` for its own request without subscribing to `TOPIC_DICTATION` (the topic exists for symmetry and carries nothing else). The bridge's `Transcript.error` becomes `DictationState{STATE_FAILED, error}`.
@@ -129,4 +145,4 @@ Speech is not transcribed on Glass: it goes to the phone, which transcribes it o
 
 ## Mock
 
-`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `lookup`, `lookdown`, `wear on|off`, `wink`, `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.
+`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `power [long]`, `hinge open|closed`, `lookup`, `lookdown`, `relative-lookup`, `nudge`, `wear on|off`, `wink`, `dim`, `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.

@@ -39,7 +39,7 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 | `glass-gesture` | Touchpad gesture recognizer: evdev events in, gestures out; pure, no I/O | M1 |
 | `glass-evdev` | Minimal evdev reader (`input_event` parsing, `EVIOCGNAME`, `EVIOCGABS`) over `libc` | M1 |
 | `glassd` | The daemon: `poll` loop, device discovery, socket server, `--mock` | M1 (touchpad only) |
-| `glass-head` | Head gestures (look up to wake, nod) from IMU samples | M2 |
+| `glass-head` | Head gestures (look up to wake, nudge, relative look-up) from IMU samples | M2 |
 | `glass-hub` | glasshub: on-head, wink, through the kernel driver's interface | M2 |
 | `glass-screen` | Wake and sleep policy (timeouts, wake sources, off-head) as a pure state machine, plus the display back ends | M2 |
 | `android/` | Android glue | M3 |

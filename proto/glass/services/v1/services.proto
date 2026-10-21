@@ -288,7 +288,7 @@ message LocationRequest {
 message Location {
   double latitude_deg = 1;
   double longitude_deg = 2;
-  float accuracy_m = 3;                      // horizontal, 68 % radius
+  float accuracy_m = 3;                      // horizontal, 68 % radius; 0 = unknown
   optional double altitude_m = 4;
   optional float bearing_deg = 5;
   optional float speed_mps = 6;

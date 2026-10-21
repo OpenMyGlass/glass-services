@@ -15,7 +15,8 @@ usage: glassd [options]
   --invert-y              down is decreasing raw Y
   --screen-off-input <encoded|touches>
                           screen-off wake: the kernel's encoded frames only (Android early
-                          suspend), or the recognizer on real touches (default: touches)
+                          suspend), or the recognizer on real touches (default: encoded on
+                          Android, touches elsewhere)
   -v, --verbose           log to standard error
   -h, --help              this help";
 
@@ -27,7 +28,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<(Options, bool), String> 
         device_name: TOUCHPAD_NAME.into(),
         invert_x: false,
         invert_y: false,
-        screen_off_input: ScreenOffInput::Touches,
+        // Android builds run with early suspend, where the kernel sends encoded frames.
+        screen_off_input: if cfg!(target_os = "android") {
+            ScreenOffInput::Encoded
+        } else {
+            ScreenOffInput::Touches
+        },
     };
     let mut verbose = false;
     let mut args = args.peekable();
@@ -60,9 +66,9 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(e) => {
             if !e.is_empty() {
-                eprintln!("glassd: {e}");
+                glassd::log::write(format_args!("glassd: {e}"));
             }
-            eprintln!("{USAGE}");
+            glassd::log::write(format_args!("{USAGE}"));
             return if e.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -74,14 +80,14 @@ fn main() -> ExitCode {
     let mut d = match Daemon::new(&opts, Box::new(LoggingDisplay)) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("glassd: cannot start: {e}");
+            glassd::log::write(format_args!("glassd: cannot start: {e}"));
             return ExitCode::FAILURE;
         }
     };
     match d.run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("glassd: {e}");
+            glassd::log::write(format_args!("glassd: {e}"));
             ExitCode::FAILURE
         }
     }

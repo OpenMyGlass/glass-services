@@ -12,12 +12,18 @@ pub fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+/// Writes one line to standard error; errors (a closed stderr) are ignored, never a panic.
+pub fn write(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{args}");
+}
+
 /// Logs when `--verbose` is on.
 #[macro_export]
 macro_rules! info {
     ($($a:tt)*) => {
         if $crate::log::verbose() {
-            eprintln!("glassd: {}", format_args!($($a)*))
+            $crate::log::write(format_args!("glassd: {}", format_args!($($a)*)))
         }
     };
 }
@@ -26,6 +32,6 @@ macro_rules! info {
 #[macro_export]
 macro_rules! warn {
     ($($a:tt)*) => {
-        eprintln!("glassd: warning: {}", format_args!($($a)*))
+        $crate::log::write(format_args!("glassd: warning: {}", format_args!($($a)*)))
     };
 }

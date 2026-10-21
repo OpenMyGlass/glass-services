@@ -20,12 +20,15 @@ use glass_gesture::{AxisRange, Config, Output, RawEvent, Recognizer};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 /// Name of the touchpad input device (docs/specs/kernel-interfaces.md §1.2).
 pub const TOUCHPAD_NAME: &str = "sensor00fn11";
+
+/// Bytes read from one client per loop iteration.
+const READ_BUDGET: usize = 64 * 1024;
 
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
@@ -94,7 +97,13 @@ pub struct Daemon {
 /// Binds the socket: removes a stale socket file, refuses to start if another daemon answers,
 /// creates the parent directory, and sets mode 0660.
 pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
-    if path.exists() {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
         if UnixStream::connect(path).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -416,27 +425,34 @@ impl Daemon {
         let mut gone = false;
         let mut bad = None;
         if let Some(c) = self.conns.get_mut(&id) {
-            loop {
-                match c.stream.read(&mut buf) {
+            // At most READ_BUDGET bytes per pass, so one busy client cannot starve the others
+            // (poll reports the rest next time); frames are parsed after each read.
+            let mut budget = READ_BUDGET;
+            'read: while budget > 0 {
+                let want = buf.len().min(budget);
+                match c.stream.read(&mut buf[..want]) {
                     Ok(0) => {
                         gone = true;
                         break;
                     }
-                    Ok(n) => c.decoder.push(&buf[..n]),
+                    Ok(n) => {
+                        budget -= n;
+                        c.decoder.push(&buf[..n]);
+                        loop {
+                            match c.decoder.next_message::<ClientFrame>() {
+                                Ok(Some(f)) => frames.push(f),
+                                Ok(None) => break,
+                                Err(e) => {
+                                    bad = Some(e.to_string());
+                                    break 'read;
+                                }
+                            }
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => {
                         gone = true;
-                        break;
-                    }
-                }
-            }
-            loop {
-                match c.decoder.next_message::<ClientFrame>() {
-                    Ok(Some(f)) => frames.push(f),
-                    Ok(None) => break,
-                    Err(e) => {
-                        bad = Some(e.to_string());
                         break;
                     }
                 }
@@ -549,7 +565,8 @@ impl Daemon {
     fn feed_touch(&mut self, events: &[RawEvent]) {
         let mut out = Vec::new();
         for e in events {
-            self.rec.set_screen_off_decoding(self.policy.is_off());
+            self.rec
+                .set_screen_off_decoding(self.gate.decoding(&self.policy));
             self.rec.push(e, &mut out);
             if !out.is_empty() {
                 let o = std::mem::take(&mut out);
@@ -775,5 +792,43 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("glassd-bind-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn bind_refuses_to_unlink_a_regular_file() {
+        let d = dir("file");
+        let p = d.join("glassd.sock");
+        std::fs::write(&p, b"keep me").unwrap();
+        assert!(bind_socket(&p).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bind_replaces_a_stale_socket_and_refuses_a_live_one() {
+        let d = dir("sock");
+        let p = d.join("glassd.sock");
+        drop(UnixListener::bind(&p).unwrap()); // stale: nobody listens
+        let live = bind_socket(&p).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+        assert_eq!(
+            bind_socket(&p).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(live);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

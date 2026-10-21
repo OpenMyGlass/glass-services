@@ -287,3 +287,37 @@ fn touchpad_events_from_a_fake_device() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn off_head_camera_is_delivered_without_waking() {
+    let mut m = Mock::start("offhead");
+    let mut c = m.client(&[Topic::Screen, Topic::Button]);
+    let _snapshot = c.recv(Some(T)).unwrap().unwrap();
+    m.send("wear off");
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::Off, "off-head".into())));
+    m.send("camera");
+    let f = c
+        .recv_until(T, |f| {
+            screen(f).is_some() || matches!(f.body, Some(Body::Button(_)))
+        })
+        .unwrap()
+        .unwrap();
+    let Some(Body::Button(b)) = f.body else {
+        panic!("{f:?}")
+    };
+    assert!(b.screen_off);
+    // A wake request is refused off the head too.
+    c.send(glass_api::proto::client_frame::Body::Screen(
+        glass_api::proto::ScreenRequest {
+            action: glass_api::proto::screen_request::Action::Wake as i32,
+            duration_ms: 0,
+        },
+    ))
+    .unwrap();
+    assert!(
+        c.recv_until(Duration::from_millis(300), |f| screen(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+}

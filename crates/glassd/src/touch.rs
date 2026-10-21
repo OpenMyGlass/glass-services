@@ -3,10 +3,12 @@
 //!
 //! - Screen on: the touch is delivered and counts as user activity, except a two-finger
 //!   `SWIPE_DOWN`, which turns the screen off and is not delivered.
-//! - Screen dim: the touch restores the screen and is consumed.
-//! - Screen off: nothing is delivered. Encoded screen-off frames (route 1) wake on tap and
-//!   forward or backward swipe; with [`ScreenOffInput::Touches`] (route 2, no encoded
-//!   frames) the recognizer's own tap and horizontal swipes do the same.
+//! - Screen dim: the touch restores the screen and is consumed (a two-finger swipe down in it
+//!   still turns the screen off).
+//! - Screen off: nothing is delivered. With [`ScreenOffInput::Encoded`] (route 1, Android
+//!   early suspend) only the kernel's encoded frames wake, on tap and forward or backward
+//!   swipe; with [`ScreenOffInput::Touches`] (route 2, no encoded frames, decoding off) the
+//!   recognizer's own tap and horizontal swipes do the same.
 //! - Off the head: touches are ignored.
 
 use crate::screen::{Change, Now, ScreenPolicy, TouchStart};
@@ -35,7 +37,10 @@ pub enum Step {
 enum Mode {
     Idle,
     Deliver,
+    /// Screen was dim: consumed, but a two-finger swipe down still sleeps.
     Consume,
+    /// Off the head: ignored.
+    Ignore,
     ScreenOff,
 }
 
@@ -51,6 +56,12 @@ impl TouchGate {
             mode: Mode::Idle,
             input,
         }
+    }
+
+    /// Whether the recognizer must decode encoded screen-off frames now: only on route 1
+    /// ([`ScreenOffInput::Encoded`]) and while the screen is off.
+    pub fn decoding(&self, policy: &ScreenPolicy) -> bool {
+        self.input == ScreenOffInput::Encoded && policy.is_off()
     }
 
     /// Whether a touch is in progress.
@@ -91,19 +102,20 @@ impl TouchGate {
             push(change, &mut steps);
             self.mode = match start {
                 TouchStart::Deliver => Mode::Deliver,
-                TouchStart::Consume | TouchStart::Ignore => Mode::Consume,
+                TouchStart::Consume => Mode::Consume,
+                TouchStart::Ignore => Mode::Ignore,
                 TouchStart::ScreenOff => Mode::ScreenOff,
             };
         }
         match self.mode {
-            Mode::Deliver => {
+            Mode::Deliver | Mode::Consume => {
                 push(policy.activity(now), &mut steps);
                 if let Output::Gesture(g) = out
                     && g.kind == GestureKind::SwipeDown as i32
                     && g.fingers == 2
                 {
                     push(policy.sleep(now, "two-finger-swipe-down"), &mut steps);
-                } else {
+                } else if self.mode == Mode::Deliver {
                     steps.push(Step::Deliver(frame));
                 }
             }
@@ -122,7 +134,7 @@ impl TouchGate {
                     }
                 }
             }
-            Mode::Consume | Mode::Idle => {}
+            Mode::Ignore | Mode::Idle => {}
         }
         if ends {
             self.mode = Mode::Idle;
@@ -161,7 +173,8 @@ mod tests {
             let mut s = Synth::new(&Config::default(), self.t);
             build(&mut s);
             self.t = s.time_us() + 100_000;
-            self.rec.set_screen_off_decoding(self.policy.is_off());
+            self.rec
+                .set_screen_off_decoding(self.gate.decoding(&self.policy));
             let mut steps = Vec::new();
             for o in self.rec.feed(&s.take()) {
                 steps.extend(self.gate.handle(&o, &mut self.policy, Now::at(self.t)));
@@ -224,6 +237,32 @@ mod tests {
             80.0,
             200
         ))));
+    }
+
+    #[test]
+    fn two_finger_swipe_down_on_a_dim_screen_sleeps() {
+        let mut r = Rig::new(ScreenOffInput::Touches);
+        r.policy.force_dim(Now::at(S));
+        let steps = r.run(|s| s.swipe(Direction::Down, 2, 80.0, 200));
+        assert!(delivered(&steps).is_empty());
+        assert_eq!(
+            changes(&steps),
+            vec![
+                (Screen::On, "activity"),
+                (Screen::Off, "two-finger-swipe-down")
+            ]
+        );
+    }
+
+    #[test]
+    fn encoded_decoding_only_on_route1_with_the_screen_off() {
+        let mut p = ScreenPolicy::new(Now::at(0), 15_000);
+        let enc = TouchGate::new(ScreenOffInput::Encoded);
+        let touches = TouchGate::new(ScreenOffInput::Touches);
+        assert!(!enc.decoding(&p) && !touches.decoding(&p));
+        p.sleep(Now::at(S), "request");
+        assert!(enc.decoding(&p));
+        assert!(!touches.decoding(&p));
     }
 
     #[test]

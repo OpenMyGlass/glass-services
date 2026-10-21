@@ -183,8 +183,12 @@ impl ScreenPolicy {
         }
     }
 
-    /// Wakes the screen (`reason` is a wake reason); `quick` for look-up and don.
+    /// Wakes the screen (`reason` is a wake reason); `quick` for look-up and don. Nothing
+    /// wakes the screen while the Glass is off the head.
     pub fn wake(&mut self, now: Now, reason: &'static str, quick: bool) -> Option<Change> {
+        if !self.on_head {
+            return None;
+        }
         match self.screen {
             Screen::On => {
                 self.last_activity_us = now.mono_us;
@@ -198,11 +202,8 @@ impl ScreenPolicy {
         }
     }
 
-    /// A screen-off tap or swipe; only on the head.
+    /// A screen-off tap or swipe.
     pub fn wake_gesture(&mut self, now: Now, reason: &'static str) -> Option<Change> {
-        if !self.on_head {
-            return None;
-        }
         self.wake(now, reason, false)
     }
 
@@ -258,6 +259,8 @@ impl ScreenPolicy {
                 self.wake(now, "request", false)
             }
             Action::Sleep => self.sleep(now, "request"),
+            // Off the head, holds are not accepted (taking the Glass off cancelled them).
+            Action::KeepOn if !self.on_head => None,
             Action::KeepOn => {
                 let d = if duration_ms == 0 || duration_ms > MAX_HOLD_MS {
                     MAX_HOLD_MS
@@ -522,6 +525,19 @@ mod tests {
         p.sleep(Now::at(14 * S), "request");
         assert_eq!(p.request(Now::at(15 * S), 1, Action::UserActivity, 0), None);
         assert!(p.is_off());
+    }
+
+    #[test]
+    fn off_head_refuses_wake_keep_on_and_button() {
+        let mut p = policy();
+        p.set_on_head(Now::at(S), false);
+        assert_eq!(p.request(Now::at(2 * S), 1, Action::Wake, 0), None);
+        assert_eq!(p.request(Now::at(2 * S), 1, Action::KeepOn, 0), None);
+        assert_eq!(p.wake(Now::at(2 * S), "button", false), None);
+        assert!(p.is_off());
+        // The refused hold does not exist after the don: quick timeout applies.
+        p.set_on_head(Now::at(3 * S), true);
+        assert_eq!(p.next_deadline(), Some(6 * S));
     }
 
     #[test]

@@ -91,7 +91,8 @@ Split into pull requests that each build and pass on their own.
 - [ ] `don_doff` reads 1 on the head and 0 off it, and `poll` wakes on each change (`on_head_detection_enabled` true); taking the Glass off turns the screen off and writes touchpad `sleepmode` 1, putting it on wakes the screen with the 3 s timeout.
 - [ ] With `wink_enabled`, a wink raises the `wink` notification and a `Wink` frame; note the false-positive rate without a CPU classifier.
 - [ ] The camera key (`gpio-keys`, `KEY_CAMERA`) gives press, long press and release, and wakes the screen; the power key (`twl6030_pwrbutton`) short press toggles off-head and on-head (`WEAR_SOURCE_POWER_KEY`). On route 1 Android's own power-key handling must be kept out of the short press first (milestone 3).
-- [ ] `FBIOBLANK` on `/dev/graphics/fb0` turns the panel off and on (find which fb drives the panel); nothing writes the brightness attributes.
+- [ ] `FBIOBLANK` (`--display fb`) turns the panel off and on (find which fb drives the panel); nothing writes the brightness attributes. Decision: on route 1 Android's framework owns blanking and `glassd` defaults to `--display log`; the M3 glue maps `ScreenState` to `PowerManager`.
+- [ ] Does `don_doff` already hold the right state right after `don_doff_enable` = 1 or `pause` = 0, or does the firmware need a moment (and then notify)? `glassd` reads it again at once.
 - [ ] The settings survive a restart of `glassd` (`/data/glassd/settings`).
 - [ ] The daemon still uses no CPU when idle with the glasshub and buttons open.
 - [ ] The IMU is the IIO device `mpu9150`; dump a few records with gyro and accel enabled and check the layout (24 bytes, format byte 0x06 at offset 15, timestamp at 16) and the scales.

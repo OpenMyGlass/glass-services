@@ -110,7 +110,8 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
   - Turning `on_head_detection_enabled` on hands over to the sensor at once; turning it off forces on-head. A sensor reading taken while it did not count (detection off, forced or timed periods) is kept and applies when the sensor counts again.
 - On off-head (any source), `glassd` turns the screen off, cancels every keep-on hold, cancels a touch in progress, puts the touchpad to sleep (`sleepmode` 1) and stops head wake. While forced off the head (power key or hinge), the glasshub is paused. While off the head nothing wakes the screen: touches are ignored, `ACTION_WAKE` and `ACTION_KEEP_ON` are ignored (no hold is recorded), and the camera button is delivered without a wake. On don it re-enables them and, if the screen is off, wakes it with the quick timeout.
 - `Wink` when the glasshub reports a wink, `wink_enabled` is true (default false) and the Glass is on the head. A wink does not wake the screen. What it does (on Glass, take a picture) is the app's decision.
-  - The wink is the glasshub firmware's low-power wink interrupt, armed only while `wink_enabled` is true. Stock Glass confirms it with a CPU classifier on the raw proximity stream and a per-user calibration; `glassd` does not reproduce that classifier, so false positives are likely until an open classifier and calibration exist (`docs/specs/glasshub.md` §6.4, §8).
+  - The wink is the glasshub firmware's low-power wink interrupt, armed only while `wink_enabled` is true; a read of `wink` that gives 0 is not a wink. Stock Glass confirms the interrupt with a CPU classifier on the raw proximity stream and a per-user calibration; `glassd` does not reproduce that classifier, so false positives are likely until an open classifier and calibration exist (`docs/specs/glasshub.md` §6.4, §8).
+  - After it arms on-head detection or resumes the hub, `glassd` reads `don_doff` again, since the state may have changed without a notification. If the glasshub fails (a read error), `glassd` stops using it: the Glass is forced on the head and winks stop.
   - At start `glassd` writes the firmware thresholds (on-head detection off while it does): don 450, doff 400, don max 2000, gain 2, or a user's calibration from the stock parameter file `/data/system/gaze/gaze_params.txt` if it is there (`--gaze-params`). It never writes `calibrate`, `update_fw_*` or anything outside a fixed list of attributes.
 
 ## Screen (`TOPIC_SCREEN`)
@@ -126,7 +127,10 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 
 The default timeout and the dim step follow the stock behaviour described in `docs/specs/`.
 
-The panel is switched with `FBIOBLANK` on its framebuffer (`--display fb[:path]`, default `/dev/graphics/fb0` on Android and `/dev/fb0` on Linux): unblank for `SCREEN_ON` and `SCREEN_DIM`, power down for `SCREEN_OFF`. The dim step is reported but does not change the panel yet: `glassd` never writes the brightness, nor `brightness_limit` or `brightness_multiplier`. `--display log` (the default with `--mock`) only logs.
+Who switches the panel:
+- **Route 2 (Linux):** `glassd`, with `FBIOBLANK` on the panel framebuffer (`--display fb[:path]`, default `/dev/fb0`; it must be a character device): unblank for `SCREEN_ON` and `SCREEN_DIM`, power down for `SCREEN_OFF`.
+- **Route 1 (Android):** the framework owns blanking (`PowerManager`, SurfaceFlinger, hwcomposer), so `glassd` defaults to `--display log` there and the Android glue (milestone 3) turns `ScreenState` into `PowerManager` calls. `--display fb` still forces `FBIOBLANK` (for example to test without the framework).
+- The dim step is reported but does not change the panel yet: `glassd` never writes the brightness, nor `brightness_limit` or `brightness_multiplier`. `--display log` (also the default with `--mock`) only logs.
 
 ## Settings (`TOPIC_SETTINGS`)
 

@@ -1,0 +1,249 @@
+//! A blocking client for the glassd socket.
+
+use crate::codec::{FrameDecoder, FrameError, encode_frame};
+use crate::hub::API_VERSION;
+use crate::proto::{
+    AcquireInputFocus, ClientFrame, Hello, ReleaseInputFocus, ServiceFrame, Subscribe, Topic,
+    Welcome, client_frame, service_frame,
+};
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Environment variable that overrides the socket path.
+pub const SOCKET_ENV: &str = "GLASS_SERVICES_SOCKET";
+
+/// The default socket path for this build target (without the environment override).
+pub fn default_socket_path() -> &'static str {
+    if cfg!(target_os = "android") {
+        "/dev/socket/glassd"
+    } else {
+        "/run/glassd/glassd.sock"
+    }
+}
+
+/// The socket path: `$GLASS_SERVICES_SOCKET` if set and not empty, else the default.
+pub fn socket_path() -> PathBuf {
+    socket_path_from(std::env::var_os(SOCKET_ENV))
+}
+
+fn socket_path_from(env: Option<std::ffi::OsString>) -> PathBuf {
+    match env {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(default_socket_path()),
+    }
+}
+
+/// How long [`Client::connect`] waits for `Welcome`.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub enum ClientError {
+    Io(io::Error),
+    Frame(FrameError),
+    /// The service closed the connection.
+    Closed,
+    /// The service answered `Hello` with something other than `Welcome`.
+    Handshake(Box<ServiceFrame>),
+    /// No `Welcome` within [`HANDSHAKE_TIMEOUT`].
+    HandshakeTimeout,
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClientError::Io(e) => write!(f, "I/O error: {e}"),
+            ClientError::Frame(e) => write!(f, "protocol error: {e}"),
+            ClientError::Closed => write!(f, "connection closed by the service"),
+            ClientError::Handshake(fr) => write!(f, "unexpected answer to Hello: {fr:?}"),
+            ClientError::HandshakeTimeout => write!(f, "no Welcome from the service"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+impl From<io::Error> for ClientError {
+    fn from(e: io::Error) -> Self {
+        ClientError::Io(e)
+    }
+}
+
+impl From<FrameError> for ClientError {
+    fn from(e: FrameError) -> Self {
+        ClientError::Frame(e)
+    }
+}
+
+/// A connected, handshaken session.
+pub struct Client {
+    stream: UnixStream,
+    decoder: FrameDecoder,
+    welcome: Welcome,
+    next_seq: u32,
+}
+
+impl Client {
+    /// Connects to `path`, sends `Hello` (client name: the executable's file name) and waits
+    /// for `Welcome`.
+    pub fn connect(path: impl AsRef<Path>) -> Result<Client, ClientError> {
+        let name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "glass-api-client".into());
+        Self::connect_as(path, &name)
+    }
+
+    /// Connects to [`socket_path()`].
+    pub fn connect_default() -> Result<Client, ClientError> {
+        Self::connect(socket_path())
+    }
+
+    /// Connects to `path` with the given client name.
+    pub fn connect_as(path: impl AsRef<Path>, client_name: &str) -> Result<Client, ClientError> {
+        let stream = UnixStream::connect(path)?;
+        let mut c = Client {
+            stream,
+            decoder: FrameDecoder::new(),
+            welcome: Welcome::default(),
+            next_seq: 1,
+        };
+        c.send_frame(&ClientFrame {
+            seq: 0,
+            body: Some(client_frame::Body::Hello(Hello {
+                api_version: API_VERSION,
+                client_name: client_name.into(),
+            })),
+        })?;
+        match c.recv(Some(HANDSHAKE_TIMEOUT))? {
+            Some(ServiceFrame {
+                body: Some(service_frame::Body::Welcome(w)),
+            }) => c.welcome = w,
+            Some(other) => return Err(ClientError::Handshake(Box::new(other))),
+            None => return Err(ClientError::HandshakeTimeout),
+        }
+        Ok(c)
+    }
+
+    /// The service's `Welcome`.
+    pub fn welcome(&self) -> &Welcome {
+        &self.welcome
+    }
+
+    /// Whether the service announced `cap` (for example `"touchpad"`).
+    pub fn has_capability(&self, cap: &str) -> bool {
+        self.welcome.capabilities.iter().any(|c| c == cap)
+    }
+
+    /// Sends a raw frame as is.
+    pub fn send_frame(&mut self, frame: &ClientFrame) -> Result<(), ClientError> {
+        let mut buf = Vec::new();
+        encode_frame(frame, &mut buf)?;
+        self.stream.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Sends a request with a fresh `seq`, returned so errors can be matched to it.
+    pub fn send(&mut self, body: client_frame::Body) -> Result<u32, ClientError> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.send_frame(&ClientFrame {
+            seq,
+            body: Some(body),
+        })?;
+        Ok(seq)
+    }
+
+    /// Replaces the subscribed topics.
+    pub fn subscribe(&mut self, topics: &[Topic]) -> Result<u32, ClientError> {
+        self.send(client_frame::Body::Subscribe(Subscribe {
+            topics: topics.iter().map(|&t| t as i32).collect(),
+        }))
+    }
+
+    pub fn acquire_focus(&mut self) -> Result<u32, ClientError> {
+        self.send(client_frame::Body::AcquireFocus(AcquireInputFocus {}))
+    }
+
+    pub fn release_focus(&mut self) -> Result<u32, ClientError> {
+        self.send(client_frame::Body::ReleaseFocus(ReleaseInputFocus {}))
+    }
+
+    /// Receives the next frame. `timeout` `None` blocks; on timeout, returns `Ok(None)`.
+    pub fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<ServiceFrame>, ClientError> {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let mut buf = [0u8; 8192];
+        loop {
+            if let Some(f) = self.decoder.next_message::<ServiceFrame>()? {
+                return Ok(Some(f));
+            }
+            let wait = match deadline {
+                None => None,
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(None);
+                    }
+                    Some(left)
+                }
+            };
+            self.stream.set_read_timeout(wait)?;
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Err(ClientError::Closed),
+                Ok(n) => self.decoder.push(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Receives frames until `pred` matches one, within `timeout`; returns it, or `None` on
+    /// timeout. Frames that do not match are discarded.
+    pub fn recv_until(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&ServiceFrame) -> bool,
+    ) -> Result<Option<ServiceFrame>, ClientError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.recv(Some(left))? {
+                None => return Ok(None),
+                Some(f) if pred(&f) => return Ok(Some(f)),
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// The underlying stream (for example to poll it).
+    pub fn stream(&self) -> &UnixStream {
+        &self.stream
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_resolution() {
+        assert_eq!(
+            socket_path_from(Some("/tmp/x.sock".into())),
+            PathBuf::from("/tmp/x.sock")
+        );
+        assert_eq!(
+            socket_path_from(Some("".into())),
+            PathBuf::from(default_socket_path())
+        );
+        assert_eq!(socket_path_from(None), PathBuf::from(default_socket_path()));
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(default_socket_path(), "/run/glassd/glassd.sock");
+    }
+}

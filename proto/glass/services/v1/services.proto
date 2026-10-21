@@ -168,7 +168,8 @@ enum HeadGestureKind {
   HEAD_GESTURE_KIND_UNSPECIFIED = 0;
   HEAD_GESTURE_KIND_LOOK_UP = 1;             // head pitch rose past the wake angle
   HEAD_GESTURE_KIND_LOOK_DOWN = 2;           // head pitch fell back below the wake angle minus the hysteresis
-  HEAD_GESTURE_KIND_NOD = 3;
+  HEAD_GESTURE_KIND_NUDGE = 3;               // a quick upward head nudge (stock: puts the screen to sleep if enabled)
+  HEAD_GESTURE_KIND_RELATIVE_LOOK_UP = 4;    // pitch rose by 17 degrees or more within 5 s, from any start angle
 }
 
 message HeadGesture {
@@ -183,8 +184,17 @@ enum Wear {
   WEAR_OFF_HEAD = 2;
 }
 
+enum WearSource {
+  WEAR_SOURCE_UNSPECIFIED = 0;
+  WEAR_SOURCE_SENSOR = 1;                    // glasshub on-head detection
+  WEAR_SOURCE_FORCED = 2;                    // detection off: assumed on head (also the 30 s period after boot)
+  WEAR_SOURCE_POWER_KEY = 3;                 // short power-key press toggles a manual off-head
+  WEAR_SOURCE_HINGE = 4;                     // hinge switch closed (off) or opened (on)
+}
+
 message WearState {
   Wear wear = 1;
+  WearSource source = 4;
   bool snapshot = 2;                         // sent because of Subscribe or GetState, not because of a change
   uint64 timestamp_us = 3;                   // time of the change (for a snapshot: of the last change)
 }
@@ -202,13 +212,18 @@ enum Screen {
 
 message ScreenState {
   Screen screen = 1;
-  string reason = 2;                         // "touch", "look-up", "button", "timeout", "off-head", "request", "snapshot"
+  string last_sleep_reason = 4;              // with a wake: why the screen last went off
+  uint32 off_ms = 5;                         // with a wake: how long the screen was off
+  string reason = 2;                         // wake: "tap", "swipe-forward", "swipe-backward", "don", "look-up", "button",
+                                             // "request"; sleep: "timeout", "two-finger-swipe-down", "nudge", "off-head",
+                                             // "request"; or "snapshot"
   uint64 timestamp_us = 3;                   // time of the change (for a snapshot: of the last change)
 }
 
 enum ButtonId {
   BUTTON_ID_UNSPECIFIED = 0;
   BUTTON_ID_CAMERA = 1;
+  BUTTON_ID_POWER = 2;
 }
 
 enum ButtonAction {
@@ -221,15 +236,17 @@ enum ButtonAction {
 message Button {
   ButtonId button = 1;
   ButtonAction action = 2;
+  bool screen_off = 4;                       // the screen was off when the button was pressed
   uint64 timestamp_us = 3;
 }
 
 message Settings {
   optional bool head_wake_enabled = 1;
-  optional float head_wake_angle_deg = 2;    // 10 to 60, above the horizon
+  optional float head_wake_angle_deg = 2;    // 10 to 40, above the horizon; default 30
   optional bool wink_enabled = 3;
   optional bool on_head_detection_enabled = 4;
-  optional uint32 screen_timeout_ms = 5;     // 3000 to 600000
+  optional uint32 screen_timeout_ms = 5;     // 3000 to 600000; default 15000
+  optional bool nudge_sleep_enabled = 6;     // default false
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 

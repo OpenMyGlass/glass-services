@@ -29,7 +29,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
-Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
+Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation`, `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
 
 ### Requests and errors
 
@@ -143,6 +143,15 @@ Speech is not transcribed on Glass: it goes to the phone, which transcribes it o
 - For `"notification-reply"`, after the final transcript the app sends `DictationConfirm{send}` (the bridge's `ReplyConfirm`); the bridge's `ReplyResult` becomes `STATE_SENT` or `STATE_FAILED`.
 - `DictationCancel` stops a request. Without a provider, `DictationStart` gets `ERROR_CODE_NO_COMPANION`.
 
+## Location (`TOPIC_LOCATION`, milestone 4)
+
+Glass gets its location from the phone, not from its own GPS chip, which stays asleep (owner decision, 2026-10-22; no GPS HAL is written). The fixes come through the OpenMyGlass companion's bridge protocol (`LocationSubscribe`, `LocationUpdate`, `LocationUnavailable`, proposed in OpenMyGlass), relayed by the companion link provider, as for dictation.
+- A client sends `LocationRequest{interval_ms, high_accuracy}` and subscribes to `TOPIC_LOCATION`. `glassd` asks the phone for the shortest interval and the highest accuracy any client wants, and tells the phone to stop when no client wants fixes (`interval_ms: 0`, or the client disconnects). The phone only tracks while asked, to save its battery.
+- `Location` frames are broadcast to subscribers. On `Subscribe` and `GetState`, the last known fix (if any) is sent with `snapshot: true`; a client checks `fix_time_ms` and `received_us` to judge its age. Fixes are kept in memory only, never written to storage.
+- `LocationStatus` reports whether fixes flow: `STATE_ACTIVE`, `STATE_IDLE`, `STATE_NO_COMPANION`, `STATE_UNSUPPORTED` (the phone does not list the `location` capability), or `STATE_UNAVAILABLE` with a reason (`permission`, `disabled`, `no-fix`).
+- **Android glue (route 1):** the glue registers a location provider (a mock/test-provider style `LocationProvider` in the system image, named e.g. `openmyglass`, and also feeding the `gps` and `network` names so legacy apps work), and pushes each `Location` into it. Apps then use Android's normal `LocationManager`. The glue holds a `LocationRequest` only while Android apps have location listeners.
+- **Route 2:** apps use this topic directly; a small gpsd-compatible shim is a possible later addition.
+
 ## Mock
 
-`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `power [long]`, `hinge open|closed`, `lookup`, `lookdown`, `relative-lookup`, `nudge`, `wear on|off`, `wink`, `dim`, `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.
+`glassd --mock` serves the same socket with `capabilities` including `mock`, and with no hardware. It reads commands on standard input, one per line: `tap [fingers]`, `longpress`, `swipe forward|backward|down|up [fingers]`, `scroll <displacement>`, `camera [long]`, `power [long]`, `hinge open|closed`, `lookup`, `lookdown`, `relative-lookup`, `nudge`, `wear on|off`, `wink`, `dim`, `location <lat> <lon> [accuracy_m]`, `location-status <state>`, `wait <ms>`. A developer or a test script can drive an app with it. The `glass-api` crate also has an in-process mock server for unit tests.

@@ -24,6 +24,7 @@ message ClientFrame {
     DictationStart dictation_start = 8;      // milestone 3
     DictationCancel dictation_cancel = 9;    // milestone 3
     DictationConfirm dictation_confirm = 10; // milestone 3
+    LocationRequest location_request = 11;   // milestone 4
   }
 }
 
@@ -41,6 +42,7 @@ enum Topic {
   TOPIC_SETTINGS = 5;                        // Settings
   TOPIC_DICTATION = 6;                       // DictationState, Transcript (only for the requester)
   TOPIC_BUTTON = 7;                          // Button
+  TOPIC_LOCATION = 8;                        // Location, LocationStatus (milestone 4)
 }
 
 message Subscribe {
@@ -103,6 +105,8 @@ message ServiceFrame {
     DictationState dictation_state = 12;     // milestone 3
     Transcript transcript = 13;              // milestone 3
     Button button = 14;
+    Location location = 15;                  // milestone 4
+    LocationStatus location_status = 16;     // milestone 4
   }
 }
 
@@ -272,4 +276,37 @@ message Transcript {
   uint32 request_id = 1;
   string text = 2;
   bool final = 3;
+}
+
+// ---- location (milestone 4): fixes come from the phone through the OpenMyGlass companion, not from Glass's GPS ----
+
+message LocationRequest {
+  uint32 interval_ms = 1;                    // wanted interval; 0 = this client no longer needs fixes
+  bool high_accuracy = 2;                    // ask the phone for GPS-grade fixes (costs the phone battery)
+}
+
+message Location {
+  double latitude_deg = 1;
+  double longitude_deg = 2;
+  float accuracy_m = 3;                      // horizontal, 68 % radius
+  optional double altitude_m = 4;
+  optional float bearing_deg = 5;
+  optional float speed_mps = 6;
+  int64 fix_time_ms = 7;                     // UTC time of the fix, from the phone
+  uint64 received_us = 8;                    // CLOCK_MONOTONIC on Glass when the fix arrived
+  string provider = 9;                       // the phone's provider: "gps", "network", "fused"
+  bool snapshot = 10;                        // the last known fix, sent on Subscribe or GetState
+}
+
+message LocationStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ACTIVE = 1;                        // the phone is sending fixes
+    STATE_NO_COMPANION = 2;                  // no phone connected
+    STATE_UNSUPPORTED = 3;                   // the phone's app does not offer location
+    STATE_UNAVAILABLE = 4;                   // the phone cannot provide it (reason says why)
+    STATE_IDLE = 5;                          // nobody asked for fixes
+  }
+  State state = 1;
+  string reason = 2;                         // with STATE_UNAVAILABLE: "permission", "disabled", "no-fix"
 }

@@ -12,7 +12,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 | Framing | varint32 length, then one protobuf message: `ClientFrame` from client to `glassd`, `ServiceFrame` back. The same framing as the OpenMyGlass bridge protocol. |
 | Frame limit | 64 KiB in both directions; both sides enforce it. A longer length, or a varint longer than 5 bytes, is a protocol error: `glassd` sends `ServiceError{ERROR_CODE_BAD_FRAME}` and closes the connection; a client closes the connection. |
 | Time | Every `timestamp_us` is `CLOCK_MONOTONIC` in microseconds (it does not advance during suspend). For input, `glassd` sets `EVIOCSCLOCKID(CLOCK_MONOTONIC)` on each evdev device (available since Linux 3.4) so the kernel's event time is used directly. |
-| Backpressure | Each client has an outgoing queue of 256 KiB. When it fills, consecutive `Scroll` frames are merged (displacement and velocity of the newest, deltas summed); if the queue stays full for 2 s the client is disconnected. A slow client never delays the others. |
+| Backpressure | Each client has an outgoing queue of 256 KiB. When it fills, consecutive `Scroll` frames are merged (displacement and velocity of the newest, deltas summed); a `Scroll` with `ended` is never merged away and no other frame is ever dropped; if the queue stays full for 2 s the client is disconnected. A slow client never delays the others. |
 
 ### Who may connect
 
@@ -26,7 +26,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 2. `glassd` answers `Welcome{api_version, service_version, capabilities}`, where `api_version` is the lower of the client's and the service's: an older client gets the older behaviour, a newer client learns which version it is talking to and decides whether to continue. `api_version` 0 is `ERROR_CODE_BAD_FRAME`.
    - A frame before `Hello` is `ERROR_CODE_BAD_FRAME` and the connection is closed.
    - A second `Hello` is answered with `Welcome` again and changes nothing else.
-3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`), `Settings`. Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
+3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
 Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button`, `dictation`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent.
@@ -36,7 +36,7 @@ Capabilities say which sources exist on this device or build: `touchpad`, `head`
 - `ClientFrame.seq` is optional; `glassd` puts it in `ServiceError.seq` when a frame causes an error, so a client can tell which request failed.
 - A frame with no known body (an empty frame, or a request newer than this `glassd`) gets `ERROR_CODE_UNSUPPORTED`.
 - A known request with an invalid value gets `ERROR_CODE_INVALID_ARGUMENT`: `ACTION_UNSPECIFIED`, an unknown dictation `purpose`, a missing `notification_key` for `"notification-reply"`. In `Subscribe`, `TOPIC_UNSPECIFIED` and unknown topic values are ignored.
-- `SetSettings` is always answered with the full `Settings` to the sender (and to subscribers of `TOPIC_SETTINGS`).
+- `SetSettings` is always answered with the full `Settings` to the sender, once even if it is subscribed to `TOPIC_SETTINGS`; the other subscribers get it too.
 - Unknown fields in a known message are ignored (normal protobuf rules), so fields can be added without a version bump. A change that alters the meaning of an existing field goes into a new package `glass.services.v2`; `glassd` may serve both.
 
 | `ErrorCode` | Meaning |
@@ -72,7 +72,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 | `GESTURE_KIND_SWIPE_UP` | upward stroke | reserved |
 
 - `Gesture.fingers` is the largest number of fingers seen during the gesture (1, 2 or 3). A two-finger tap is `TAP` with `fingers: 2`.
-- `TAP` and `SWIPE_*` are sent when the last finger lifts. `LONG_PRESS` is sent once, when the hold time passes; that touch then produces no other gesture and no more `Scroll`.
+- `TAP` and `SWIPE_*` are sent when the last finger lifts. `LONG_PRESS` is sent once, when the hold time passes; that touch then produces no other gesture, and if `Scroll` frames were sent, a last `Scroll{ended:true, cancelled:true}` comes first.
 - `Gesture.velocity` for swipes is in pad widths per second (horizontal) or pad heights per second (vertical), positive forward or down.
 - `Scroll` is sent while fingers move horizontally, once the movement passes the slop threshold. `displacement` and `velocity` are in pad widths (1.0 = the full horizontal travel) and per second, positive forward. The last `Scroll` of a touch has `ended: true`.
 - For a horizontal swipe a client gets both: the `Scroll` frames, the final `Scroll{ended:true}`, then the `SWIPE_*` gesture. A list that follows the finger uses `Scroll` while dragging and the gesture (or the final velocity) to decide where to settle.
@@ -123,7 +123,7 @@ Speech is not transcribed on Glass: it goes to the phone, which transcribes it o
 - An app sends `DictationStart{request_id, purpose}`. `purpose` is `"notification-reply"` (with the notification key and action index, as in the bridge protocol) or `"free"` (any text, for example a note). Bridge v1 supports only notification replies: `"free"` needs a small bridge change, proposed in OpenMyGlass.
 - `request_id` is per connection; `glassd` maps it to its own id on the companion link, so two clients cannot collide.
 - `glassd` relays the request to the companion link provider, the process that holds the phone connection. The provider captures the microphone and streams audio to the phone, so audio never passes through `glassd`. How the provider registers is defined in milestone 3.
-- The app receives `DictationState` and `Transcript` for its own request. The bridge's `Transcript.error` becomes `DictationState{STATE_FAILED, error}`.
+- The app receives `DictationState` and `Transcript` for its own request without subscribing to `TOPIC_DICTATION` (the topic exists for symmetry and carries nothing else). The bridge's `Transcript.error` becomes `DictationState{STATE_FAILED, error}`.
 - For `"notification-reply"`, after the final transcript the app sends `DictationConfirm{send}` (the bridge's `ReplyConfirm`); the bridge's `ReplyResult` becomes `STATE_SENT` or `STATE_FAILED`.
 - `DictationCancel` stops a request. Without a provider, `DictationStart` gets `ERROR_CODE_NO_COMPANION`.
 

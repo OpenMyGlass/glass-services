@@ -230,6 +230,7 @@ message Settings {
   optional bool wink_enabled = 3;
   optional bool on_head_detection_enabled = 4;
   optional uint32 screen_timeout_ms = 5;     // 3000 to 600000
+  bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 
 message FocusState {
@@ -247,7 +248,7 @@ message DictationState {
   }
   uint32 request_id = 1;
   State state = 2;
-  string error = 3;                          // with STATE_FAILED: "no-companion", "no-speech", or the phone's text
+  string error = 3;                          // with STATE_FAILED: "no-speech", "link-lost", or the phone's text
 }
 
 message Transcript {

@@ -41,9 +41,22 @@ pub mod settings_rules {
     use crate::proto::Settings;
 
     pub const HEAD_WAKE_ANGLE_MIN: f32 = 10.0;
-    pub const HEAD_WAKE_ANGLE_MAX: f32 = 60.0;
+    pub const HEAD_WAKE_ANGLE_MAX: f32 = 40.0;
     pub const SCREEN_TIMEOUT_MIN_MS: u32 = 3_000;
     pub const SCREEN_TIMEOUT_MAX_MS: u32 = 600_000;
+
+    /// The defaults of docs/api.md ("Settings").
+    pub fn defaults() -> Settings {
+        Settings {
+            head_wake_enabled: Some(true),
+            head_wake_angle_deg: Some(30.0),
+            wink_enabled: Some(false),
+            on_head_detection_enabled: Some(false),
+            screen_timeout_ms: Some(15_000),
+            nudge_sleep_enabled: Some(false),
+            snapshot: false,
+        }
+    }
 
     /// Copies the fields present in `change` into `current`, clamped to their ranges.
     pub fn merge(current: &mut Settings, change: &Settings) {
@@ -59,6 +72,9 @@ pub mod settings_rules {
         }
         if let Some(v) = change.on_head_detection_enabled {
             current.on_head_detection_enabled = Some(v);
+        }
+        if let Some(v) = change.nudge_sleep_enabled {
+            current.nudge_sleep_enabled = Some(v);
         }
         if let Some(v) = change.screen_timeout_ms {
             current.screen_timeout_ms = Some(v.clamp(SCREEN_TIMEOUT_MIN_MS, SCREEN_TIMEOUT_MAX_MS));
@@ -639,6 +655,7 @@ mod tests {
             screen: Screen::On as i32,
             reason: "touch".into(),
             timestamp_us: 77,
+            ..Default::default()
         });
         hub.set_settings_source(Settings::default());
         let id = hub.add_client();
@@ -666,6 +683,7 @@ mod tests {
             wear: Wear::OnHead as i32,
             snapshot: false,
             timestamp_us: 9,
+            ..Default::default()
         });
         let s = sends(&hub.on_frame(id, sub(&[Topic::Wear, Topic::Wear, Topic::Gesture])));
         assert_eq!(s.len(), 1);
@@ -812,6 +830,7 @@ mod tests {
             screen: Screen::Off as i32,
             reason: "timeout".into(),
             timestamp_us: 1,
+            ..Default::default()
         })));
         assert_eq!(
             sends(&fx).iter().map(|s| s.0).collect::<Vec<_>>(),
@@ -823,14 +842,7 @@ mod tests {
     #[test]
     fn set_settings_merges_clamps_and_replies_once() {
         let mut hub = Hub::new("1", &[]);
-        hub.set_settings_source(Settings {
-            head_wake_enabled: Some(true),
-            head_wake_angle_deg: Some(30.0),
-            wink_enabled: Some(false),
-            on_head_detection_enabled: Some(true),
-            screen_timeout_ms: Some(10_000),
-            snapshot: false,
-        });
+        hub.set_settings_source(settings_rules::defaults());
         let a = connect(&mut hub, &[Topic::Settings]);
         let b = connect(&mut hub, &[Topic::Settings]);
         let fx = hub.on_frame(
@@ -839,6 +851,7 @@ mod tests {
                 settings: Some(Settings {
                     head_wake_angle_deg: Some(90.0),
                     screen_timeout_ms: Some(1),
+                    nudge_sleep_enabled: Some(true),
                     ..Default::default()
                 }),
             })),
@@ -848,9 +861,10 @@ mod tests {
         let S::Settings(applied) = &s[0].1 else {
             panic!()
         };
-        assert_eq!(applied.head_wake_angle_deg, Some(60.0));
+        assert_eq!(applied.head_wake_angle_deg, Some(40.0));
         assert_eq!(applied.screen_timeout_ms, Some(3000));
         assert_eq!(applied.head_wake_enabled, Some(true));
+        assert_eq!(applied.nudge_sleep_enabled, Some(true));
         assert!(!applied.snapshot);
         assert!(fx.iter().any(|e| matches!(e, Effect::SettingsChanged(_))));
     }

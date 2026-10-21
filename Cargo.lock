@@ -108,6 +108,12 @@ dependencies = [
 [[package]]
 name = "glassd"
 version = "0.1.0"
+dependencies = [
+ "glass-api",
+ "glass-evdev",
+ "glass-gesture",
+ "libc",
+]
 
 [[package]]
 name = "hashbrown"

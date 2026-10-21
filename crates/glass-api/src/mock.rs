@@ -13,8 +13,7 @@
 use crate::codec::{FrameDecoder, encode_frame};
 use crate::hub::{ClientId, Effect, Hub};
 use crate::proto::{
-    ClientFrame, Screen, ScreenState, ServiceFrame, Settings, Wear, WearState, screen_request,
-    service_frame,
+    ClientFrame, Screen, ScreenState, ServiceFrame, Wear, WearState, screen_request, service_frame,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -28,20 +27,16 @@ use std::time::{Duration, Instant};
 
 /// Capabilities the mock announces.
 pub const MOCK_CAPABILITIES: &[&str] = &[
-    "mock", "touchpad", "screen", "button", "head", "wear", "wink",
+    "mock",
+    "touchpad",
+    "screen",
+    "button-camera",
+    "button-power",
+    "hinge",
+    "head",
+    "wear",
+    "wink",
 ];
-
-/// Settings the mock starts with.
-pub fn mock_default_settings() -> Settings {
-    Settings {
-        head_wake_enabled: Some(false),
-        head_wake_angle_deg: Some(30.0),
-        wink_enabled: Some(false),
-        on_head_detection_enabled: Some(true),
-        screen_timeout_ms: Some(10_000),
-        snapshot: false,
-    }
-}
 
 struct State {
     hub: Hub,
@@ -96,13 +91,15 @@ impl MockService {
             screen: Screen::On as i32,
             reason: "request".into(),
             timestamp_us: t,
+            ..Default::default()
         });
         hub.set_wear_source(WearState {
-            wear: Wear::Unknown as i32,
+            wear: Wear::OnHead as i32,
+            source: crate::proto::WearSource::Forced as i32,
             snapshot: false,
             timestamp_us: t,
         });
-        hub.set_settings_source(mock_default_settings());
+        hub.set_settings_source(crate::hub::settings_rules::defaults());
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 hub,
@@ -310,6 +307,7 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
                             screen: t as i32,
                             reason: "request".into(),
                             timestamp_us: now_us(),
+                            ..Default::default()
                         })),
                     }));
                 }

@@ -38,6 +38,8 @@ pub struct Event {
 }
 
 impl From<RawInputEvent> for Event {
+    // `c_long` is i32 on 32-bit ARM and i64 on 64-bit targets: the cast is needed on one of them.
+    #[allow(clippy::unnecessary_cast)]
     fn from(r: RawInputEvent) -> Self {
         let sec = (r.tv_sec as i64).max(0) as u64;
         let usec = (r.tv_usec as i64).clamp(0, 999_999) as u64;

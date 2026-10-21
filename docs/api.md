@@ -119,7 +119,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 ## Screen (`TOPIC_SCREEN`)
 
 `glassd` owns the screen policy, so every app does not need to:
-- **Wakes** on a touchpad tap or forward or backward swipe, on `LOOK_UP` when head wake is on, on don, on the camera button, and on `ACTION_WAKE`, but only while the Glass is on the head (see Wearing). `ScreenState` for a wake carries `reason`, `last_sleep_reason` and `off_ms`, so the launcher can decide whether to return to the home card (stock: it returns home unless the last sleep was a timeout or a gesture and either the screen was off for 5 s or less or an immersive app was in front; a swipe always returns home). The sleep reasons that count as a gesture are `nudge` (as on stock) and `two-finger-swipe-down` (our choice). `off_ms` counts time in suspend too (`CLOCK_BOOTTIME`), so a Glass left off overnight reports the real time.
+- **Wakes** on a touchpad tap or forward or backward swipe, on `LOOK_UP` when head wake is on, on don, on the camera button, and on `ACTION_WAKE` or `ACTION_KEEP_ON`, but only while the Glass is on the head (see Wearing). `ScreenState` for a wake carries `reason`, `last_sleep_reason` and `off_ms`, so the launcher can decide whether to return to the home card (stock: it returns home unless the last sleep was a timeout or a gesture and either the screen was off for 5 s or less or an immersive app was in front; a swipe always returns home). The sleep reasons that count as a gesture are `nudge` (as on stock) and `two-finger-swipe-down` (our choice). `off_ms` counts time in suspend too (`CLOCK_BOOTTIME`), so a Glass left off overnight reports the real time.
 - **Quick timeout:** a wake by look-up or by don uses a one-shot 3 s timeout with no dim step; the next user activity switches back to the normal timeout.
 - **Sleeps** after `screen_timeout_ms` (default 15 s) without user activity, with a dim step before; on a **two-finger swipe down anywhere** (handled by `glassd`, not delivered to apps, as on stock Glass); on a nudge when `nudge_sleep_enabled`; on `WEAR_OFF_HEAD`; and on `ACTION_SLEEP` (the launcher sends it on a one-finger `SWIPE_DOWN` at the home card).
 - **Keep-on holds:** `ACTION_KEEP_ON` wakes the screen if needed and holds it on, without dimming, for `duration_ms` (0, or more than 10 minutes, means 10 minutes: a client renews it to hold longer). A repeated `ACTION_KEEP_ON` from the same client replaces its hold. The screen stays on while any client holds it. A hold ends on `ACTION_RELEASE_KEEP_ON`, when its time runs out, or when the client disconnects. Off the head `ACTION_KEEP_ON` is ignored.
@@ -127,16 +127,16 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 - `ACTION_USER_ACTIVITY` restarts the timer, for activity `glassd` cannot see.
 - `ScreenState` reports every change with a `reason`; `dim` for the dim step and `activity` when a touch or `ACTION_USER_ACTIVITY` restores `SCREEN_ON` from `SCREEN_DIM`.
 
-  `ScreenState.reason` and `last_sleep_reason` take exactly these values:
+  `ScreenState.reason` currently takes these values:
 
   | Change | Reasons |
   |---|---|
-  | wake (`SCREEN_OFF` → `SCREEN_ON`) | `tap`, `swipe-forward`, `swipe-backward` (touchpad), `look-up`, `don`, `button` (camera), `request` (`ACTION_WAKE` or `ACTION_KEEP_ON`) |
+  | wake (→ `SCREEN_ON`, from `SCREEN_OFF` or `SCREEN_DIM`) | `tap`, `swipe-forward`, `swipe-backward` (touchpad), `look-up`, `don`, `button` (camera), `request` (`ACTION_WAKE` or `ACTION_KEEP_ON`) |
   | sleep (→ `SCREEN_OFF`) | `timeout`, `two-finger-swipe-down`, `nudge`, `off-head`, `request` (`ACTION_SLEEP`) |
-  | dim and undim | `dim` (`SCREEN_ON` → `SCREEN_DIM`), `activity` (`SCREEN_DIM` → `SCREEN_ON`) |
+  | dim and undim | `dim` (`SCREEN_ON` → `SCREEN_DIM`); `activity` (`SCREEN_DIM` → `SCREEN_ON` by a touch or `ACTION_USER_ACTIVITY`; other wake sources undim with their wake reason) |
   | snapshot | `snapshot` |
 
-  A client compares them as strings and treats an unknown value as "other" (new reasons may be added).
+  `last_sleep_reason` is one of the sleep reasons, set only on a change out of `SCREEN_OFF`, and empty otherwise (also before the first sleep). A client compares reasons as strings and treats an unknown value as "other" (new reasons may be added).
 
 The default timeout and the dim step follow the stock behaviour described in `docs/specs/`.
 

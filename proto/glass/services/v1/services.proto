@@ -1,0 +1,216 @@
+// Glass services interface, version 1: glassd <-> clients (launcher, apps, Android glue).
+// Transport: Unix stream socket. Framing: varint32 length + one ClientFrame or ServiceFrame (max 64 KiB).
+// See docs/api.md for the semantics. Field numbers are stable; new fields are added, never renumbered.
+syntax = "proto3";
+
+package glass.services.v1;
+
+option java_package = "org.openmyglass.services.v1";
+option java_outer_classname = "Services";
+
+// ---- client -> glassd ----
+
+message ClientFrame {
+  oneof body {
+    Hello hello = 1;                         // first frame
+    Subscribe subscribe = 2;                 // replace the set of topics
+    AcquireInputFocus acquire_focus = 3;     // gestures go to the focus holder only
+    ReleaseInputFocus release_focus = 4;
+    ScreenRequest screen = 5;
+    SetSettings set_settings = 6;
+    GetState get_state = 7;
+    DictationStart dictation_start = 8;      // M3
+    DictationCancel dictation_cancel = 9;    // M3
+  }
+}
+
+message Hello {
+  uint32 api_version = 1;                    // 1
+  string client_name = 2;                    // e.g. "glass-launcher"
+}
+
+enum Topic {
+  TOPIC_UNSPECIFIED = 0;
+  TOPIC_GESTURE = 1;                         // Gesture, Scroll, FingerCount (focus holder only)
+  TOPIC_HEAD = 2;                            // HeadGesture
+  TOPIC_WEAR = 3;                            // WearState, Wink
+  TOPIC_SCREEN = 4;                          // ScreenState
+  TOPIC_SETTINGS = 5;                        // Settings
+  TOPIC_DICTATION = 6;                       // Transcript, DictationState (only for the requester)
+}
+
+message Subscribe {
+  repeated Topic topics = 1;
+}
+
+message AcquireInputFocus {}
+message ReleaseInputFocus {}
+
+message ScreenRequest {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    WAKE = 1;                                // turn the screen on now (counts as user activity)
+    SLEEP = 2;                               // turn the screen off now
+    KEEP_ON = 3;                             // hold the screen on for duration_ms (0 = until released)
+    RELEASE_KEEP_ON = 4;
+    USER_ACTIVITY = 5;                       // restart the screen-off timer
+  }
+  Action action = 1;
+  uint32 duration_ms = 2;
+}
+
+message SetSettings {
+  Settings settings = 1;                     // only the fields that are set are changed
+}
+
+message GetState {}
+
+message DictationStart {
+  uint32 request_id = 1;                     // chosen by the client; a newer one replaces an older one
+  string purpose = 2;                        // "free" or "notification-reply"
+  string notification_key = 3;               // for "notification-reply"
+  uint32 action_index = 4;                   // for "notification-reply"
+}
+
+message DictationCancel {
+  uint32 request_id = 1;
+}
+
+// ---- glassd -> client ----
+
+message ServiceFrame {
+  oneof body {
+    Welcome welcome = 1;                     // answer to Hello
+    Error error = 2;
+    Gesture gesture = 3;
+    Scroll scroll = 4;
+    FingerCount finger_count = 5;
+    HeadGesture head_gesture = 6;
+    WearState wear_state = 7;
+    Wink wink = 8;
+    ScreenState screen_state = 9;
+    Settings settings = 10;
+    FocusState focus_state = 11;
+    DictationState dictation_state = 12;     // M3
+    Transcript transcript = 13;              // M3
+  }
+}
+
+message Welcome {
+  uint32 api_version = 1;                    // 1
+  string service_version = 2;
+  repeated string capabilities = 3;          // "touchpad", "head", "wear", "wink", "screen", "dictation", "mock"
+}
+
+message Error {
+  string code = 1;                           // "bad-frame", "unsupported", "not-focused", "unavailable"
+  string message = 2;
+}
+
+// Discrete gestures, recognized when the fingers lift (tap, swipe) or after the hold time (long press).
+// Directions are in Glass terms: FORWARD = finger moves toward the front of the frame (the eye),
+// BACKWARD = toward the ear, DOWN = from the top edge toward the bottom, UP = the reverse.
+enum GestureKind {
+  GESTURE_UNSPECIFIED = 0;
+  TAP = 1;
+  LONG_PRESS = 2;
+  SWIPE_FORWARD = 3;
+  SWIPE_BACKWARD = 4;
+  SWIPE_DOWN = 5;
+  SWIPE_UP = 6;
+}
+
+message Gesture {
+  GestureKind kind = 1;
+  uint32 fingers = 2;                        // 1, 2 or 3 (the maximum seen during the gesture)
+  float velocity = 3;                        // swipes: along the swipe axis, touchpad widths per second, signed
+  uint64 timestamp_us = 4;                   // CLOCK_MONOTONIC, from the kernel event of the last finger lift
+}
+
+// Continuous horizontal movement while fingers are down, for dragging the timeline.
+message Scroll {
+  float displacement = 1;                    // since touch down, touchpad widths, + = forward
+  float delta = 2;                           // since the previous Scroll
+  float velocity = 3;                        // touchpad widths per second, + = forward
+  uint32 fingers = 4;
+  bool ended = 5;                            // last Scroll of this touch (fingers lifted or gesture cancelled)
+  uint64 timestamp_us = 6;
+}
+
+message FingerCount {
+  uint32 previous = 1;
+  uint32 current = 2;
+  uint64 timestamp_us = 3;
+}
+
+enum HeadGestureKind {
+  HEAD_GESTURE_UNSPECIFIED = 0;
+  LOOK_UP = 1;                               // head raised past the wake angle
+  LOOK_DOWN = 2;                             // head back below the wake angle (hysteresis applied)
+  NOD = 3;
+}
+
+message HeadGesture {
+  HeadGestureKind kind = 1;
+  float pitch_deg = 2;                       // head pitch when recognized, + = up
+  uint64 timestamp_us = 3;
+}
+
+enum Wear {
+  WEAR_UNKNOWN = 0;
+  ON_HEAD = 1;
+  OFF_HEAD = 2;
+}
+
+message WearState {
+  Wear wear = 1;
+  uint64 timestamp_us = 2;
+}
+
+message Wink {
+  uint64 timestamp_us = 1;
+}
+
+enum Screen {
+  SCREEN_UNKNOWN = 0;
+  ON = 1;
+  DIM = 2;
+  OFF = 3;
+}
+
+message ScreenState {
+  Screen screen = 1;
+  string reason = 2;                         // "tap", "look-up", "timeout", "off-head", "request", "swipe-down", ...
+  uint64 timestamp_us = 3;
+}
+
+message Settings {
+  optional bool head_wake_enabled = 1;
+  optional float head_wake_angle_deg = 2;
+  optional bool wink_enabled = 3;            // a wink is reported only when enabled
+  optional bool on_head_detection_enabled = 4;
+  optional uint32 screen_timeout_ms = 5;
+}
+
+message FocusState {
+  bool focused = 1;                          // this client now holds (true) or lost (false) the input focus
+}
+
+message DictationState {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    LISTENING = 1;
+    PROCESSING = 2;
+    DONE = 3;
+    FAILED = 4;
+  }
+  uint32 request_id = 1;
+  State state = 2;
+  string error = 3;
+}
+
+message Transcript {
+  uint32 request_id = 1;
+  string text = 2;
+  bool final = 3;
+}

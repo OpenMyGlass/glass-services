@@ -2,8 +2,8 @@
 
 use glass_api::Client;
 use glass_api::proto::{
-    ButtonAction, GestureKind, Screen, ServiceFrame, SetSettings, Settings, Topic, Wear,
-    WearSource, client_frame::Body as Body2, service_frame::Body,
+    ButtonAction, GestureKind, HeadGestureKind, HeadRequest, Screen, ServiceFrame, SetSettings,
+    Settings, Topic, Wear, WearSource, client_frame::Body as Body2, service_frame::Body,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ const NO_HARDWARE: &[&str] = &[
     "--power-device",
     "none",
     "--touchpad-sysfs",
+    "none",
+    "--iio",
     "none",
 ];
 /// Handshake timeout for the integration tests (slow CI runners).
@@ -627,5 +629,232 @@ fn fake_glasshub_camera_and_touchpad_sysfs() {
     assert_eq!(b.action, ButtonAction::Press as i32);
     // The settings file was written.
     assert!(dir.join("state/settings").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn head(f: &ServiceFrame) -> Option<HeadGestureKind> {
+    match &f.body {
+        Some(Body::HeadGesture(g)) => Some(HeadGestureKind::try_from(g.kind).unwrap()),
+        _ => None,
+    }
+}
+
+fn sleep_request(c: &mut Client) {
+    c.send(Body2::Screen(glass_api::proto::ScreenRequest {
+        action: glass_api::proto::screen_request::Action::Sleep as i32,
+        duration_ms: 0,
+    }))
+    .unwrap();
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::Off, "request".into())));
+}
+
+const SHORT: Duration = Duration::from_millis(300);
+
+/// A GetState round trip: every frame sent before it has been handled.
+fn sync(c: &mut Client) {
+    c.send(Body2::GetState(Default::default())).unwrap();
+    c.recv_until(T, |f| matches!(f.body, Some(Body::FocusState(_))))
+        .unwrap()
+        .expect("GetState answer");
+}
+
+#[test]
+fn head_gestures_follow_the_rules_in_the_mock() {
+    let mut m = Mock::start("head");
+    let mut c = m.client(&[Topic::Head, Topic::Screen]);
+    // Screen on: no look-up detector runs.
+    m.send("lookup");
+    assert!(
+        c.recv_until(SHORT, |f| head(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+    sleep_request(&mut c);
+    m.send("lookup");
+    let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::LookUp));
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "look-up".into())));
+    // The detector runs until the look-down, with the screen on.
+    m.send("lookdown");
+    let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::LookDown));
+    // Back to the normal timeout, and past the nudge inhibition that the look-up started.
+    c.send(Body2::Screen(glass_api::proto::ScreenRequest {
+        action: glass_api::proto::screen_request::Action::Wake as i32,
+        duration_ms: 0,
+    }))
+    .unwrap();
+    sync(&mut c);
+    std::thread::sleep(Duration::from_millis(1100));
+    // Nudge: not wanted by default.
+    m.send("nudge");
+    assert!(
+        c.recv_until(SHORT, |f| head(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+    // Asked for: delivered, and the screen stays on (nudge_sleep_enabled is false).
+    c.send(Body2::Head(HeadRequest {
+        nudge: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    sync(&mut c);
+    m.send("nudge");
+    let f = c
+        .recv_until(T, |f| head(f).is_some() || screen(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::Nudge));
+    // Relative look-up needs its own request.
+    m.send("relative-lookup");
+    assert!(
+        c.recv_until(SHORT, |f| head(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+    c.send(Body2::Head(HeadRequest {
+        relative_look_up: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    sync(&mut c);
+    m.send("relative-lookup");
+    let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::RelativeLookUp));
+}
+
+#[test]
+fn nudge_sleep_turns_the_screen_off() {
+    let mut m = Mock::start("nudge");
+    let mut c = m.client(&[Topic::Head, Topic::Screen, Topic::Settings]);
+    set_settings(
+        &mut c,
+        Settings {
+            nudge_sleep_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    m.send("nudge");
+    let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::Nudge));
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::Off, "nudge".into())));
+}
+
+/// A non-mock daemon on a fake IIO device: the accelerometer stream is started when the
+/// screen goes off, and a look-up in the samples wakes the screen.
+#[test]
+fn look_up_from_a_fake_imu() {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = test_dir("imu");
+    let iio = dir.join("iio");
+    let d = iio.join("iio:device0");
+    std::fs::create_dir_all(d.join("scan_elements")).unwrap();
+    std::fs::create_dir_all(d.join("buffer")).unwrap();
+    std::fs::write(d.join("name"), "mpu9150\n").unwrap();
+    for f in [
+        "power_state",
+        "sampling_frequency",
+        "gyro_enable",
+        "accl_enable",
+        "buffer/enable",
+    ] {
+        std::fs::write(d.join(f), "").unwrap();
+    }
+    let scan = [
+        ("in_anglvel_x", 4),
+        ("in_anglvel_y", 5),
+        ("in_anglvel_z", 6),
+        ("in_accel_x", 7),
+        ("in_accel_y", 8),
+        ("in_accel_z", 9),
+        ("in_timestamp", 13),
+    ];
+    for (n, i) in scan {
+        let ty = if n == "in_timestamp" {
+            "le:s64/64>>0"
+        } else {
+            "le:s16/16>>0"
+        };
+        std::fs::write(d.join(format!("scan_elements/{n}_en")), "0\n").unwrap();
+        std::fs::write(d.join(format!("scan_elements/{n}_index")), format!("{i}\n")).unwrap();
+        std::fs::write(d.join(format!("scan_elements/{n}_type")), format!("{ty}\n")).unwrap();
+    }
+    let fifo = dir.join("iio-node");
+    let cpath = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: plain libc calls with a valid path.
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    assert!(fd >= 0);
+    let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    let socket = dir.join("glassd.sock");
+    let _child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(NO_HARDWARE)
+            .arg("--iio")
+            .arg(&iio)
+            .arg("--iio-device")
+            .arg(&fifo)
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    let deadline = Instant::now() + T;
+    while !socket.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut c = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
+    assert!(c.has_capability("head"));
+    c.subscribe(&[Topic::Head, Topic::Screen]).unwrap();
+    let rd = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
+    // Screen on, nothing wanted: the IMU is not started.
+    assert_ne!(rd("buffer/enable"), "1\n");
+    sleep_request(&mut c);
+    let deadline = Instant::now() + T;
+    while rd("buffer/enable") != "1\n" {
+        assert!(
+            Instant::now() < deadline,
+            "the accelerometer stream did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(rd("accl_enable"), "1\n");
+    assert_eq!(rd("gyro_enable"), "0\n");
+    assert_eq!(rd("scan_elements/in_accel_x_en"), "1\n");
+    assert_eq!(rd("scan_elements/in_anglvel_x_en"), "0\n");
+    // Accel only: 6 data bytes, the format byte at 7, the timestamp at 8 (16-byte records).
+    // Board matrix: out = (chip.y, chip.z, chip.x), so chip = (-sin p, 0, cos p) for a pitch p.
+    let mut bytes = Vec::new();
+    for i in 0..100i64 {
+        let pitch: f32 = if i < 50 { 0.0 } else { 40.0 };
+        let p = pitch.to_radians();
+        let chip = [
+            (-p.sin() * 16384.0) as i16,
+            0i16,
+            (p.cos() * 16384.0) as i16,
+        ];
+        for v in chip {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0x04]);
+        bytes.extend_from_slice(&(i * 20_000_000).to_le_bytes());
+    }
+    writer.write_all(&bytes).unwrap();
+    let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
+    assert_eq!(head(&f), Some(HeadGestureKind::LookUp));
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "look-up".into())));
     let _ = std::fs::remove_dir_all(&dir);
 }

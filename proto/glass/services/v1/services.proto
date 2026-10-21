@@ -25,6 +25,7 @@ message ClientFrame {
     DictationCancel dictation_cancel = 9;    // milestone 3
     DictationConfirm dictation_confirm = 10; // milestone 3
     LocationRequest location_request = 11;   // milestone 4
+    HeadRequest head = 12;                   // milestone 2
   }
 }
 
@@ -63,6 +64,15 @@ message ScreenRequest {
   }
   Action action = 1;
   uint32 duration_ms = 2;
+}
+
+// What this client wants from the head gesture detectors (docs/api.md "Head gestures"). Each HeadRequest replaces the
+// sender's previous relative_look_up and nudge; they count only while the client is subscribed to TOPIC_HEAD, and end
+// when it disconnects.
+message HeadRequest {
+  bool relative_look_up = 1;                 // report RELATIVE_LOOK_UP (while any client wants it, it replaces LOOK_UP)
+  bool nudge = 2;                            // report NUDGE even when nudge_sleep_enabled is false
+  optional uint32 inhibit_look_up_ms = 3;    // if set: no LOOK_UP for this long from now (for every client); 0 clears it
 }
 
 message SetSettings {

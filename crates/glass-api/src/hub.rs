@@ -6,8 +6,8 @@
 //! carry out. Both servers use it, so they behave the same.
 
 use crate::proto::{
-    ClientFrame, ErrorCode, FocusState, Hello, LocationStatus, ScreenState, Scroll, ServiceError,
-    ServiceFrame, Settings, Topic, WearState, Welcome, client_frame, location_status,
+    ClientFrame, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus, ScreenState, Scroll,
+    ServiceError, ServiceFrame, Settings, Topic, WearState, Welcome, client_frame, location_status,
     screen_request, service_frame,
 };
 use std::collections::BTreeMap;
@@ -35,6 +35,11 @@ pub enum Effect {
     },
     /// The settings changed (after merging and clamping); apply them.
     SettingsChanged(Settings),
+    /// A `HeadRequest` for the head gesture detectors.
+    Head {
+        client: ClientId,
+        request: HeadRequest,
+    },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -319,6 +324,10 @@ impl Hub {
                     fx.push(Effect::SettingsChanged(applied));
                 }
             },
+            Some(B::Head(request)) => fx.push(Effect::Head {
+                client: id,
+                request,
+            }),
             Some(B::GetState(_)) => {
                 self.snapshots(id, &mut fx);
                 let focused = self.focus_holder() == Some(id);
@@ -453,6 +462,13 @@ impl Hub {
                 })),
             ));
         }
+    }
+
+    /// Whether the client has said `Hello` and is subscribed to `topic`.
+    pub fn is_subscribed(&self, id: ClientId, topic: Topic) -> bool {
+        self.clients
+            .get(&id)
+            .is_some_and(|c| c.hello && c.subscribed(topic))
     }
 
     /// The current screen state, if the screen source exists.
@@ -854,6 +870,29 @@ mod tests {
     }
 
     #[test]
+    fn head_request_becomes_an_effect() {
+        let mut hub = Hub::new("1", &["head"]);
+        let a = connect(&mut hub, &[Topic::Head]);
+        let b = connect(&mut hub, &[Topic::Screen]);
+        assert!(hub.is_subscribed(a, Topic::Head));
+        assert!(!hub.is_subscribed(b, Topic::Head));
+        assert!(!hub.is_subscribed(99, Topic::Head));
+        let req = crate::proto::HeadRequest {
+            relative_look_up: true,
+            nudge: false,
+            inhibit_look_up_ms: Some(5000),
+        };
+        let fx = hub.on_frame(b, cf(C::Head(req)));
+        assert_eq!(
+            fx,
+            vec![Effect::Head {
+                client: b,
+                request: req
+            }]
+        );
+    }
+
+    #[test]
     fn set_settings_merges_clamps_and_replies_once() {
         let mut hub = Hub::new("1", &[]);
         hub.set_settings_source(settings_rules::defaults());
@@ -881,6 +920,8 @@ mod tests {
         assert_eq!(applied.nudge_sleep_enabled, Some(true));
         assert!(!applied.snapshot);
         assert!(fx.iter().any(|e| matches!(e, Effect::SettingsChanged(_))));
+        // The change comes after the answers.
+        assert!(matches!(fx.last(), Some(Effect::SettingsChanged(_))));
     }
 
     #[test]

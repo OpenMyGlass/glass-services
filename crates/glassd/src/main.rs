@@ -33,6 +33,11 @@ usage: glassd [options]
   --touchpad-sysfs <dir|none>
                           touchpad F11 sysfs directory for sleepmode
                           (default /sys/bus/rmi/devices/touchpad.fn11)
+  --head <on|off>         read the IMU for head gestures (default: on on Linux; off on
+                          Android, where the sensors HAL owns the IMU)
+  --iio <dir|none>        where to look for the IMU (IIO device named mpu9150; default
+                          /sys/bus/iio/devices)
+  --iio-device <path>     the IMU's character device (default /dev/iio:deviceN)
   --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
                           /data/glassd on Android and /var/lib/glassd elsewhere; with
                           --mock, only when given)
@@ -83,10 +88,15 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         power: Source::Auto,
         touchpad_sysfs: Some(TOUCHPAD_SYSFS.into()),
         state_dir: None,
+        iio: Some(glass_head::iio::DEVICES_ROOT.into()),
+        iio_dev: None,
     };
     let mut verbose = false;
     let mut display = DisplayChoice::Default;
     let mut state_dir = None;
+    // On Android (route 1) the IMU belongs to the sensors HAL; head gestures come through
+    // the glue there (milestone 3) unless --head on gives the IMU to glassd.
+    let mut head = !cfg!(target_os = "android");
     let mut args = args.peekable();
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -120,12 +130,24 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
             "--power-device" => o.power = source(value("--power-device")?),
             "--touchpad-sysfs" => o.touchpad_sysfs = path_or_none(value("--touchpad-sysfs")?),
             "--state-dir" => state_dir = Some(PathBuf::from(value("--state-dir")?)),
+            "--iio" => o.iio = path_or_none(value("--iio")?),
+            "--head" => {
+                head = match value("--head")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--head: unknown value {v:?}")),
+                }
+            }
+            "--iio-device" => o.iio_dev = Some(PathBuf::from(value("--iio-device")?)),
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option {other:?}")),
         }
     }
     o.state_dir = state_dir.or_else(|| (!o.mock).then(default_state_dir));
+    if !head {
+        o.iio = None;
+    }
     Ok(Parsed {
         opts: o,
         verbose,

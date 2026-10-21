@@ -19,6 +19,7 @@ use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
 use glass_gesture::synth::{Direction, Synth};
 use glass_gesture::{AxisRange, Config, Output, RawEvent, Recognizer};
+use glass_head::{Context as HeadContext, HeadService, Imu, Sample};
 use glass_hub::{GlassHub, Thresholds, Update, WearMachine};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
@@ -67,6 +68,10 @@ pub struct Options {
     pub touchpad_sysfs: Option<PathBuf>,
     /// Where the settings are stored (`None`: in memory only).
     pub state_dir: Option<PathBuf>,
+    /// Where IIO devices are listed, to find the IMU (`None`: no IMU).
+    pub iio: Option<PathBuf>,
+    /// The IMU's character device (default `/dev/iio:deviceN`).
+    pub iio_dev: Option<PathBuf>,
 }
 
 /// Where an input device comes from.
@@ -132,6 +137,11 @@ pub struct Daemon {
     power_dev: Option<Device>,
     touch_sleep: TouchpadSleep,
     store: Option<SettingsStore>,
+    imu: Option<Imu>,
+    head: HeadService,
+    /// `HeadRequest` wishes per client: (relative look-up, nudge).
+    head_requests: BTreeMap<ClientId, (bool, bool)>,
+    samples: Vec<Sample>,
 }
 
 /// Writes `v` with `write` unless it is the value last written; true if it was written.
@@ -262,6 +272,31 @@ fn open_glasshub(opts: &Options) -> Option<GlassHub> {
     Some(hub)
 }
 
+fn open_imu(opts: &Options) -> Option<Imu> {
+    let root = opts.iio.as_ref()?;
+    let dir = match glass_head::iio::find(root, glass_head::iio::IMU_NAME) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            info!("no IIO device named {:?}", glass_head::iio::IMU_NAME);
+            return None;
+        }
+        Err(e) => {
+            info!("cannot list {}: {e}", root.display());
+            return None;
+        }
+    };
+    match Imu::open(&dir, opts.iio_dev.clone()) {
+        Ok(imu) => {
+            info!("IMU {} ({:?})", dir.display(), imu.calibration());
+            Some(imu)
+        }
+        Err(e) => {
+            warn!("cannot open the IMU at {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
 fn open_touchpad(opts: &Options) -> Option<(Device, Config)> {
     let path = match &opts.device {
         Some(p) => p.clone(),
@@ -366,13 +401,14 @@ impl Daemon {
             None => settings_rules::defaults(),
         };
         let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(15_000));
-        let (glasshub, camera_dev, power_dev) = if opts.mock {
-            (None, None, None)
+        let (glasshub, camera_dev, power_dev, imu) = if opts.mock {
+            (None, None, None, None)
         } else {
             (
                 open_glasshub(opts),
                 open_key(&opts.camera, CAMERA_NAME, KEY_CAMERA),
                 open_key(&opts.power, POWER_NAME, KEY_POWER),
+                open_imu(opts),
             )
         };
         let hub_present = glasshub.is_some() || opts.mock;
@@ -394,6 +430,9 @@ impl Daemon {
             let mut c = Vec::new();
             if device.is_some() {
                 c.push("touchpad");
+            }
+            if imu.is_some() {
+                c.push("head");
             }
             c.extend(["screen", "wear"]);
             if glasshub.is_some() {
@@ -444,6 +483,10 @@ impl Daemon {
             power_dev,
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
+            imu,
+            head: HeadService::default(),
+            head_requests: BTreeMap::new(),
+            samples: Vec::new(),
         };
         // A previous run may have left the touchpad asleep.
         if d.mock.is_none() {
@@ -451,6 +494,7 @@ impl Daemon {
         }
         d.sync_glasshub();
         d.read_don_doff();
+        d.update_head();
         Ok(d)
     }
 
@@ -484,6 +528,7 @@ impl Daemon {
     /// One iteration: timers, writes, `poll`, reads.
     pub fn step(&mut self) -> io::Result<()> {
         self.timers(now());
+        self.update_head();
         self.flush(now());
 
         let timeout = match self.next_deadline() {
@@ -505,6 +550,7 @@ impl Daemon {
             Key(ButtonId),
             DonDoff,
             WinkAttr,
+            Imu,
             Client(ClientId),
         }
         let mut fds = Vec::new();
@@ -526,6 +572,9 @@ impl Daemon {
         }
         if let Some(d) = &self.power_dev {
             add(d.as_raw_fd(), libc::POLLIN, Src::Key(ButtonId::Power));
+        }
+        if let Some(fd) = self.imu.as_ref().and_then(|i| i.fd()) {
+            add(fd, libc::POLLIN, Src::Imu);
         }
         if let Some(h) = &self.glasshub {
             add(h.don_doff_fd(), glass_hub::sysfs::POLL_EVENTS, Src::DonDoff);
@@ -567,6 +616,7 @@ impl Daemon {
                 Src::Key(id) => self.read_key(id),
                 Src::DonDoff => self.read_don_doff(),
                 Src::WinkAttr => self.read_wink(),
+                Src::Imu => self.read_imu(),
                 Src::Client(id) => {
                     if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                         self.read_client(id);
@@ -692,6 +742,7 @@ impl Daemon {
         }
         let fx = self.hub.remove_client(id);
         self.policy.client_gone(now(), id);
+        self.head_requests.remove(&id);
         self.effects(fx);
     }
 
@@ -726,6 +777,7 @@ impl Daemon {
                         c.closing = true;
                     }
                     self.policy.client_gone(t, id);
+                    self.head_requests.remove(&id);
                 }
                 Effect::Screen {
                     client,
@@ -737,6 +789,13 @@ impl Daemon {
                     }
                 }
                 Effect::SettingsChanged(s) => self.settings_changed(&s),
+                Effect::Head { client, request } => {
+                    self.head_requests
+                        .insert(client, (request.relative_look_up, request.nudge));
+                    if let Some(ms) = request.inhibit_look_up_ms {
+                        self.head.inhibit_look_up(t.mono_us, ms);
+                    }
+                }
             }
         }
     }
@@ -897,38 +956,18 @@ impl Daemon {
                 self.wear_update(u);
             }
             Command::LookUp | Command::LookDown | Command::RelativeLookUp | Command::Nudge => {
-                let s = self.settings();
-                let angle = s.head_wake_angle_deg.unwrap_or(30.0);
-                let (kind, pitch) = match c {
-                    Command::LookUp => (HeadGestureKind::LookUp, angle + 5.0),
-                    Command::LookDown => (HeadGestureKind::LookDown, angle - 10.0),
-                    Command::RelativeLookUp => (HeadGestureKind::RelativeLookUp, angle),
-                    _ => (HeadGestureKind::Nudge, 0.0),
+                let kind = match c {
+                    Command::LookUp => HeadGestureKind::LookUp,
+                    Command::LookDown => HeadGestureKind::LookDown,
+                    Command::RelativeLookUp => HeadGestureKind::RelativeLookUp,
+                    _ => HeadGestureKind::Nudge,
                 };
-                self.publish(service_frame::Body::HeadGesture(HeadGesture {
-                    kind: kind as i32,
-                    pitch_deg: pitch,
-                    timestamp_us: t.mono_us,
-                }));
-                let change = match kind {
-                    HeadGestureKind::LookUp
-                        if self.policy.is_off()
-                            && self.policy.on_head()
-                            && s.head_wake_enabled.unwrap_or(true) =>
-                    {
-                        self.policy.wake(t, "look-up", true)
-                    }
-                    HeadGestureKind::Nudge
-                        if s.nudge_sleep_enabled.unwrap_or(false)
-                            && !self.policy.is_off()
-                            && !self.gate.touching() =>
-                    {
-                        self.policy.sleep(t, "nudge")
-                    }
-                    _ => None,
-                };
-                if let Some(ch) = change {
-                    self.apply_change(ch);
+                self.update_head();
+                match self.head.inject(kind, t.mono_us) {
+                    Some(g) => self.head_gesture(g),
+                    None => info!(
+                        "mock: {kind:?} not delivered (its detector does not run now, or it is inhibited)"
+                    ),
                 }
             }
             Command::Wink => self.wink(t.mono_us),
@@ -1133,6 +1172,86 @@ impl Daemon {
             warn!("cannot store the settings in {}: {e}", st.path().display());
         }
     }
+
+    /// The head detectors' context from the screen, the wear, the settings and the requests
+    /// of clients subscribed to `TOPIC_HEAD`.
+    fn head_context(&self) -> HeadContext {
+        let s = self.settings();
+        let (mut relative, mut nudge) = (false, false);
+        for (&id, &(r, n)) in &self.head_requests {
+            if self.hub.is_subscribed(id, glass_api::proto::Topic::Head) {
+                relative |= r;
+                nudge |= n;
+            }
+        }
+        HeadContext {
+            screen_off: self.policy.is_off(),
+            on_head: self.wear.on_head(),
+            head_wake_enabled: s.head_wake_enabled.unwrap_or(true),
+            wake_angle_deg: s.head_wake_angle_deg.unwrap_or(30.0),
+            nudge_wanted: nudge || s.nudge_sleep_enabled.unwrap_or(false),
+            relative_wanted: relative,
+        }
+    }
+
+    /// Brings the detectors and the IMU stream in line with the current state.
+    fn update_head(&mut self) {
+        let ctx = self.head_context();
+        if ctx != self.head.context() {
+            self.head.set_context(ctx);
+        }
+        let want = self.head.channels();
+        if let Some(imu) = &mut self.imu
+            && imu.channels() != want
+        {
+            info!("IMU -> accel {} gyro {}", want.accel, want.gyro);
+            if let Err(e) = imu.set_channels(want) {
+                warn!("IMU setup failed ({e}); head gestures disabled");
+                self.imu = None;
+            }
+        }
+    }
+
+    fn read_imu(&mut self) {
+        let Some(imu) = &mut self.imu else { return };
+        self.samples.clear();
+        let t = now();
+        if let Err(e) = imu.read((t.mono_us * 1000) as i64, &mut self.samples) {
+            warn!("IMU read failed ({e}); head gestures disabled");
+            self.imu = None;
+            return;
+        }
+        let samples = std::mem::take(&mut self.samples);
+        for s in &samples {
+            for g in self.head.push(s, t.mono_us) {
+                self.head_gesture(g);
+            }
+        }
+        self.samples = samples;
+    }
+
+    /// Publishes a head gesture and applies it: a look-up wakes the screen with the quick
+    /// timeout; a nudge turns it off when `nudge_sleep_enabled`, unless a touch is in progress.
+    fn head_gesture(&mut self, g: HeadGesture) {
+        let t = now();
+        let kind = HeadGestureKind::try_from(g.kind).unwrap_or(HeadGestureKind::Unspecified);
+        info!("head {kind:?} at {:.1} deg", g.pitch_deg);
+        self.publish(service_frame::Body::HeadGesture(g));
+        let change = match kind {
+            HeadGestureKind::LookUp => self.policy.wake(t, "look-up", true),
+            HeadGestureKind::Nudge
+                if self.settings().nudge_sleep_enabled.unwrap_or(false)
+                    && !self.gate.touching() =>
+            {
+                self.policy.sleep(t, "nudge")
+            }
+            _ => None,
+        };
+        if let Some(ch) = change {
+            self.apply_change(ch);
+        }
+        self.update_head();
+    }
 }
 
 impl Drop for Daemon {
@@ -1176,6 +1295,8 @@ mod tests {
             power: Source::Off,
             touchpad_sysfs: None,
             state_dir: None,
+            iio: None,
+            iio_dev: None,
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

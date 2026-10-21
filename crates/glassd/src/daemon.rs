@@ -2,21 +2,24 @@
 //! Single-threaded; blocks in `poll` until a descriptor is ready or the next deadline
 //! (long press, screen timer, a full client queue, a mock `wait`).
 
-use crate::display::Display;
+use crate::buttons::{ButtonTracker, LONG_PRESS_MS};
+use crate::display::{Display, TouchpadSleep};
 use crate::mockcmd::{self, Command};
 use crate::queue::OutQueue;
 use crate::screen::{Change, Now, ScreenPolicy};
+use crate::settings_store::SettingsStore;
 use crate::touch::{ScreenOffInput, Step, TouchGate};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, HeadGesture, HeadGestureKind, ScreenState,
-    ServiceFrame, Settings, Wear, WearSource, WearState, Wink, service_frame,
+    ServiceFrame, Settings, Wear, WearSource, Wink, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
 use glass_gesture::synth::{Direction, Synth};
 use glass_gesture::{AxisRange, Config, Output, RawEvent, Recognizer};
+use glass_hub::{GlassHub, Thresholds, Update, WearMachine};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
@@ -26,6 +29,14 @@ use std::path::{Path, PathBuf};
 
 /// Name of the touchpad input device (docs/specs/kernel-interfaces.md §1.2).
 pub const TOUCHPAD_NAME: &str = "sensor00fn11";
+/// Input device of the camera button, `KEY_CAMERA` (kernel-interfaces.md §5).
+pub const CAMERA_NAME: &str = "gpio-keys";
+pub const KEY_CAMERA: u16 = 212;
+/// Input device of the power button, `KEY_POWER`.
+pub const POWER_NAME: &str = "twl6030_pwrbutton";
+pub const KEY_POWER: u16 = 116;
+
+const EV_KEY: u16 = 1;
 
 /// Bytes read from one client per loop iteration.
 const READ_BUDGET: usize = 64 * 1024;
@@ -46,6 +57,26 @@ pub struct Options {
     /// "Down" is decreasing raw Y.
     pub invert_y: bool,
     pub screen_off_input: ScreenOffInput,
+    /// The glasshub sysfs directory (`None`: no glasshub).
+    pub glasshub: Option<PathBuf>,
+    /// A stock gaze parameter file to take the hub thresholds from, if it exists.
+    pub gaze_params: Option<PathBuf>,
+    pub camera: Source,
+    pub power: Source,
+    /// The touchpad's F11 sysfs directory, for `sleepmode` (`None`: not written).
+    pub touchpad_sysfs: Option<PathBuf>,
+    /// Where the settings are stored (`None`: in memory only).
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Where an input device comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Found by its input device name.
+    Auto,
+    Path(PathBuf),
+    /// Not used.
+    Off,
 }
 
 /// Reads both clocks.
@@ -92,6 +123,39 @@ pub struct Daemon {
     display: Box<dyn Display>,
     mock: Option<MockInput>,
     events: Vec<glass_evdev::Event>,
+    glasshub: Option<GlassHub>,
+    hub_written: HubWritten,
+    wear: WearMachine,
+    camera: ButtonTracker,
+    power: ButtonTracker,
+    camera_dev: Option<Device>,
+    power_dev: Option<Device>,
+    touch_sleep: TouchpadSleep,
+    store: Option<SettingsStore>,
+}
+
+/// Writes `v` with `write` unless it is the value last written.
+fn sync_attr(
+    cur: &mut Option<bool>,
+    v: bool,
+    name: &str,
+    write: impl FnOnce(bool) -> io::Result<()>,
+) {
+    if *cur == Some(v) {
+        return;
+    }
+    match write(v) {
+        Ok(()) => *cur = Some(v),
+        Err(e) => warn!("glasshub {name}: {e}"),
+    }
+}
+
+/// What was last written to the glasshub, so each value is written only on a change.
+#[derive(Debug, Default)]
+struct HubWritten {
+    detection: Option<bool>,
+    wink: Option<bool>,
+    pause: Option<bool>,
 }
 
 /// Binds the socket: removes a stale socket file, refuses to start if another daemon answers,
@@ -121,6 +185,75 @@ pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     l.set_nonblocking(true)?;
     Ok(l)
+}
+
+/// Opens a button's input device (by name, or the given path) and checks that it has the key.
+fn open_key(source: &Source, name: &str, code: u16) -> Option<Device> {
+    let path = match source {
+        Source::Off => return None,
+        Source::Path(p) => p.clone(),
+        Source::Auto => match glass_evdev::find_by_name(name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                info!("no input device named {name:?}");
+                return None;
+            }
+            Err(e) => {
+                warn!("cannot scan /dev/input for {name:?}: {e}");
+                return None;
+            }
+        },
+    };
+    let mut dev = match Device::open(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("cannot open {}: {e}", path.display());
+            return None;
+        }
+    };
+    if dev.has_code(EV_KEY, code).is_ok_and(|has| !has) {
+        warn!("{} ({name:?}) has no key {code}", path.display());
+        return None;
+    }
+    if let Err(e) = dev.set_clock_monotonic() {
+        info!("{}: EVIOCSCLOCKID failed ({e})", path.display());
+    }
+    info!("{name:?} on {}", path.display());
+    Some(dev)
+}
+
+/// Opens the glasshub and writes its thresholds (with on-head detection off while doing so).
+fn open_glasshub(opts: &Options) -> Option<GlassHub> {
+    let root = opts.glasshub.as_ref()?;
+    let hub = match GlassHub::open(root) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            info!("no glasshub at {}", root.display());
+            return None;
+        }
+        Err(e) => {
+            warn!("cannot open the glasshub at {}: {e}", root.display());
+            return None;
+        }
+    };
+    info!(
+        "glasshub {} (firmware {})",
+        root.display(),
+        hub.version().unwrap_or_else(|e| format!("unreadable: {e}"))
+    );
+    let thresholds = opts
+        .gaze_params
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| Thresholds::parse_params(&t))
+        .unwrap_or_default();
+    if let Err(e) = hub
+        .set_on_head_detection(false)
+        .and_then(|()| hub.apply_thresholds(&thresholds))
+    {
+        warn!("glasshub thresholds: {e}");
+    }
+    Some(hub)
 }
 
 fn open_touchpad(opts: &Options) -> Option<(Device, Config)> {
@@ -215,11 +348,32 @@ impl Daemon {
         };
         cfg.forward_is_positive_x = !opts.invert_x;
         cfg.down_is_positive_y = !opts.invert_y;
-        let settings = settings_rules::defaults();
+        let store = opts.state_dir.as_ref().map(SettingsStore::new);
+        let settings = match &store {
+            Some(st) => st.load().unwrap_or_else(|e| {
+                warn!(
+                    "cannot read {}: {e}; using the defaults",
+                    st.path().display()
+                );
+                settings_rules::defaults()
+            }),
+            None => settings_rules::defaults(),
+        };
         let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(15_000));
-        let mut caps: Vec<&str> = vec!["screen"];
-        if opts.mock {
-            caps = vec![
+        let (glasshub, camera_dev, power_dev) = if opts.mock {
+            (None, None, None)
+        } else {
+            (
+                open_glasshub(opts),
+                open_key(&opts.camera, CAMERA_NAME, KEY_CAMERA),
+                open_key(&opts.power, POWER_NAME, KEY_POWER),
+            )
+        };
+        let hub_present = glasshub.is_some() || opts.mock;
+        let detection = settings.on_head_detection_enabled.unwrap_or(false) && hub_present;
+        let wear = WearMachine::new(t.mono_us, detection);
+        let caps: Vec<&str> = if opts.mock {
+            vec![
                 "mock",
                 "touchpad",
                 "screen",
@@ -229,34 +383,41 @@ impl Daemon {
                 "head",
                 "wear",
                 "wink",
-            ];
-        } else if device.is_some() {
-            caps.insert(0, "touchpad");
-        }
+            ]
+        } else {
+            let mut c = Vec::new();
+            if device.is_some() {
+                c.push("touchpad");
+            }
+            c.extend(["screen", "wear"]);
+            if glasshub.is_some() {
+                c.push("wink");
+            }
+            if camera_dev.is_some() {
+                c.push("button-camera");
+            }
+            if power_dev.is_some() {
+                c.push("button-power");
+            }
+            c
+        };
         let mut hub = Hub::new(env!("CARGO_PKG_VERSION"), &caps);
         hub.set_screen_source(policy.state());
         hub.set_settings_source(settings);
-        let mock = opts.mock.then(|| {
-            let wear = WearState {
-                wear: Wear::OnHead as i32,
-                snapshot: false,
-                timestamp_us: t.mono_us,
-                source: WearSource::Forced as i32,
-            };
-            hub.set_wear_source(wear);
-            MockInput {
-                buf: Vec::new(),
-                commands: VecDeque::new(),
-                resume_at: None,
-                eof: false,
-            }
+        hub.set_wear_source(wear.state());
+        let mock = opts.mock.then(|| MockInput {
+            buf: Vec::new(),
+            commands: VecDeque::new(),
+            resume_at: None,
+            eof: false,
         });
+        let touchpad_sysfs = opts.touchpad_sysfs.clone().filter(|d| d.is_dir());
         info!(
             "listening on {} ({})",
             opts.socket.display(),
             caps.join(", ")
         );
-        Ok(Daemon {
+        let mut d = Daemon {
             hub,
             listener,
             socket_path: opts.socket.clone(),
@@ -268,7 +429,23 @@ impl Daemon {
             display,
             mock,
             events: Vec::new(),
-        })
+            glasshub,
+            hub_written: HubWritten::default(),
+            wear,
+            camera: ButtonTracker::new(ButtonId::Camera),
+            power: ButtonTracker::new(ButtonId::Power),
+            camera_dev,
+            power_dev,
+            touch_sleep: TouchpadSleep::new(touchpad_sysfs),
+            store,
+        };
+        // A previous run may have left the touchpad asleep.
+        if d.mock.is_none() {
+            d.touch_sleep.set(false);
+        }
+        d.sync_glasshub();
+        d.read_don_doff();
+        Ok(d)
     }
 
     /// Runs forever (until a fatal error).
@@ -283,6 +460,9 @@ impl Daemon {
             self.rec.next_deadline(),
             self.policy.next_deadline(),
             self.mock.as_ref().and_then(|m| m.resume_at),
+            self.wear.next_deadline(),
+            self.camera.next_deadline(),
+            self.power.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -316,6 +496,9 @@ impl Daemon {
             Listener,
             Touchpad,
             Stdin,
+            Key(ButtonId),
+            DonDoff,
+            WinkAttr,
             Client(ClientId),
         }
         let mut fds = Vec::new();
@@ -331,6 +514,16 @@ impl Daemon {
         add(self.listener.as_raw_fd(), libc::POLLIN, Src::Listener);
         if let Some(d) = &self.device {
             add(d.as_raw_fd(), libc::POLLIN, Src::Touchpad);
+        }
+        if let Some(d) = &self.camera_dev {
+            add(d.as_raw_fd(), libc::POLLIN, Src::Key(ButtonId::Camera));
+        }
+        if let Some(d) = &self.power_dev {
+            add(d.as_raw_fd(), libc::POLLIN, Src::Key(ButtonId::Power));
+        }
+        if let Some(h) = &self.glasshub {
+            add(h.don_doff_fd(), glass_hub::sysfs::POLL_EVENTS, Src::DonDoff);
+            add(h.wink_fd(), glass_hub::sysfs::POLL_EVENTS, Src::WinkAttr);
         }
         if let Some(m) = &self.mock
             && !m.eof
@@ -365,6 +558,9 @@ impl Daemon {
                 Src::Listener => self.accept(),
                 Src::Touchpad => self.read_touchpad(),
                 Src::Stdin => self.read_stdin(),
+                Src::Key(id) => self.read_key(id),
+                Src::DonDoff => self.read_don_doff(),
+                Src::WinkAttr => self.read_wink(),
                 Src::Client(id) => {
                     if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                         self.read_client(id);
@@ -381,6 +577,13 @@ impl Daemon {
         self.touch_outputs(&out, t);
         if let Some(c) = self.policy.on_timeout(t) {
             self.apply_change(c);
+        }
+        let u = self.wear.on_timeout(t.mono_us);
+        self.wear_update(u);
+        for id in [ButtonId::Camera, ButtonId::Power] {
+            if let Some(b) = self.tracker(id).on_timeout(t.mono_us) {
+                self.button_frames(id, vec![b]);
+            }
         }
         if let Some(m) = &mut self.mock
             && m.resume_at.is_some_and(|r| t.mono_us >= r)
@@ -527,11 +730,7 @@ impl Daemon {
                         self.apply_change(c);
                     }
                 }
-                Effect::SettingsChanged(s) => {
-                    if let Some(ms) = s.screen_timeout_ms {
-                        self.policy.set_timeout(ms);
-                    }
-                }
+                Effect::SettingsChanged(s) => self.settings_changed(&s),
             }
         }
     }
@@ -676,47 +875,21 @@ impl Daemon {
             Command::Scroll { displacement } => {
                 self.synth_touch(|s, cfg| s.drag(1, displacement * cfg.x.span(), 600))
             }
-            Command::Camera { long } => {
-                let screen_off = self.policy.is_off();
-                if let Some(ch) = self.policy.wake(t, "button", false) {
-                    self.apply_change(ch);
-                }
-                let actions: &[ButtonAction] = if long {
-                    &[ButtonAction::LongPress, ButtonAction::Release]
-                } else {
-                    &[ButtonAction::Press]
-                };
-                for &a in actions {
-                    self.publish(service_frame::Body::Button(Button {
-                        button: ButtonId::Camera as i32,
-                        action: a as i32,
-                        screen_off,
-                        timestamp_us: t.mono_us,
-                    }));
-                }
+            Command::Camera { long } => self.mock_button(ButtonId::Camera, long),
+            Command::Power { long } => self.mock_button(ButtonId::Power, long),
+            Command::Hinge { open } => {
+                let u = self.wear.hinge(t.mono_us, open);
+                self.wear_update(u);
             }
-            Command::Power { long } => {
-                let screen_off = self.policy.is_off();
-                let actions: &[ButtonAction] = if long {
-                    &[ButtonAction::LongPress, ButtonAction::Release]
-                } else {
-                    &[ButtonAction::Press]
-                };
-                for &a in actions {
-                    self.publish(service_frame::Body::Button(Button {
-                        button: ButtonId::Power as i32,
-                        action: a as i32,
-                        screen_off,
-                        timestamp_us: t.mono_us,
-                    }));
+            Command::Wear { on } => {
+                if !self.wear.detection() {
+                    info!(
+                        "mock: on_head_detection_enabled is false: the sensor reading is kept, not used"
+                    );
                 }
-                if !long {
-                    let on = !self.policy.on_head();
-                    self.mock_wear(on, WearSource::PowerKey);
-                }
+                let u = self.wear.sensor(t.mono_us, on);
+                self.wear_update(u);
             }
-            Command::Hinge { open } => self.mock_wear(open, WearSource::Hinge),
-            Command::Wear { on } => self.mock_wear(on, WearSource::Sensor),
             Command::LookUp | Command::LookDown | Command::RelativeLookUp | Command::Nudge => {
                 let s = self.settings();
                 let angle = s.head_wake_angle_deg.unwrap_or(30.0);
@@ -752,15 +925,7 @@ impl Daemon {
                     self.apply_change(ch);
                 }
             }
-            Command::Wink => {
-                if self.settings().wink_enabled.unwrap_or(false) {
-                    self.publish(service_frame::Body::Wink(Wink {
-                        timestamp_us: t.mono_us,
-                    }));
-                } else {
-                    info!("mock: wink ignored (wink_enabled is false)");
-                }
-            }
+            Command::Wink => self.wink(t.mono_us),
             Command::Dim => {
                 if let Some(ch) = self.policy.force_dim(t) {
                     self.apply_change(ch);
@@ -774,17 +939,182 @@ impl Daemon {
         }
     }
 
-    fn mock_wear(&mut self, on: bool, source: WearSource) {
-        let t = now();
-        let wear = WearState {
-            wear: if on { Wear::OnHead } else { Wear::OffHead } as i32,
-            snapshot: false,
-            timestamp_us: t.mono_us,
-            source: source as i32,
+    /// A press of a button from the mock: down, then (long) the hold time, then up.
+    fn mock_button(&mut self, id: ButtonId, long: bool) {
+        let t = now().mono_us;
+        self.on_key(id, crate::buttons::KEY_DOWN, t);
+        let mut up = t;
+        if long {
+            up = t + LONG_PRESS_MS * 1000;
+            if let Some(b) = self.tracker(id).on_timeout(up) {
+                self.button_frames(id, vec![b]);
+            }
+        }
+        self.on_key(id, crate::buttons::KEY_UP, up);
+    }
+
+    fn tracker(&mut self, id: ButtonId) -> &mut ButtonTracker {
+        match id {
+            ButtonId::Power => &mut self.power,
+            _ => &mut self.camera,
+        }
+    }
+
+    fn read_key(&mut self, id: ButtonId) {
+        let dev = match id {
+            ButtonId::Power => &mut self.power_dev,
+            _ => &mut self.camera_dev,
         };
-        self.publish(service_frame::Body::WearState(wear));
-        if let Some(ch) = self.policy.set_on_head(t, on) {
+        let Some(d) = dev else { return };
+        self.events.clear();
+        if let Err(e) = d.read_events(&mut self.events) {
+            warn!("{id:?} button read failed ({e}); button disabled");
+            *dev = None;
+            self.tracker(id).cancel();
+            return;
+        }
+        let code = match id {
+            ButtonId::Power => KEY_POWER,
+            _ => KEY_CAMERA,
+        };
+        let keys: Vec<(i32, u64)> = self
+            .events
+            .iter()
+            .filter(|e| e.type_ == EV_KEY && e.code == code)
+            .map(|e| (e.value, e.time_us))
+            .collect();
+        for (value, at) in keys {
+            self.on_key(id, value, at);
+        }
+    }
+
+    /// One key event of a button. The camera button wakes the screen on key down (not off
+    /// the head); the frames are published; a short power press toggles a manual off-head.
+    fn on_key(&mut self, id: ButtonId, value: i32, at_us: u64) {
+        let screen_off = self.policy.is_off();
+        let (down, frames) = self.tracker(id).key(value, at_us, screen_off);
+        if down
+            && id == ButtonId::Camera
+            && let Some(ch) = self.policy.wake(now(), "button", false)
+        {
             self.apply_change(ch);
+        }
+        self.button_frames(id, frames);
+    }
+
+    fn button_frames(&mut self, id: ButtonId, frames: Vec<Button>) {
+        for b in frames {
+            info!("button {id:?} {:?}", ButtonAction::try_from(b.action));
+            let press = b.action == ButtonAction::Press as i32;
+            self.publish(service_frame::Body::Button(b));
+            if id == ButtonId::Power && press {
+                let u = self.wear.power_key(now().mono_us);
+                self.wear_update(u);
+            }
+        }
+    }
+
+    /// Publishes a wear change and, when the wear itself changed, applies it: the screen
+    /// (off, or a quick wake on don), the touchpad's sleep mode, and a touch in progress is
+    /// cancelled off the head.
+    fn wear_update(&mut self, u: Option<Update>) {
+        if let Some(u) = u {
+            let on = u.state.wear == Wear::OnHead as i32;
+            info!(
+                "wear {:?} ({:?})",
+                Wear::try_from(u.state.wear),
+                WearSource::try_from(u.state.source)
+            );
+            self.publish(service_frame::Body::WearState(u.state));
+            if u.wear_changed {
+                let t = now();
+                self.touch_sleep.set(!on);
+                if let Some(ch) = self.policy.set_on_head(t, on) {
+                    self.apply_change(ch);
+                }
+                if !on {
+                    let mut out = Vec::new();
+                    self.rec.cancel(t.mono_us, &mut out);
+                    self.touch_outputs(&out, t);
+                }
+            }
+        }
+        self.sync_glasshub();
+    }
+
+    /// A glasshub (or the mock) can sense the wear.
+    fn hub_present(&self) -> bool {
+        self.glasshub.is_some() || self.mock.is_some()
+    }
+
+    /// Writes the glasshub enables that differ from what it has: on-head detection, the wink
+    /// interrupt, and the pause while forced off the head.
+    fn sync_glasshub(&mut self) {
+        let wink = self.settings().wink_enabled.unwrap_or(false);
+        let detection = self.wear.detection();
+        let pause = self.wear.hub_paused();
+        let Some(h) = &self.glasshub else { return };
+        let w = &mut self.hub_written;
+        sync_attr(&mut w.detection, detection, "on-head detection", |v| {
+            h.set_on_head_detection(v)
+        });
+        sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
+        sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v));
+    }
+
+    /// Re-reads `don_doff` after a notification (or at start).
+    fn read_don_doff(&mut self) {
+        let Some(h) = &mut self.glasshub else { return };
+        match h.read_don_doff() {
+            Ok(Some(on)) => {
+                let u = self.wear.sensor(now().mono_us, on);
+                self.wear_update(u);
+            }
+            Ok(None) => warn!("glasshub don_doff: unexpected value"),
+            Err(e) => {
+                warn!("glasshub read failed ({e}); glasshub disabled");
+                self.glasshub = None;
+            }
+        }
+    }
+
+    /// Acknowledges a wink interrupt and reports it.
+    fn read_wink(&mut self) {
+        let Some(h) = &mut self.glasshub else { return };
+        match h.ack_wink() {
+            Ok(_) => self.wink(now().mono_us),
+            Err(e) => {
+                warn!("glasshub read failed ({e}); glasshub disabled");
+                self.glasshub = None;
+            }
+        }
+    }
+
+    /// A wink is reported when `wink_enabled` is true and the Glass is on the head.
+    fn wink(&mut self, at_us: u64) {
+        if !self.settings().wink_enabled.unwrap_or(false) {
+            info!("wink ignored (wink_enabled is false)");
+        } else if !self.wear.on_head() {
+            info!("wink ignored (off the head)");
+        } else {
+            self.publish(service_frame::Body::Wink(Wink {
+                timestamp_us: at_us,
+            }));
+        }
+    }
+
+    /// Applies and stores changed settings.
+    fn settings_changed(&mut self, s: &Settings) {
+        if let Some(ms) = s.screen_timeout_ms {
+            self.policy.set_timeout(ms);
+        }
+        let detection = s.on_head_detection_enabled.unwrap_or(false) && self.hub_present();
+        let u = self.wear.set_detection(now().mono_us, detection);
+        self.wear_update(u);
+        if let Some(st) = &self.store
+            && let Err(e) = st.save(s)
+        {
+            warn!("cannot store the settings in {}: {e}", st.path().display());
         }
     }
 }

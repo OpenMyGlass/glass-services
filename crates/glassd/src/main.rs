@@ -1,5 +1,6 @@
-use glassd::daemon::{Daemon, Options, TOUCHPAD_NAME};
-use glassd::display::LoggingDisplay;
+use glassd::daemon::{Daemon, Options, Source, TOUCHPAD_NAME};
+use glassd::display::{Display, FbDisplay, LoggingDisplay, TOUCHPAD_SYSFS, default_fb};
+use glassd::settings_store::default_state_dir;
 use glassd::touch::ScreenOffInput;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,10 +18,51 @@ usage: glassd [options]
                           screen-off wake: the kernel's encoded frames only (Android early
                           suspend), or the recognizer on real touches (default: encoded on
                           Android, touches elsewhere)
+  --display <fb[:path]|log>
+                          screen back end: FBIOBLANK on the framebuffer (default
+                          /dev/graphics/fb0 on Android, /dev/fb0 elsewhere), or log only
+                          (default: fb, log with --mock)
+  --glasshub <dir|none>   glasshub sysfs directory (default /sys/bus/i2c/devices/4-0035)
+  --gaze-params <path>    take the glasshub thresholds from this stock parameter file
+                          (default /data/system/gaze/gaze_params.txt, if it exists)
+  --camera-device <path|none>
+                          camera button event device (default: found by name, gpio-keys)
+  --power-device <path|none>
+                          power button event device (default: found by name, twl6030_pwrbutton)
+  --touchpad-sysfs <dir|none>
+                          touchpad F11 sysfs directory for sleepmode
+                          (default /sys/bus/rmi/devices/touchpad.fn11)
+  --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
+                          /data/glassd on Android and /var/lib/glassd elsewhere; with
+                          --mock, only when given)
   -v, --verbose           log to standard error
   -h, --help              this help";
 
-fn parse(args: impl Iterator<Item = String>) -> Result<(Options, bool), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplayChoice {
+    Default,
+    Log,
+    Fb(Option<PathBuf>),
+}
+
+fn path_or_none(v: String) -> Option<PathBuf> {
+    (v != "none").then(|| PathBuf::from(v))
+}
+
+fn source(v: String) -> Source {
+    match path_or_none(v) {
+        Some(p) => Source::Path(p),
+        None => Source::Off,
+    }
+}
+
+struct Parsed {
+    opts: Options,
+    verbose: bool,
+    display: DisplayChoice,
+}
+
+fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     let mut o = Options {
         socket: glass_api::socket_path(),
         mock: false,
@@ -34,8 +76,16 @@ fn parse(args: impl Iterator<Item = String>) -> Result<(Options, bool), String> 
         } else {
             ScreenOffInput::Touches
         },
+        glasshub: Some(glass_hub::sysfs::DEFAULT_ROOT.into()),
+        gaze_params: Some(glass_hub::sysfs::STOCK_PARAMS.into()),
+        camera: Source::Auto,
+        power: Source::Auto,
+        touchpad_sysfs: Some(TOUCHPAD_SYSFS.into()),
+        state_dir: None,
     };
     let mut verbose = false;
+    let mut display = DisplayChoice::Default;
+    let mut state_dir = None;
     let mut args = args.peekable();
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -53,16 +103,56 @@ fn parse(args: impl Iterator<Item = String>) -> Result<(Options, bool), String> 
                     v => return Err(format!("--screen-off-input: unknown value {v:?}")),
                 }
             }
+            "--display" => {
+                display = match value("--display")?.as_str() {
+                    "log" => DisplayChoice::Log,
+                    "fb" => DisplayChoice::Fb(None),
+                    v => match v.strip_prefix("fb:") {
+                        Some(p) if !p.is_empty() => DisplayChoice::Fb(Some(p.into())),
+                        _ => return Err(format!("--display: unknown value {v:?}")),
+                    },
+                }
+            }
+            "--glasshub" => o.glasshub = path_or_none(value("--glasshub")?),
+            "--gaze-params" => o.gaze_params = path_or_none(value("--gaze-params")?),
+            "--camera-device" => o.camera = source(value("--camera-device")?),
+            "--power-device" => o.power = source(value("--power-device")?),
+            "--touchpad-sysfs" => o.touchpad_sysfs = path_or_none(value("--touchpad-sysfs")?),
+            "--state-dir" => state_dir = Some(PathBuf::from(value("--state-dir")?)),
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option {other:?}")),
         }
     }
-    Ok((o, verbose))
+    o.state_dir = state_dir.or_else(|| (!o.mock).then(default_state_dir));
+    Ok(Parsed {
+        opts: o,
+        verbose,
+        display,
+    })
+}
+
+fn display(choice: DisplayChoice, mock: bool) -> Box<dyn Display> {
+    let path = match choice {
+        DisplayChoice::Log => return Box::new(LoggingDisplay),
+        DisplayChoice::Default if mock => return Box::new(LoggingDisplay),
+        DisplayChoice::Default | DisplayChoice::Fb(None) => default_fb(),
+        DisplayChoice::Fb(Some(p)) => p,
+    };
+    match FbDisplay::open(&path) {
+        Ok(d) => Box::new(d),
+        Err(e) => {
+            glassd::log::write(format_args!(
+                "glassd: warning: cannot open {} ({e}); the screen is not blanked",
+                path.display()
+            ));
+            Box::new(LoggingDisplay)
+        }
+    }
 }
 
 fn main() -> ExitCode {
-    let (opts, verbose) = match parse(std::env::args().skip(1)) {
+    let parsed = match parse(std::env::args().skip(1)) {
         Ok(v) => v,
         Err(e) => {
             if !e.is_empty() {
@@ -76,8 +166,13 @@ fn main() -> ExitCode {
             };
         }
     };
+    let Parsed {
+        opts,
+        verbose,
+        display: choice,
+    } = parsed;
     glassd::log::set_verbose(verbose);
-    let mut d = match Daemon::new(&opts, Box::new(LoggingDisplay)) {
+    let mut d = match Daemon::new(&opts, display(choice, opts.mock)) {
         Ok(d) => d,
         Err(e) => {
             glassd::log::write(format_args!("glassd: cannot start: {e}"));

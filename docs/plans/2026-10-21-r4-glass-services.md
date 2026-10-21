@@ -40,8 +40,8 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 | `glass-evdev` | Minimal evdev reader (`input_event` parsing, `EVIOCGNAME`, `EVIOCGABS`) over `libc` | M1 |
 | `glassd` | The daemon: `poll` loop, device discovery, socket server, `--mock` | M1 (touchpad only) |
 | `glass-head` | Head gestures (look up to wake, nudge, relative look-up) from IMU samples | M2 |
-| `glass-hub` | glasshub: on-head, wink, through the kernel driver's interface | M2 |
-| `glass-screen` | Wake and sleep policy (timeouts, wake sources, off-head) as a pure state machine, plus the display back ends | M2 |
+| `glass-hub` | glasshub: on-head, wink, through the kernel driver's interface; the on-head state machine | M2 |
+| `glass-screen` | Wake and sleep policy (timeouts, wake sources, off-head) as a pure state machine, plus the display back ends. Done in M1 and M2 as modules of `glassd` (`screen.rs`, `display.rs`) instead of a crate of its own | M2 |
 | `android/` | Android glue | M3 |
 
 ### CI (GitHub Actions)
@@ -59,9 +59,19 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 5. `glass-evdev` and `glassd` reading a touchpad, recognizing gestures and serving them over the socket; host test with a fake device stream.
 6. CI as above, and the ruleset.
 
+## Milestone 2
+
+Split into pull requests that each build and pass on their own.
+
+1. [x] `glass-hub`: sysfs access (presence by `version`, `poll` on `don_doff` and `wink`, enables, thresholds, an allow-list of writable attributes) and the pure on-head state machine (sensor, forced, power key, hinge; 30 s forced period).
+2. [x] Buttons: camera (`gpio-keys`) and power (`twl6030_pwrbutton`) by device name; press, long press, release; a short power press toggles the manual off-head.
+3. [x] Back ends: `FBIOBLANK` on the panel framebuffer, touchpad `sleepmode` on off-head and don.
+4. [x] Settings stored in a file, written atomically, read at start.
+5. [ ] `glass-head`: IIO buffer reader for the MPU-9150, look-up and look-down from the accelerometer, nudge and relative look-up from the gyroscope, inhibition windows; `HeadRequest` in the interface (next pull request).
+6. [x] Mock commands for buttons, hinge, wear and wink through the same logic as the hardware; capabilities only for the sources found.
+
 ## Later milestones
 
-- **M2:** head gestures, glasshub (on-head, wink), screen policy; device checklist.
 - **M3:** Android glue (init service, system app, key event injection for legacy apps, `PowerManager` wake and sleep).
 - **M4:** location feed from the phone (owner decision 2026-10-22: the GPS chip stays asleep and no GPS HAL is written): relay of the bridge's location messages through the companion link provider, `TOPIC_LOCATION` in glassd, mock commands; in the Android glue, a location provider fed from it.
 - **M5:** route 2 packaging (OpenRC service for Alpine, udev-free device discovery).
@@ -74,3 +84,13 @@ Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.
 - [ ] Two clients: the focus moves to the second and back when it disconnects; the first gets a cancelled `Scroll` if the hand-off happens mid-touch.
 - [ ] A tap on a dark screen wakes it and selects nothing.
 - [ ] evdev timestamps are monotonic after `EVIOCSCLOCKID`.
+
+### Milestone 2 (not run: no Glass available)
+
+- [ ] The glasshub is at `/sys/bus/i2c/devices/4-0035/` and `version` reads 1.12 or later; the thresholds are written at start (read them back).
+- [ ] `don_doff` reads 1 on the head and 0 off it, and `poll` wakes on each change (`on_head_detection_enabled` true); taking the Glass off turns the screen off and writes touchpad `sleepmode` 1, putting it on wakes the screen with the 3 s timeout.
+- [ ] With `wink_enabled`, a wink raises the `wink` notification and a `Wink` frame; note the false-positive rate without a CPU classifier.
+- [ ] The camera key (`gpio-keys`, `KEY_CAMERA`) gives press, long press and release, and wakes the screen; the power key (`twl6030_pwrbutton`) short press toggles off-head and on-head (`WEAR_SOURCE_POWER_KEY`). On route 1 Android's own power-key handling must be kept out of the short press first (milestone 3).
+- [ ] `FBIOBLANK` on `/dev/graphics/fb0` turns the panel off and on (find which fb drives the panel); nothing writes the brightness attributes.
+- [ ] The settings survive a restart of `glassd` (`/data/glassd/settings`).
+- [ ] The daemon still uses no CPU when idle with the glasshub and buttons open.

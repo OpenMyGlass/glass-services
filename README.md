@@ -16,7 +16,8 @@ Clean-room Glass system services for Google Glass Explorer Edition: touchpad ges
 | `crates/glass-api` | Types generated from the `.proto` at build time (prost-build + protox, no `protoc`), the framing codec, a blocking `Client`, the session rules as a pure `Hub`, and the in-process `MockService` for tests of clients |
 | `crates/glass-gesture` | Touchpad recognizer (MT protocol A and B, tap, long press, swipes, scroll, screen-off encoded frames); pure, no I/O |
 | `crates/glass-evdev` | Minimal evdev over `libc`: `input_event` parsing, `EVIOCGNAME`, `EVIOCGABS`, `EVIOCSCLOCKID` |
-| `crates/glassd` | The daemon: `poll` loop, socket server, screen policy, `--mock` |
+| `crates/glass-hub` | glasshub over the kernel driver's sysfs (on-head, wink, thresholds; an allow-list of writable attributes) and the pure on-head state machine |
+| `crates/glassd` | The daemon: `poll` loop, socket server, screen policy and back ends (`FBIOBLANK`, touchpad `sleepmode`), buttons, stored settings, `--mock` |
 
 ## Build and run
 
@@ -25,6 +26,12 @@ cargo test --workspace
 cargo run -p glassd -- --mock --socket /tmp/glassd.sock -v     # then type: tap, swipe forward, wait 500, ...
 cargo run -p glassd -- --device-name sensor00fn11              # on a Glass (default device name)
 ```
+
+On a Glass, `glassd` also opens the glasshub (`--glasshub`, default `/sys/bus/i2c/devices/4-0035`),
+the camera and power buttons (found by name, or `--camera-device` / `--power-device`), the touchpad's
+`sleepmode` (`--touchpad-sysfs`), and blanks the panel with `FBIOBLANK` (`--display fb[:path]`, or
+`--display log`). Settings are stored in `--state-dir` (default `$GLASSD_STATE_DIR`, else
+`/data/glassd` on Android, `/var/lib/glassd` elsewhere). `glassd --help` lists every option.
 
 Cross builds (as in CI): `cargo build --release --target armv7-linux-androideabi` with the NDK's
 `armv7a-linux-androideabi22-clang` as linker, and `cargo zigbuild --release --target

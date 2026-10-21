@@ -1,0 +1,12 @@
+[package]
+name = "glass-hub"
+description = "glasshub (on-head, wink) over the kernel driver's sysfs, and the on-head state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glass-api.workspace = true
+libc.workspace = true

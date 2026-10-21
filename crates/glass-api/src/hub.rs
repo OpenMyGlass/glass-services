@@ -303,7 +303,6 @@ impl Hub {
                         settings_rules::merge(current, &change);
                     }
                     let applied = *current;
-                    fx.push(Effect::SettingsChanged(applied));
                     fx.push(Effect::Send(
                         id,
                         frame(service_frame::Body::Settings(applied)),
@@ -316,6 +315,8 @@ impl Hub {
                             ));
                         }
                     }
+                    // Last, so the answer goes out before the frames its consequences cause.
+                    fx.push(Effect::SettingsChanged(applied));
                 }
             },
             Some(B::GetState(_)) => {

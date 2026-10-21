@@ -106,12 +106,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-hub"
+version = "0.1.0"
+dependencies = [
+ "glass-api",
+ "libc",
+]
+
+[[package]]
 name = "glassd"
 version = "0.1.0"
 dependencies = [
  "glass-api",
  "glass-evdev",
  "glass-gesture",
+ "glass-hub",
  "libc",
 ]
 

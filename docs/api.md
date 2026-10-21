@@ -127,6 +127,17 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 - `ACTION_USER_ACTIVITY` restarts the timer, for activity `glassd` cannot see.
 - `ScreenState` reports every change with a `reason`; `dim` for the dim step and `activity` when a touch or `ACTION_USER_ACTIVITY` restores `SCREEN_ON` from `SCREEN_DIM`.
 
+  `ScreenState.reason` and `last_sleep_reason` take exactly these values:
+
+  | Change | Reasons |
+  |---|---|
+  | wake (`SCREEN_OFF` → `SCREEN_ON`) | `tap`, `swipe-forward`, `swipe-backward` (touchpad), `look-up`, `don`, `button` (camera), `request` (`ACTION_WAKE` or `ACTION_KEEP_ON`) |
+  | sleep (→ `SCREEN_OFF`) | `timeout`, `two-finger-swipe-down`, `nudge`, `off-head`, `request` (`ACTION_SLEEP`) |
+  | dim and undim | `dim` (`SCREEN_ON` → `SCREEN_DIM`), `activity` (`SCREEN_DIM` → `SCREEN_ON`) |
+  | snapshot | `snapshot` |
+
+  A client compares them as strings and treats an unknown value as "other" (new reasons may be added).
+
 The default timeout and the dim step follow the stock behaviour described in `docs/specs/`.
 
 Who switches the panel:

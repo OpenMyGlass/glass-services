@@ -26,7 +26,7 @@ relies on them.
 | IMU | IIO device `mpu9150` (`/sys/bus/iio/devices/iio:deviceN`, `/dev/iio:deviceN`) | gyro + accel + AK8975 compass via the MPU aux bus; DMP "GLU" event |
 | Ambient light / prox | evdev `ltr506_als` (`ABS_MISC`) and `ltr506_ps` (`ABS_DISTANCE`), sysfs on the input devices | LTR-506ALS |
 | Display on/off | fb blank (`FBIOBLANK` on `/dev/graphics/fb0`), Android early suspend via `/sys/power/state` | panel driver `panel_notle` |
-| Brightness | `.../panel-notle-dpi/brightness` (0..255) | `brightness_limit` is a power cap: do not raise |
+| Brightness | `.../panel-notle-dpi/brightness` (effective 0..223 at the default cap) | never raise `brightness_limit` or `brightness_multiplier` |
 | Wake locks | `/sys/power/wake_lock`, `/sys/power/wake_unlock`, `/proc/wakelocks` | Android wakelock API |
 
 ## 1. Touchpad
@@ -35,7 +35,8 @@ relies on them.
 
 - Chip: Synaptics, sensor name `tm2240`, driven by the out-of-tree Synaptics
   RMI4 bus driver in `drivers/input/rmi4/` (board-notle.c:1479-1481).
-  Not Cypress: all Cypress touch options are off in the defconfig.
+  Not Cypress: all Cypress touch options are off in the defconfig
+  (e.g. `TOUCHSCREEN_CYTTSP_CORE`, notle_defconfig:1449).
 - Enabled options: `CONFIG_RMI4_BUS`, `RMI4_I2C`, `RMI4_GENERIC`, `RMI4_F05`,
   `RMI4_F09`, `RMI4_F11`, `RMI4_F34` (flash), `RMI4_DEV` (char dev),
   `RMI4_DEBUG` (notle_defconfig:1514-1534). `RMI4_F11_PEN` and
@@ -97,8 +98,11 @@ relies on them.
   note). When the last finger lifts, the driver sends an empty
   `SYN_MT_REPORT` then `SYN_REPORT` (rmi_f11.c:2132-2139, 2147). An "all up"
   frame is therefore a frame with zero contacts.
-- Fingers that land inside the viewfinder rectangle while `view_enable=1` are
-  not reported as contacts (rmi_f11.c:1911-1929).
+- While `view_enable=1`, a finger whose **first** sample of the touch
+  sequence lands inside the viewfinder rectangle is not reported as a
+  contact; a finger that starts outside and moves in is still reported
+  (rmi_f11.c:1913-1925, the `movement_finger_cnt[i] == 0` test). Excluded
+  fingers are also not counted for the press gesture.
 - Report rate: set by the controller firmware; F01 exposes a one-bit
   `reportrate` (1.4). Not stated in source. **[device]** measure with evtest.
 
@@ -126,7 +130,21 @@ synthetic touches (rmi_f11.c:1961-2097, generator at 1756-1795):
 | driver tap (if `gesture=1`) | 100 | 100 | box < 90x90, 5..250 ms, 1 finger, >1 events; once per suspend cycle |
 
 Markers of a synthetic event: `ABS_MT_PRESSURE = 1`, `TOUCH_MAJOR = 15`,
-`TOUCH_MINOR = 15`, no tracking ID (rmi_f11.c:79-83, 1761-1773). Offsets:
+`TOUCH_MINOR = 15`, and no `TRACKING_ID`, `TOOL_TYPE` or `ORIENTATION`
+(rmi_f11.c:79-83, 1761-1773).
+
+Frame structure in screen-off mode:
+
+- Real contacts are still reported in early suspend
+  (rmi_f11.c:1931-1932), interleaved with the synthetic gestures.
+- Each synthetic gesture is its own frame: one contact, `SYN_MT_REPORT`,
+  `SYN_REPORT` (rmi_f11.c:1775-1776).
+- Before a press gesture the driver closes the current real-finger frame
+  with an extra `SYN_REPORT` (rmi_f11.c:2071-2075). The outer handler then
+  closes its own frame with another `SYN_REPORT` (rmi_f11.c:2147).
+- So the frame that follows a gesture can be empty or partial. Consumers
+  must not read it as "all fingers up". Classify each frame by the
+  synthetic markers first, and track real contacts separately. Offsets:
 rmi_f11.c:102-109. Driver-tap thresholds: rmi_f11.c:92-97. Each synthetic
 event takes a 250 ms wakelock `touchpad_wakelock` (rmi_f11.c:28, 1794,
 2895). The same wakelock is taken while any finger is down (rmi_f11.c:2127-2130).
@@ -294,7 +312,12 @@ data, `0x02` wink, `0x04` don/doff, `0x08` debug, `0x80` overflow
 - `value` is masked to 14 bits (`0x3fff`), or to 15 bits (`0x7fff`) when
   `wink_flag_enable=1`, in which case bit 14 (`0x4000`) marks a sample where
   the MCU detected a wink (glasshub.c:195-198, 680-686, 714).
-- FIFO depth 64 records; older data is dropped when full (glasshub.c:181).
+- FIFO depth 64 records (glasshub.c:181, 308). When it is full, `kfifo_put`
+  discards the **new** record (glasshub.c:717), so the queued data is kept.
+  At most 64 samples per interrupt are kept (glasshub.c:667); the rest of
+  the burst is still drained from the MCU and thrown away. A slow reader
+  therefore sees stale samples, then a gap. Read promptly, or flush with
+  `lseek(fd, 0, SEEK_END)` before resuming.
 - Timestamps: the hard IRQ takes `read_robust_clock()`; samples in a burst
   are spaced by a running average interval that starts at 1/32 s
   (≈31.25 ms, so about 32 Hz) and is re-estimated every 32 single-sample
@@ -364,11 +387,14 @@ touch these attributes or `calibrate`.
   order, then padded to 8 bytes; Google added a format byte in the last
   padding byte before the timestamp (`0x01` quat, `0x02` gyro, `0x04` accel,
   `0x08` compass, inv_mpu_ring.c:536-539, 680-683), then the 64-bit
-  timestamp. Readers must handle this byte. **[device]** dump a few records.
+  timestamp. No format byte is written when only quaternion data is
+  enabled (inv_mpu_ring.c:680-681). Readers must handle this byte. **[device]** dump a few records.
 - Recommended sequence (README in the driver directory, lines 281-313):
   `power_state=1`; set `sampling_frequency`; set `gyro_enable`,
   `accl_enable`, `compass_enable`; enable scan elements; `buffer/enable=1`;
-  read `/dev/iio:device0`. Most settings return `EPERM` while the buffer is
+  read `/dev/iio:device0`. The README says `fifo_rate`; the actual IIO
+  attribute is `sampling_frequency` (README:287; inv_mpu_core.c:1447-1449).
+  Most settings return `EPERM` while the buffer is
   enabled or the chip is asleep (inv_mpu_core.c:546-549, 561).
 
 ### 3.3 Rates and ranges
@@ -409,8 +435,11 @@ flat, then on its side).
 
 - `dmp_firmware` is a binary sysfs file; the DMP image must be written
   from user space as a whole, then `firmware_loaded` reads 1
-  (inv_mpu_core.c:1847-1862; README). The image is not in the kernel tree.
-  **Open question:** where a redistributable DMP image would come from.
+  (inv_mpu_core.c:1847-1862; README). The write is rejected unless the
+  image is exactly 2962 bytes with CRC32 `0x130bd18d`
+  (inv_mpu_iio.h:515-516; inv_mpu_misc.c:1751-1762), so only one specific
+  InvenSense image is accepted. That image is not in the kernel tree.
+  **Open question:** where a redistributable copy of it could come from.
 - Event attributes, read after `poll()`: `event_tap`, `event_orientation`,
   `event_display_orientation`, `event_glu` (inv_mpu_core.c:1510-1514).
 - `event_glu` is a Google addition, notified when the DMP raises
@@ -432,7 +461,8 @@ flat, then on its side).
 ### 3.6 Suspend
 
 - `suspend_noirq` does nothing on notle (the abort-on-busy logic is
-  compiled out under `CONFIG_MACH_NOTLE`, inv_mpu_core.c:2054-2068).
+  compiled out under `CONFIG_MACH_NOTLE`, inv_mpu_core.c:2054-2068; hook
+  registered at inv_mpu_core.c:2070-2072).
 - The chip keeps its configuration over suspend; the IRQ is a wake source,
   so a running FIFO or DMP event can wake the system. A service must turn
   the buffer or `power_state` off before suspend if it does not want that.
@@ -484,9 +514,13 @@ kobject `panel-notle-dpi` under the DSS overlay manager
 | Attribute | Semantics |
 |---|---|
 | `enabled` | RW 0/1: power the panel on or off directly, bypassing fb blank (panel-notle-dpi.c:486-511) |
-| `brightness` | RW, 0..255 user scale (non-linear internal mapping, panel-notle-dpi.c:934-998). 0 turns the LEDs off. Applied at once if enabled, else at next enable. |
-| `brightness_multiplier` | RW, percent x100, default 10000 (accessibility boost, panel-notle-dpi.c:1044-1061, 2178) |
-| `brightness_limit` | RW, default 255 (panel-notle-dpi.c:2177). **Safety cap tied to the LED power limit `limit_mw` in board data (board-notle.c:569-589). Services must not raise it (rule 6).** |
+| `brightness` | RW. Accepts any value >= 0 (panel-notle-dpi.c:955-998). The user scale is non-linear: `range_expand` maps 0..223 roughly linearly and 224..255 steeply, so 255 becomes 765 internally (panel-notle-dpi.c:934-948). The effective value is min(scaled brightness, internal limit) (panel-notle-dpi.c:1515-1518), so at the default cap the usable range is **0..223**. 0 turns the LEDs off. Applied at once if enabled, else at next enable. |
+| `brightness_multiplier` | RW, percent x100, default 10000; any value >= 0, **no upper bound**; scales brightness before the cap (panel-notle-dpi.c:1048-1063, 1515-1516, 2178). **It raises LED power: services must never raise it above the default (rule 6).** |
+| `brightness_limit` | RW. Default is 255 internal (panel-notle-dpi.c:2177), which **reads back as 223** (`range_reduce`, panel-notle-dpi.c:1000-1002). Writes go through `range_expand` (panel-notle-dpi.c:1004-1042), so writing 255 would set the internal cap to 765, about 3x the default. **Services must never raise it (rule 6).** |
+
+`limit_mw` (76 on current boards, board-notle.c:569-589) is a separate fixed
+factor in the PWM calculation (panel-notle-dpi.c:1531-1533). It is not tied
+to `brightness_limit`.
 | `gamma1`..`gamma8`, `gamma_preset`, `colormix`, `mono`, `cpsel`, `forcer/g/b`, `testpattern`, `list_testpatterns` | image tuning and test; not for services |
 | `reg_addr`, `reg_value`, `dump_regs`, `fpga_revision`, `reset`, `debug` | FPGA register access and diagnostics; not for services |
 

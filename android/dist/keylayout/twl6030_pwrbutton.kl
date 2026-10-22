@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# The power button reaches Android as BUTTON_MODE, not POWER: glassd handles the short press
+# (manual off-head) and the glue the long press (docs/api.md "Android glue").
+key 116   BUTTON_MODE

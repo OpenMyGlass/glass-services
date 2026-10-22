@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# glassd, the Glass system services daemon (OpenMyGlass glass-services, docs/api.md).
+# Imported by the device's init.<hardware>.rc: import /init.glassd.rc
+
+on post-fs-data
+    # Stored settings (docs/api.md "Settings").
+    mkdir /data/glassd 0700 system system
+
+on boot
+    # The touchpad's F11 sleepmode, written off the head (docs/specs/kernel-interfaces.md).
+    chown system system /sys/devices/touchpad/touchpad.fn11/sleepmode
+
+# The socket is 0666 because no group of ours exists on Android: glassd checks each peer's uid
+# (root, system, the packages below; docs/api.md "Who may connect"). The input group opens the
+# touchpad and buttons in /dev/input.
+service glassd /system/bin/glassd --allow-package org.openmyglass.launcher --allow-package org.openmyglass.glass
+    class main
+    user system
+    group system input
+    socket glassd stream 0666 system system

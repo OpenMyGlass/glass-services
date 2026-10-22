@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- The glassd Android glue (docs/api.md "Android glue"). A persistent system app with the system
+     uid: the platform signature (LOCAL_CERTIFICATE := platform) grants DEVICE_POWER,
+     INJECT_EVENTS and SHUTDOWN. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.openmyglass.services.glue"
+    android:sharedUserId="android.uid.system"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="22" />
+
+    <uses-permission android:name="android.permission.DEVICE_POWER" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.INJECT_EVENTS" />
+    <uses-permission android:name="android.permission.SHUTDOWN" />
+
+    <application
+        android:name=".GlueApplication"
+        android:label="Glass services glue"
+        android:persistent="true"
+        android:allowBackup="false"
+        android:hasCode="true" />
+</manifest>

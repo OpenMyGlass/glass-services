@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# glassd on Android 6.0 (BOARD_SEPOLICY_DIRS). Not built or run yet: check with audit2allow on
+# a device and tighten the sysfs rules once the glasshub and touchpad nodes have their own labels.
+type glassd, domain;
+type glassd_exec, exec_type, file_type;
+type glassd_data_file, file_type, data_file_type;
+type glassd_socket, file_type;
+
+init_daemon_domain(glassd)
+
+# Touchpad, camera and power buttons.
+allow glassd input_device:dir r_dir_perms;
+allow glassd input_device:chr_file r_file_perms;
+# Glasshub (4-0035) and touchpad sleepmode attributes.
+allow glassd sysfs:dir r_dir_perms;
+allow glassd sysfs:file rw_file_perms;
+allow glassd sysfs:lnk_file read;
+# Stored settings.
+allow glassd glassd_data_file:dir create_dir_perms;
+allow glassd glassd_data_file:file create_file_perms;
+# /data/system/packages.list, for the peer check.
+allow glassd system_data_file:dir search;
+allow glassd system_data_file:file r_file_perms;
+
+# Clients: the glue (system uid), the launcher (platform signature) and the companion link
+# provider (a regular app).
+unix_socket_connect(system_app, glassd, glassd)
+unix_socket_connect(platform_app, glassd, glassd)
+unix_socket_connect(untrusted_app, glassd, glassd)

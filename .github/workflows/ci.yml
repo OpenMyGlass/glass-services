@@ -23,6 +23,76 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  glue:
+    # The Android glue's Java logic on a desktop JVM (no emulator), against glassd --mock.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: cargo build --locked -p glassd
+      - name: Glue tests (JVM), end to end against glassd --mock
+        run: |
+          out=$(mktemp -d)
+          javac -Xlint:all -Werror -d "$out" $(find android/glue/src android/glue/test -name '*.java' ! -name GlueApplication.java)
+          java -cp "$out" org.openmyglass.services.glue.GlueTests target/debug/glassd
+
+  android-dist:
+    # Android 4.4 and 6.0 (API 19, NDK r25c): glassd and the glue APK as the dist directory the
+    # device tree includes (android/README.md).
+    runs-on: ubuntu-latest
+    env:
+      BUILD_TOOLS: "34.0.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r25c
+          add-to-path: false
+      - name: SDK platform 19 and build-tools (pinned)
+        run: |
+          sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$sdkmanager" --install "platforms;android-19" "build-tools;$BUILD_TOOLS" >/dev/null
+      - name: Build the dist directory
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: tools/android-dist.sh dist
+      - name: Check the binary and the APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          llvm="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          file dist/bin/glassd
+          "$llvm/llvm-readelf" -d dist/bin/glassd | grep NEEDED | tee needed.txt
+          # Only libraries that Android 4.4 (API 19) has.
+          if grep -v -E '\[(libc|libm|libdl|liblog)\.so\]' needed.txt; then
+            echo "error: a library Android 4.4 may not have"; exit 1
+          fi
+          aapt2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
+          "$aapt2" dump badging dist/app/GlassServicesGlue.apk | tee badging.txt
+          grep -q "minSdkVersion:'19'" badging.txt
+          "$aapt2" dump xmltree --file AndroidManifest.xml dist/app/GlassServicesGlue.apk | tee manifest.txt
+          grep -q 'android:sharedUserId.*"android.uid.system"' manifest.txt
+          grep -q 'android:persistent.*=true' manifest.txt
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" verify --min-sdk-version 19 dist/app/GlassServicesGlue.apk
+          (cd dist && sha256sum -c SHA256SUMS)
+          cat dist/SOURCE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-services-android-dist
+          path: dist/
+
   android-armv7:
     runs-on: ubuntu-latest
     steps:

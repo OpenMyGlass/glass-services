@@ -36,6 +36,8 @@ pub const MOCK_CAPABILITIES: &[&str] = &[
     "head",
     "wear",
     "wink",
+    "dictation",
+    "companion",
 ];
 
 struct State {

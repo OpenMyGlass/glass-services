@@ -26,6 +26,11 @@ message ClientFrame {
     DictationConfirm dictation_confirm = 10; // milestone 3
     LocationRequest location_request = 11;   // milestone 4
     HeadRequest head = 12;                   // milestone 2
+    // Companion link provider only (milestone 3; docs/api.md "Companion link provider"):
+    CompanionRegister companion_register = 13;   // this client holds the phone link
+    CompanionStatus companion_status = 14;       // the phone link changed
+    DictationState provider_dictation_state = 15; // a relayed request's state; request_id = the link id
+    Transcript provider_transcript = 16;          // a relayed request's transcript; request_id = the link id
   }
 }
 
@@ -44,6 +49,7 @@ enum Topic {
   TOPIC_DICTATION = 6;                       // DictationState, Transcript (only for the requester)
   TOPIC_BUTTON = 7;                          // Button
   TOPIC_LOCATION = 8;                        // Location, LocationStatus (milestone 4)
+  TOPIC_COMPANION = 9;                       // CompanionState (milestone 3)
 }
 
 message Subscribe {
@@ -117,13 +123,19 @@ message ServiceFrame {
     Button button = 14;
     Location location = 15;                  // milestone 4
     LocationStatus location_status = 16;     // milestone 4
+    CompanionState companion_state = 17;     // milestone 3
+    // To the companion link provider only (milestone 3); request_id is glassd's link id:
+    DictationStart provider_dictation_start = 18;
+    DictationCancel provider_dictation_cancel = 19;
+    DictationConfirm provider_dictation_confirm = 20;
   }
 }
 
 message Welcome {
   uint32 api_version = 1;                    // the version this session uses: min(client, service)
   string service_version = 2;
-  repeated string capabilities = 3;          // "touchpad", "head", "wear", "wink", "screen", "button", "dictation", "mock"
+  repeated string capabilities = 3;          // "touchpad", "head", "wear", "wink", "screen", "button-camera", ...,
+                                             // "dictation", "companion", "mock" (docs/api.md)
 }
 
 enum ErrorCode {
@@ -133,6 +145,7 @@ enum ErrorCode {
   ERROR_CODE_INVALID_ARGUMENT = 3;           // a known request with an invalid value
   ERROR_CODE_UNAVAILABLE = 4;                // the source exists but failed (device removed, ...)
   ERROR_CODE_NO_COMPANION = 5;               // dictation without a companion link
+  ERROR_CODE_DENIED = 6;                     // the peer is not allowed on the socket; connection closed
 }
 
 message ServiceError {
@@ -319,4 +332,25 @@ message LocationStatus {
   }
   State state = 1;
   string reason = 2;                         // with STATE_UNAVAILABLE: "permission", "disabled", "no-fix"
+}
+
+// ---- companion link (milestone 3): the process that holds the phone connection (docs/api.md) ----
+
+message CompanionRegister {
+  string name = 1;                           // for logs, e.g. "openmyglass-glass"
+}
+
+message CompanionStatus {                    // provider -> glassd, after CompanionRegister
+  bool phone_connected = 1;                  // a phone's bridge session is up (its Hello was received)
+  repeated string phone_capabilities = 2;    // the capabilities of the phone's Hello, e.g. "dictation-free"
+  string phone_name = 3;                     // for display, e.g. the phone's Bluetooth name; may be empty
+}
+
+message CompanionState {                     // TOPIC_COMPANION
+  bool provider = 1;                         // a companion link provider is registered
+  bool phone_connected = 2;
+  repeated string phone_capabilities = 3;
+  string phone_name = 4;
+  bool snapshot = 5;                         // sent because of Subscribe or GetState
+  uint64 timestamp_us = 6;                   // time of the change (for a snapshot: of the last change)
 }

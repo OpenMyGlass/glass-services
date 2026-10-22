@@ -425,6 +425,8 @@ impl Daemon {
                 "head",
                 "wear",
                 "wink",
+                "dictation",
+                "companion",
             ]
         } else {
             let mut c = Vec::new();
@@ -444,6 +446,7 @@ impl Daemon {
             if power_dev.is_some() {
                 c.push("button-power");
             }
+            c.extend(["dictation", "companion"]);
             c
         };
         let mut hub = Hub::new(env!("CARGO_PKG_VERSION"), &caps);

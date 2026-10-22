@@ -1,5 +1,6 @@
 use glassd::daemon::{Daemon, Options, Source, TOUCHPAD_NAME};
 use glassd::display::{Display, FbDisplay, LoggingDisplay, TOUCHPAD_SYSFS, default_fb};
+use glassd::peers::{PACKAGES_LIST, PeerPolicy};
 use glassd::settings_store::default_state_dir;
 use glassd::touch::ScreenOffInput;
 use std::path::PathBuf;
@@ -38,6 +39,12 @@ usage: glassd [options]
   --iio <dir|none>        where to look for the IMU (IIO device named mpu9150; default
                           /sys/bus/iio/devices)
   --iio-device <path>     the IMU's character device (default /dev/iio:deviceN)
+  --peer-check <on|off>   check each peer's uid (default: on on Android, where the socket
+                          is 0666; off elsewhere unless --allow-* is given). Root and
+                          system (1000) are always allowed
+  --allow-package <name>  allow this Android package's uid (from --packages-list); repeatable
+  --allow-uid <uid>       allow this uid; repeatable
+  --packages-list <path>  Android's package list (default /data/system/packages.list)
   --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
                           /data/glassd on Android and /var/lib/glassd elsewhere; with
                           --mock, only when given)
@@ -90,7 +97,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         state_dir: None,
         iio: Some(glass_head::iio::DEVICES_ROOT.into()),
         iio_dev: None,
+        peers: PeerPolicy::open(),
     };
+    let mut peer_check = None;
+    let mut allow_uids = Vec::new();
+    let mut allow_packages = Vec::new();
+    let mut packages_list = PathBuf::from(PACKAGES_LIST);
     let mut verbose = false;
     let mut display = DisplayChoice::Default;
     let mut state_dir = None;
@@ -139,12 +151,32 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                 }
             }
             "--iio-device" => o.iio_dev = Some(PathBuf::from(value("--iio-device")?)),
+            "--peer-check" => {
+                peer_check = match value("--peer-check")?.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => return Err(format!("--peer-check: unknown value {v:?}")),
+                }
+            }
+            "--allow-package" => allow_packages.push(value("--allow-package")?),
+            "--allow-uid" => {
+                let v = value("--allow-uid")?;
+                allow_uids.push(
+                    v.parse()
+                        .map_err(|_| format!("--allow-uid: not a uid: {v:?}"))?,
+                );
+            }
+            "--packages-list" => packages_list = PathBuf::from(value("--packages-list")?),
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option {other:?}")),
         }
     }
     o.state_dir = state_dir.or_else(|| (!o.mock).then(default_state_dir));
+    let check = peer_check.unwrap_or(
+        cfg!(target_os = "android") || !allow_uids.is_empty() || !allow_packages.is_empty(),
+    );
+    o.peers = PeerPolicy::new(check, allow_uids, allow_packages, &packages_list);
     if !head {
         o.iio = None;
     }

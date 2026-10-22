@@ -451,7 +451,7 @@ impl Hub {
             }
             Some(B::DictationConfirm(c)) => {
                 let mut out = Vec::new();
-                if self.relay.confirm(id, c, &mut out).is_err() {
+                if !self.relay.confirm(id, c, &mut out) {
                     fx.push(Effect::Send(
                         id,
                         error(

@@ -37,6 +37,25 @@ pub enum Command {
     Wait {
         ms: u64,
     },
+    /// The simulated companion link provider (milestone 3).
+    Companion(CompanionCommand),
+}
+
+/// Commands of the simulated companion link provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompanionCommand {
+    /// Register (if needed) with a connected phone offering these capabilities.
+    On { capabilities: Vec<String> },
+    /// The phone disconnects; the provider stays registered.
+    Off,
+    /// The provider unregisters (disconnects from glassd).
+    Gone,
+    /// A transcript for the newest open request.
+    Transcript { text: String, last: bool },
+    /// The newest open request fails with this error.
+    Error { error: String },
+    /// The phone's `ReplyResult` for the newest open request.
+    ReplyResult { ok: bool },
 }
 
 fn fingers(arg: Option<&str>) -> Result<u32, String> {
@@ -64,9 +83,56 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
     let Some(cmd) = w.next() else {
         return Ok(None);
     };
+    // The words after the command, for commands that take text.
+    let rest = |line: &str| -> String {
+        let after = line.trim_start();
+        after[cmd.len()..].trim().to_string()
+    };
     let a = w.next();
     let b = w.next();
     let c = match cmd {
+        "companion" => Command::Companion(match a {
+            Some("on") => CompanionCommand::On {
+                capabilities: {
+                    let mut caps: Vec<String> = line
+                        .split_whitespace()
+                        .skip(2)
+                        .map(str::to_string)
+                        .collect();
+                    if caps.is_empty() {
+                        caps.push("dictation-free".into());
+                    }
+                    caps
+                },
+            },
+            Some("off") => CompanionCommand::Off,
+            Some("gone") => CompanionCommand::Gone,
+            _ => return Err("companion on [CAPABILITY ...]|off|gone".into()),
+        }),
+        "transcript" | "transcript-final" => {
+            let text = rest(line);
+            if text.is_empty() {
+                return Err(format!("{cmd} <text>"));
+            }
+            Command::Companion(CompanionCommand::Transcript {
+                text,
+                last: cmd == "transcript-final",
+            })
+        }
+        "dictation-error" => {
+            let error = rest(line);
+            if error.is_empty() {
+                return Err("dictation-error <error>".into());
+            }
+            Command::Companion(CompanionCommand::Error { error })
+        }
+        "reply-result" => Command::Companion(CompanionCommand::ReplyResult {
+            ok: match a {
+                Some("ok") => true,
+                Some("fail") => false,
+                _ => return Err("reply-result ok|fail".into()),
+            },
+        }),
         "tap" => Command::Tap {
             fingers: fingers(a)?,
         },
@@ -160,6 +226,45 @@ mod tests {
         assert_eq!(ok("wink"), Command::Wink);
         assert_eq!(ok("dim"), Command::Dim);
         assert_eq!(ok("wait 250 # comment"), Command::Wait { ms: 250 });
+        let comp = |c| Command::Companion(c);
+        assert_eq!(
+            ok("companion on"),
+            comp(CompanionCommand::On {
+                capabilities: vec!["dictation-free".into()]
+            })
+        );
+        assert_eq!(
+            ok("companion on location dictation-free"),
+            comp(CompanionCommand::On {
+                capabilities: vec!["location".into(), "dictation-free".into()]
+            })
+        );
+        assert_eq!(ok("companion off"), comp(CompanionCommand::Off));
+        assert_eq!(ok("companion gone"), comp(CompanionCommand::Gone));
+        assert_eq!(
+            ok("  transcript-final  buy milk  "),
+            comp(CompanionCommand::Transcript {
+                text: "buy milk".into(),
+                last: true
+            })
+        );
+        assert_eq!(
+            ok("transcript buy"),
+            comp(CompanionCommand::Transcript {
+                text: "buy".into(),
+                last: false
+            })
+        );
+        assert_eq!(
+            ok("dictation-error no-speech"),
+            comp(CompanionCommand::Error {
+                error: "no-speech".into()
+            })
+        );
+        assert_eq!(
+            ok("reply-result fail"),
+            comp(CompanionCommand::ReplyResult { ok: false })
+        );
     }
 
     #[test]
@@ -178,6 +283,11 @@ mod tests {
             "wear",
             "wait",
             "fly",
+            "companion",
+            "companion maybe",
+            "transcript",
+            "dictation-error",
+            "reply-result maybe",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

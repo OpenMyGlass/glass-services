@@ -51,6 +51,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: armv7-linux-androideabi
+          components: clippy
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

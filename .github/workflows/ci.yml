@@ -64,6 +64,8 @@ jobs:
         run: |
           sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
           yes | "$sdkmanager" --install "platforms;android-19" "build-tools;$BUILD_TOOLS" >/dev/null
+      - name: Clippy for Android (the API 19 shims, logcat)
+        run: cargo clippy --locked --target armv7-linux-androideabi -p glassd -- -D warnings
       - name: Build the dist directory
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

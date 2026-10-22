@@ -6,6 +6,10 @@
 use std::ffi::{c_int, c_void};
 
 /// `signal` through `sigaction` (exported at API 19), with `SA_RESTART` like bionic's own `signal`.
+///
+/// # Safety
+///
+/// As for libc's `signal`: `handler` is `SIG_DFL`, `SIG_IGN` or a valid signal handler.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signal(sig: c_int, handler: libc::sighandler_t) -> libc::sighandler_t {
     // SAFETY: zeroed is a valid sigaction; the pointers are valid for the call.
@@ -25,7 +29,7 @@ pub unsafe extern "C" fn signal(sig: c_int, handler: libc::sighandler_t) -> libc
 /// Used by the standard library only to symbolize panic backtraces: report no objects, so a
 /// backtrace shows addresses without names.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dl_iterate_phdr(
+pub extern "C" fn dl_iterate_phdr(
     _callback: Option<unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> c_int>,
     _data: *mut c_void,
 ) -> c_int {

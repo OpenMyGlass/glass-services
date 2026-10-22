@@ -7,6 +7,7 @@ Clean-room Glass system services for Google Glass Explorer Edition: touchpad ges
 | [`docs/api.md`](docs/api.md) | The interface between `glassd` and clients (launcher, apps, Android glue) |
 | [`proto/glass/services/v1/services.proto`](proto/glass/services/v1/services.proto) | Its messages |
 | [`docs/plans/`](docs/plans/) | Plans and decisions |
+| [`android/`](android/) | The Android glue and the prebuilt directory the device tree includes ([`android/README.md`](android/README.md)) |
 | `docs/specs/` | Facts: kernel interfaces (from the GPL kernel source) and clean-room specs of the stock components (added by their own PRs) |
 
 ## Crates

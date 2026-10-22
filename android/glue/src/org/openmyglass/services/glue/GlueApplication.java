@@ -37,6 +37,8 @@ public final class GlueApplication extends Application implements Platform {
     private Method wakeUp;
     private Method goToSleep;
     private final ExecutorService keys = Executors.newSingleThreadExecutor();
+    /** Screen broadcasts are handled off the main thread: they may write to the socket. */
+    private final ExecutorService broadcasts = Executors.newSingleThreadExecutor();
     private Glue glue;
 
     @Override
@@ -63,7 +65,13 @@ public final class GlueApplication extends Application implements Platform {
         registerReceiver(new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                glue.onAndroidScreen(Intent.ACTION_SCREEN_ON.equals(intent.getAction()));
+                final boolean on = Intent.ACTION_SCREEN_ON.equals(intent.getAction());
+                broadcasts.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        glue.onAndroidScreen(on);
+                    }
+                });
             }
         }, f);
         Thread t = new Thread(glue, "glassd-client");

@@ -22,6 +22,8 @@ public final class Glue implements Runnable {
     private volatile Platform.Connection conn;
     private volatile boolean running = true;
     private volatile boolean focused;
+    /** A session reached Welcome (the reconnection delay starts again from the minimum). */
+    private volatile boolean connected;
 
     public Glue(Platform platform, boolean interactive) {
         this.platform = platform;
@@ -41,13 +43,14 @@ public final class Glue implements Runnable {
         }
     }
 
-    /** Android's screen broadcast; may be called from any thread. */
+    /**
+     * Android's screen broadcast; may be called from any thread except the main one (it may
+     * write to the socket). The screen's state and its actions are kept in order by one lock.
+     */
     public void onAndroidScreen(boolean on) {
-        List<ScreenSync.Action> actions;
         synchronized (screen) {
-            actions = screen.onAndroidScreen(on, platform.uptimeMs());
+            apply(screen.onAndroidScreen(on, platform.uptimeMs()));
         }
-        apply(actions);
     }
 
     private void apply(List<ScreenSync.Action> actions) {
@@ -101,7 +104,6 @@ public final class Glue implements Runnable {
             conn = c;
             try {
                 session(c);
-                backoff = BACKOFF_MIN_MS;
             } catch (IOException e) {
                 platform.log("glassd connection lost: " + e.getMessage());
             } finally {
@@ -111,11 +113,13 @@ public final class Glue implements Runnable {
                 conn = null;
                 c.close();
                 focused = false;
-                List<ScreenSync.Action> actions;
                 synchronized (screen) {
-                    actions = screen.onDisconnected();
+                    apply(screen.onDisconnected());
                 }
-                apply(actions);
+            }
+            if (connected) {
+                connected = false;
+                backoff = BACKOFF_MIN_MS;
             }
             if (running) {
                 sleep(backoff);
@@ -139,6 +143,7 @@ public final class Glue implements Runnable {
             throw new IOException("expected Welcome, got " + w);
         }
         platform.log("connected to glassd " + w.serviceVersion + " " + w.capabilities);
+        connected = true;
         if (!send(Frames.subscribe(Frames.TOPIC_GESTURE, Frames.TOPIC_SCREEN, Frames.TOPIC_BUTTON))
                 || !send(Frames.acquireFocus())) {
             throw new IOException("handshake send failed");
@@ -155,11 +160,9 @@ public final class Glue implements Runnable {
     void handle(Frames.Event e) {
         switch (e.kind) {
             case SCREEN_STATE: {
-                List<ScreenSync.Action> actions;
                 synchronized (screen) {
-                    actions = screen.onGlassdScreen(e.screen, platform.uptimeMs());
+                    apply(screen.onGlassdScreen(e.screen, platform.uptimeMs()));
                 }
-                apply(actions);
                 break;
             }
             case FOCUS_STATE:

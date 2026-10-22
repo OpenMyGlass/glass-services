@@ -28,6 +28,8 @@ pub struct Link {
     pub started_us: u64,
     /// The final transcript was delivered (a reply then waits for `DictationConfirm`).
     pub final_seen: bool,
+    /// A reply's `DictationConfirm{send: true}` was relayed (it then waits for the result).
+    pub confirmed: bool,
 }
 
 /// What the relay asks its owner to send.
@@ -235,6 +237,7 @@ impl Relay {
                 free,
                 started_us: now_us,
                 final_seen: false,
+                confirmed: false,
             },
         );
         out.push(Out::Start(
@@ -263,10 +266,15 @@ impl Relay {
         let Some(link) = self.find(client, c.request_id) else {
             return true;
         };
-        let l = &self.links[&link];
+        let l = self.links.get_mut(&link).expect("found");
         if l.free || !l.final_seen {
             return false;
         }
+        if l.confirmed {
+            // Already relayed; the phone's result is pending.
+            return true;
+        }
+        l.confirmed = c.send;
         let provider = self.provider.expect("links exist only with a provider");
         out.push(Out::Confirm(
             provider,
@@ -293,6 +301,8 @@ impl Relay {
         match st {
             St::Unspecified | St::Done => return,
             St::Listening | St::Processing => {}
+            // Only a reply that was confirmed can be sent.
+            St::Sent if !l.confirmed => return,
             St::Failed | St::Sent => {
                 self.links.remove(&s.request_id);
             }
@@ -643,6 +653,8 @@ mod tests {
         );
         let fx = hub.on_frame(provider, cf(ptext(link, "on my way", true)));
         assert_eq!(states(&fx, app), vec![(5, St::Done, String::new())]);
+        // SENT before the confirmation is ignored.
+        assert!(sends(&hub.on_frame(provider, cf(pstate(link, St::Sent, "")))).is_empty());
         let fx = hub.on_frame(app, confirm(true));
         match &sends(&fx)[..] {
             [(id, S::ProviderDictationConfirm(c))] if *id == provider => {
@@ -650,6 +662,8 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // A second confirmation is not relayed again.
+        assert!(sends(&hub.on_frame(app, confirm(true))).is_empty());
         let fx = hub.on_frame(provider, cf(pstate(link, St::Sent, "")));
         assert_eq!(states(&fx, app), vec![(5, St::Sent, String::new())]);
         assert!(hub.relay().links().is_empty());

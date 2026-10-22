@@ -15,7 +15,7 @@ How `glassd` and its Android glue go into an AOSP build of Android 4.4 (Track A)
 | `init.glassd.rc` | the init service (user `system`, groups `system input`, socket `glassd` 0666), `/data/glassd`, the touchpad `sleepmode` owner |
 | `keylayout/twl6030_pwrbutton.kl` | power key as `BUTTON_MODE`, so Android never handles it (docs/api.md "Android glue") |
 | `idc/sensor00fn11.idc` | the touchpad as a touch navigation device (no pointer on screen) |
-| `sepolicy/` | `glassd` domain, socket and data types, `connectto` for the glue, launcher and provider (Android 6.0 only) |
+| `sepolicy/` | `glassd` domain, socket and data types, labels for the glasshub and touchpad sysfs nodes (the only ones it may write), `connectto` for the glue, launcher and provider (Android 6.0 only) |
 | `SOURCE`, `SHA256SUMS` | the glass-services commit and toolchain, and the files' checksums |
 
 The directory goes to `<aosp>/vendor/openmyglass/glass-services` (or anywhere, with `GLASS_SERVICES_DIR` set to it).
@@ -45,7 +45,7 @@ Nothing else: the glasshub attributes are already owned by `system` in `init.oma
 
 ## What runs
 
-- `glassd` starts in `class main` as `system`. It takes the socket that init created (`ANDROID_SOCKET_glassd`) and checks each peer's uid: root and system, and the packages `org.openmyglass.launcher` (glass-apps) and `org.openmyglass.glass` (the OpenMyGlass Glass app, the companion link provider), looked up in `/data/system/packages.list`. It logs to `logcat` (tag `glassd`). Defaults on Android: `--display log` (the framework blanks the panel), `--head off` (the sensors HAL owns the IMU), `--screen-off-input encoded`.
+- `glassd` starts in `class main` as `system`. It takes the socket that init created (`ANDROID_SOCKET_glassd`) and checks each peer's uid: root and system, and the packages `org.openmyglass.launcher` (glass-apps) and `org.openmyglass.glass` (the OpenMyGlass Glass app, the companion link provider), looked up in `/data/system/packages.list`. It logs to `logcat` (tag `glassd`). Defaults on Android: `--display log` (the framework blanks the panel), `--head off` (the sensors HAL owns the IMU), `--screen-off-input encoded`, `--grab-touchpad on`. Rust's standard library needs two libc functions that API 19 does not export (`signal`, `dl_iterate_phdr`); `crates/glassd/src/compat.rs` defines them for Android builds.
 - The glue `org.openmyglass.services.glue` runs as `android.uid.system` with `android:persistent`, so the framework starts it at boot and restarts it. It maps `ScreenState` to `PowerManager`, injects key events for regular apps while it holds the input focus, and shuts down on a long power-key press (docs/api.md "Android glue"). Log tag `glass-glue`.
 
 ## Tests without a device
@@ -69,6 +69,8 @@ Nothing else: the glasshub attributes are already owned by `system` in `init.oma
 - [ ] An alarm or notification that wakes the screen through a wake lock turns glassd's screen on too (`ACTION_WAKE` from the glue).
 - [ ] The power key's short press toggles off-head and does not sleep the screen through Android; a long press shuts down.
 - [ ] With a regular app in front (for example Settings), tap, swipes and swipe down move and select as `DPAD_CENTER`, `DPAD_RIGHT`/`LEFT` and `BACK`; with the launcher in front no keys are injected.
-- [ ] No pointer is shown for the touchpad (`sensor00fn11.idc`).
+- [ ] No pointer is shown for the touchpad, and in Settings each gesture moves exactly once (glassd grabs the touchpad; Android must not add its own navigation keys).
+- [ ] A tap with the screen off and the CPU suspended still wakes the screen (glassd holds no wake lock while it reads the touchpad; the kernel's 250 ms wake lock after an encoded frame should cover it).
+- [ ] glassd's dim step: note whether the panel actually dims (the framework shows `SCREEN_DIM_WAKE_LOCK` only after its own timeout).
 - [ ] Android 6.0: no SELinux denials for `glassd` (`dmesg | grep avc`); tighten the sysfs rules to the glasshub and touchpad labels.
 - [ ] Dictation through the OpenMyGlass Glass app once it registers as the companion link provider (it does not yet: that change belongs to the OpenMyGlass repository).

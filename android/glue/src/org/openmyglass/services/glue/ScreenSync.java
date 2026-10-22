@@ -59,8 +59,9 @@ public final class ScreenSync {
             case Frames.SCREEN_DIM:
                 if (!interactive) {
                     out.add(Action.WAKE_UP);
+                    // The expectations are independent: after a quick off and on, the
+                    // framework still sends both broadcasts, the off one first.
                     expectOnUntil = nowMs + ECHO_MS;
-                    expectOffUntil = -1;
                     interactive = true;
                 }
                 out.add(screen == Frames.SCREEN_ON ? Action.LOCK_BRIGHT : Action.LOCK_DIM);
@@ -70,7 +71,6 @@ public final class ScreenSync {
                 if (interactive) {
                     out.add(Action.GO_TO_SLEEP);
                     expectOffUntil = nowMs + ECHO_MS;
-                    expectOnUntil = -1;
                     interactive = false;
                 }
                 break;
@@ -92,8 +92,6 @@ public final class ScreenSync {
             expectOffUntil = -1;
             return out;
         }
-        expectOnUntil = -1;
-        expectOffUntil = -1;
         if (on && glassd == Frames.SCREEN_OFF) {
             out.add(Action.REQUEST_WAKE);
         } else if (!on && (glassd == Frames.SCREEN_ON || glassd == Frames.SCREEN_DIM)) {

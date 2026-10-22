@@ -11,7 +11,7 @@ import java.nio.charset.Charset;
 /**
  * The protobuf wire format and the varint32 length framing of docs/api.md, for the few
  * messages the glue uses. Hand-written instead of generated (no protoc and no protobuf
- * runtime in the build); CI checks it against a real glassd (GlueEndToEnd).
+ * runtime in the build); CI checks it against a real glassd (GlueTests, end to end).
  */
 public final class Wire {
     public static final int MAX_FRAME = 64 * 1024;

@@ -1058,10 +1058,28 @@ fn listens_on_a_socket_passed_by_init() {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let dir = test_dir("init-socket");
-    // As Android's init does: the socket file exists before glassd starts.
+    // As Android's init does: a socket that is bound but not listening.
     let path = dir.join("glassd");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let fd = listener.as_raw_fd();
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as _;
+    }
+    // SAFETY: a valid sockaddr_un of the given size.
+    let r = unsafe {
+        libc::bind(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(r, 0, "bind: {}", std::io::Error::last_os_error());
+    // SAFETY: we own fd.
+    let listener = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let _ = listener.as_raw_fd();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_glassd"));
     cmd.args(["--mock", "--socket"])
         .arg(&path)
@@ -1079,7 +1097,18 @@ fn listens_on_a_socket_passed_by_init() {
     }
     let child = spawn(&mut cmd);
     drop(listener);
-    let mut c = Client::connect_with_timeout(&path, "it", HANDSHAKE).unwrap();
+    // Until glassd calls listen(), connecting is refused.
+    let deadline = Instant::now() + HANDSHAKE;
+    let mut c = loop {
+        match Client::connect_with_timeout(&path, "it", HANDSHAKE) {
+            Ok(c) => break c,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
     assert!(c.has_capability("mock"));
     c.subscribe(&[Topic::Screen]).unwrap();
     drop(c);

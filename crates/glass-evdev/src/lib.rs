@@ -140,6 +140,9 @@ pub mod ioctl {
 
     /// `EVIOCSCLOCKID`.
     pub const SCLOCKID: u32 = ioc(WRITE, 0xa0, 4);
+
+    /// `EVIOCGRAB`.
+    pub const GRAB: u32 = ioc(WRITE, 0x90, 4);
 }
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -255,6 +258,14 @@ impl Device {
         });
         self.monotonic = r.is_ok();
         r.map(|_| ())
+    }
+
+    /// Takes the device for this descriptor only (`EVIOCGRAB`): other readers, such as
+    /// Android's input reader, get no events while it is held.
+    pub fn grab(&mut self, on: bool) -> io::Result<()> {
+        // SAFETY: EVIOCGRAB takes its int argument by value.
+        cvt(unsafe { libc::ioctl(self.fd.as_raw_fd(), ioctl::GRAB as _, libc::c_int::from(on)) })
+            .map(|_| ())
     }
 
     /// Whether event times come from the kernel in `CLOCK_MONOTONIC`.

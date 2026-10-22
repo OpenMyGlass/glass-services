@@ -39,6 +39,9 @@ usage: glassd [options]
   --iio <dir|none>        where to look for the IMU (IIO device named mpu9150; default
                           /sys/bus/iio/devices)
   --iio-device <path>     the IMU's character device (default /dev/iio:deviceN)
+  --grab-touchpad <on|off>
+                          take the touchpad for glassd alone (EVIOCGRAB; default: on on
+                          Android, where the glue injects keys instead, off elsewhere)
   --peer-check <on|off>   check each peer's uid (default: on on Android, where the socket
                           is 0666; off elsewhere unless --allow-* is given). Root and
                           system (1000) are always allowed
@@ -98,6 +101,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         iio: Some(glass_head::iio::DEVICES_ROOT.into()),
         iio_dev: None,
         peers: PeerPolicy::open(),
+        grab_touchpad: cfg!(target_os = "android"),
     };
     let mut peer_check = None;
     let mut allow_uids = Vec::new();
@@ -158,6 +162,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                     v => return Err(format!("--peer-check: unknown value {v:?}")),
                 }
             }
+            "--grab-touchpad" => {
+                o.grab_touchpad = match value("--grab-touchpad")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--grab-touchpad: unknown value {v:?}")),
+                }
+            }
             "--allow-package" => allow_packages.push(value("--allow-package")?),
             "--allow-uid" => {
                 let v = value("--allow-uid")?;
@@ -211,6 +222,12 @@ fn display(choice: DisplayChoice, mock: bool) -> Box<dyn Display> {
 }
 
 fn main() -> ExitCode {
+    // Keep the API 19 shims in the link: the standard library refers to them.
+    #[cfg(target_os = "android")]
+    std::hint::black_box((
+        glassd::compat::signal as usize,
+        glassd::compat::dl_iterate_phdr as usize,
+    ));
     let parsed = match parse(std::env::args().skip(1)) {
         Ok(v) => v,
         Err(e) => {

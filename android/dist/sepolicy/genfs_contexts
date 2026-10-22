@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# The sysfs nodes glassd may write (glassd.te).
+genfscon sysfs /devices/platform/omap_i2c.4/i2c-4/4-0035 u:object_r:sysfs_glasshub:s0
+genfscon sysfs /devices/touchpad u:object_r:sysfs_glass_touchpad:s0

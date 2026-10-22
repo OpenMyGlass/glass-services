@@ -77,6 +77,9 @@ pub struct Options {
     pub iio_dev: Option<PathBuf>,
     /// Which peers may connect (docs/api.md, "Who may connect").
     pub peers: PeerPolicy,
+    /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
+    /// touches into navigation keys (docs/api.md, "Android glue").
+    pub grab_touchpad: bool,
 }
 
 /// Where an input device comes from.
@@ -209,7 +212,13 @@ pub fn listen(path: &Path) -> io::Result<(UnixListener, bool)> {
                 format!("{}={v:?} is not a file descriptor", init_socket_env(name)),
             )
         })?;
-        // SAFETY: init passes the descriptor of a listening Unix socket and nothing else in
+        // init only binds the socket; the daemon listens (as vold and installd do). On a
+        // socket that already listens this only changes the backlog.
+        // SAFETY: listen on a descriptor number; an invalid one only returns an error.
+        if unsafe { libc::listen(fd, 16) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: init passes the descriptor of a Unix stream socket and nothing else in
         // this process uses it.
         let l = unsafe { UnixListener::from_raw_fd(fd) };
         l.set_nonblocking(true)?;
@@ -365,6 +374,11 @@ fn open_touchpad(opts: &Options) -> Option<(Device, Config)> {
     };
     if let Err(e) = dev.set_clock_monotonic() {
         warn!("EVIOCSCLOCKID failed ({e}); stamping events when read");
+    }
+    if opts.grab_touchpad
+        && let Err(e) = dev.grab(true)
+    {
+        warn!("EVIOCGRAB failed ({e}); other readers also get the touchpad");
     }
     let axis = |code, fallback: AxisRange| match dev.abs_info(code) {
         Ok(a) if a.maximum > a.minimum => AxisRange::new(a.minimum, a.maximum),
@@ -1549,6 +1563,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            grab_touchpad: false,
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

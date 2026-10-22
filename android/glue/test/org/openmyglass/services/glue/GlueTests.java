@@ -187,6 +187,17 @@ public final class GlueTests {
                 t.onAndroidScreen(false, 10 + ScreenSync.ECHO_MS + 1), "late off is external");
     }
 
+    static void testQuickOffAndOnKeepsTheScreenOn() {
+        ScreenSync s = new ScreenSync(true);
+        s.onGlassdScreen(Frames.SCREEN_ON, 0);
+        s.onGlassdScreen(Frames.SCREEN_OFF, 100);
+        s.onGlassdScreen(Frames.SCREEN_ON, 300);
+        // Both broadcasts come late, the off one first: both are our echoes.
+        eq(Collections.emptyList(), s.onAndroidScreen(false, 400), "late off echo");
+        eq(Collections.emptyList(), s.onAndroidScreen(true, 450), "on echo");
+        check(s.interactive(), "interactive");
+    }
+
     static void testDisconnectGivesTheScreenBack() {
         ScreenSync s = new ScreenSync(true);
         s.onGlassdScreen(Frames.SCREEN_ON, 0);

@@ -36,6 +36,8 @@ fb[:path]`; on Android the framework does, and the default is `--display log`). 
 stored in `--state-dir` (default `$GLASSD_STATE_DIR`, else
 `/data/glassd` on Android, `/var/lib/glassd` elsewhere). `glassd --help` lists every option.
 
+Android (4.4 and 6.0): `tools/android-dist.sh DIR` builds `glassd` with NDK r25c for API 19 and the glue APK into the directory the device tree includes; see [`android/README.md`](android/README.md).
+
 Cross builds (as in CI): `cargo build --release --target armv7-linux-androideabi` with the NDK's
 `armv7a-linux-androideabi22-clang` as linker, and `cargo zigbuild --release --target
 armv7-unknown-linux-musleabihf` for a static Linux binary.

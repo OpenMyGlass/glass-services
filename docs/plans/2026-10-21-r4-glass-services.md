@@ -22,13 +22,15 @@ Roadmap phase R4 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGl
 | **Rust** (chosen) | Memory safety in a long-running daemon that parses device input and socket frames; unit tests built in; one `cargo` command cross-builds to `armv7-linux-androideabi` and `armv7-unknown-linux-musleabihf`; a static musl binary also runs on Android, since it does not need bionic | Larger binaries than C (about 1 MB stripped); NDK linking for Android targets API 21 and up |
 | C | Smallest binaries; AOSP builds it natively | Parsing and state machines without memory safety; tests need a separate framework; two build systems (Android.mk and meson) |
 
-Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.0 (API 22 or 23). If a KitKat build is ever needed, the static musl build of the daemon runs there unchanged.
+> **Changed in milestone 3 (2026-10-22):** Android 4.4 is now a target (the roadmap's Track A is the near-term build). The Android build uses NDK r25c, the last NDK with API 19, and targets API 19, so one binary serves Track A (4.4) and Track B (6.0). The API 22 build with the runner's NDK stays in CI as a check of current toolchains.
+
+~~Android 4.4 (API 19) is not a target: the open ROM is built on Android 5.1 or 6.0 (API 22 or 23). If a KitKat build is ever needed, the static musl build of the daemon runs there unchanged.~~
 
 ### Process model
 
 - One daemon, `glassd`, with one module per source: touchpad, head (IMU), glasshub, screen policy. The modules are libraries (crates) with pure logic separated from device I/O, so the logic is tested on the host with recorded or synthetic event streams.
 - Clients (the launcher, apps, the Android glue) connect to a Unix stream socket. The interface is in [`../api.md`](../api.md).
-- Framing and encoding follow OpenMyGlass's bridge protocol: a varint32 length followed by one protobuf message. Rust generates its types from the `.proto` at build time with `prost-build` and `protox` (a pure-Rust protobuf compiler, so no `protoc` is needed), so the Rust types cannot drift from the `.proto`; Java glue uses protobuf-lite with the same file.
+- Framing and encoding follow OpenMyGlass's bridge protocol: a varint32 length followed by one protobuf message. Rust generates its types from the `.proto` at build time with `prost-build` and `protox` (a pure-Rust protobuf compiler, so no `protoc` is needed), so the Rust types cannot drift from the `.proto`. The Java glue (milestone 3) uses a small hand-written codec for the dozen fields it needs instead of protobuf-lite, so its build needs no `protoc` and no runtime library; an end-to-end test against `glassd --mock` in CI catches drift.
 - `glassd --mock` (and the in-process mock in `glass-api`) serves the same socket with scripted or keyboard-driven events, so apps are built and tested without a Glass.
 
 ### Crates
@@ -70,9 +72,20 @@ Split into pull requests that each build and pass on their own.
 5. [x] `glass-head`: IIO buffer reader for the MPU-9150 (scan elements, the Glass format byte, timestamps, scales, board matrix), look-up and look-down from the accelerometer, our nudge detector and relative look-up from the gyroscope, inhibition windows, sensors run only when needed; `HeadRequest` in the interface.
 6. [x] Mock commands for buttons, hinge, wear and wink through the same logic as the hardware; capabilities only for the sources found.
 
+## Milestone 3: Android glue
+
+1. [x] Companion link provider and dictation relay in the interface (`docs/api.md`, `TOPIC_COMPANION`, the `provider_*` frames), as pure state in `glass-api` used by the hub; a simulated provider in `glassd --mock`.
+2. [x] Android specifics in `glassd`: the socket from init (`ANDROID_SOCKET_glassd`), the peer check by uid with `packages.list` (Android has no group we can add without changing `system/core`; decision below), `logcat` output.
+3. [x] The glue (`android/glue/`): `ScreenState` to `PowerManager`, framework screen changes back to `glassd`, key events for regular apps while it holds the focus, shutdown on a long power-key press. JVM tests, end to end against `glassd --mock`.
+4. [x] Packaging: a prebuilt directory for `vendor/openmyglass/glass-services` (`Android.mk`, product makefile, init rc, key layout, IDC, 6.0 SELinux policy), built by `tools/android-dist.sh` and CI's `android-dist` job. The device tree includes it (lines in `android/README.md`); this repository does not edit the device tree.
+5. Not in this milestone: head gestures from Android's sensors (the IMU ownership decision is still open), the stock binder services for stock Glass apps, a location provider (M4).
+
+Decisions for the owner:
+- **Socket access on Android:** the socket is 0666 and `glassd` checks the peer's uid (root, system, the launcher and the OpenMyGlass Glass app by package name). The alternative is an AID `glass` added to `system/core` (a fork change in the manifest), which would let the socket be 0660 again.
+- **The provider:** the OpenMyGlass Glass app (`org.openmyglass.glass`) must register as the companion link provider for dictation to work; that change belongs to the OpenMyGlass repository.
+
 ## Later milestones
 
-- **M3:** Android glue (init service, system app, key event injection for legacy apps, `PowerManager` wake and sleep).
 - **M4:** location feed from the phone (owner decision 2026-10-22: the GPS chip stays asleep and no GPS HAL is written): relay of the bridge's location messages through the companion link provider, `TOPIC_LOCATION` in glassd, mock commands; in the Android glue, a location provider fed from it.
 - **M5:** route 2 packaging (OpenRC service for Alpine, udev-free device discovery).
 
@@ -103,4 +116,5 @@ Split into pull requests that each build and pass on their own.
 - [ ] Power: with head wake on and the screen off, the 10 Hz accelerometer interrupt wakes the CPU; measure the battery drain and whether Android still suspends. Without the DMP firmware this is the cost of look-up to wake (owner decision if it is too high).
 - [ ] The IMU stops (`buffer/enable` 0, `power_state` 0) off the head, when no detector runs, at start and when `glassd` exits.
 - [ ] The scales read back after `power_state` 1 match the driver defaults (±2 g, ±2000 dps).
+- [ ] Milestone 3: the Android checklist in [`android/README.md`](../../android/README.md) (glassd at boot, peer check, screen sync with `PowerManager`, key injection, power key, SELinux on 6.0).
 - [ ] Open decision for the owner: on route 1 the IMU belongs to Android's sensors HAL, so `glassd` defaults to `--head off` on Android and head gestures would come through the M3 glue from Android sensors; alternatively the HAL is dropped and `glassd` takes the IMU (`--head on`). On route 2 `glassd` owns it.

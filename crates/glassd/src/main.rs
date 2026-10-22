@@ -225,8 +225,8 @@ fn main() -> ExitCode {
     // Keep the API 19 shims in the link: the standard library refers to them.
     #[cfg(target_os = "android")]
     std::hint::black_box((
-        glassd::compat::signal as usize,
-        glassd::compat::dl_iterate_phdr as usize,
+        glassd::compat::signal as *const (),
+        glassd::compat::dl_iterate_phdr as *const (),
     ));
     let parsed = match parse(std::env::args().skip(1)) {
         Ok(v) => v,

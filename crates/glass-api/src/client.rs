@@ -230,6 +230,51 @@ impl Client {
         }
     }
 
+    /// Returns a frame that is already decoded or already in the socket, without waiting:
+    /// `Ok(None)` when there is none. Unlike `recv` with a short timeout (which the kernel
+    /// rounds up to a scheduler tick), it never blocks, so an event loop that polls the socket
+    /// itself drains it with this.
+    pub fn try_recv(&mut self) -> Result<Option<ServiceFrame>, ClientError> {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; 8192];
+        loop {
+            if self.closed {
+                return Err(ClientError::Closed);
+            }
+            match self.decoder.next_message::<ServiceFrame>() {
+                Ok(Some(f)) => return Ok(Some(f)),
+                Ok(None) => {}
+                Err(e) => {
+                    self.closed = true;
+                    let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                    return Err(e.into());
+                }
+            }
+            // SAFETY: `buf` is valid for `buf.len()` bytes.
+            let n = unsafe {
+                libc::recv(
+                    self.stream.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n == 0 {
+                return Err(ClientError::Closed);
+            }
+            if n > 0 {
+                self.decoder.push(&buf[..n as usize]);
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::WouldBlock => return Ok(None),
+                io::ErrorKind::Interrupted => {}
+                _ => return Err(e.into()),
+            }
+        }
+    }
+
     /// Receives frames until `pred` matches one, within `timeout`; returns it, or `None` on
     /// timeout. Frames that do not match are discarded.
     pub fn recv_until(

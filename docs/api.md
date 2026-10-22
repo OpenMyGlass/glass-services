@@ -1,6 +1,6 @@
 # Glass services interface (API version 1)
 
-How the launcher, apps and the Android glue talk to `glassd`. The messages are defined in [`proto/glass/services/v1/services.proto`](../proto/glass/services/v1/services.proto); this page gives their meaning. The Rust types, codec, client and in-process mock are in the `glass-api` crate.
+How the launcher, apps and the Android glue talk to `glassd`. The messages are defined in [`proto/glass/services/v1/services.proto`](../proto/glass/services/v1/services.proto); this page gives their meaning. The Rust types, codec, client and in-process mock are in the `glass-api` crate. A client with its own event loop polls the socket (`Client::stream()`) and drains it with `Client::try_recv()`, which never blocks.
 
 Nothing in this interface depends on Android: it is the same on route 1 (open Android) and route 2 (plain Linux).
 

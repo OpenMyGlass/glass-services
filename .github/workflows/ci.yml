@@ -81,7 +81,7 @@ jobs:
           fi
           aapt2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
           "$aapt2" dump badging dist/app/GlassServicesGlue.apk | tee badging.txt
-          grep -q "minSdkVersion:'19'" badging.txt
+          grep -qE "^(sdkVersion|minSdkVersion):'19'" badging.txt
           "$aapt2" dump xmltree --file AndroidManifest.xml dist/app/GlassServicesGlue.apk | tee manifest.txt
           grep -q 'android:sharedUserId.*"android.uid.system"' manifest.txt
           grep -q 'android:persistent.*=true' manifest.txt

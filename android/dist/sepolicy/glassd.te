@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# glassd on Android 6.0 (BOARD_SEPOLICY_DIRS). Not built or run yet: check with audit2allow on
+# a device.
+type glassd, domain;
+type glassd_exec, exec_type, file_type;
+type glassd_data_file, file_type, data_file_type;
+type glassd_socket, file_type;
+
+init_daemon_domain(glassd)
+
+# Touchpad, camera and power buttons.
+allow glassd input_device:dir r_dir_perms;
+allow glassd input_device:chr_file r_file_perms;
+# sysfs: read anywhere (the paths go through /sys/bus symlinks); write only the glasshub and
+# touchpad nodes (genfs_contexts), never cpufreq, thermal or charger nodes.
+type sysfs_glasshub, fs_type, sysfs_type;
+type sysfs_glass_touchpad, fs_type, sysfs_type;
+allow glassd sysfs:dir r_dir_perms;
+allow glassd sysfs:file r_file_perms;
+allow glassd sysfs:lnk_file read;
+allow glassd { sysfs_glasshub sysfs_glass_touchpad }:dir r_dir_perms;
+allow glassd { sysfs_glasshub sysfs_glass_touchpad }:file rw_file_perms;
+# Stored settings.
+allow glassd glassd_data_file:dir create_dir_perms;
+allow glassd glassd_data_file:file create_file_perms;
+# /data/system/packages.list, for the peer check.
+allow glassd system_data_file:dir search;
+allow glassd system_data_file:file r_file_perms;
+
+# Clients: the glue (system uid), the launcher (platform signature) and the companion link
+# provider (a regular app).
+unix_socket_connect(system_app, glassd, glassd)
+unix_socket_connect(platform_app, glassd, glassd)
+unix_socket_connect(untrusted_app, glassd, glassd)

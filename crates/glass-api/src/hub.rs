@@ -5,10 +5,11 @@
 //! [`Effect`]s the owner (glassd, or the in-process [`MockService`](crate::MockService)) must
 //! carry out. Both servers use it, so they behave the same.
 
+use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
-    ClientFrame, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus, ScreenState, Scroll,
-    ServiceError, ServiceFrame, Settings, Topic, WearState, Welcome, client_frame, location_status,
-    screen_request, service_frame,
+    ClientFrame, CompanionState, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus,
+    ScreenState, Scroll, ServiceError, ServiceFrame, Settings, Topic, WearState, Welcome,
+    client_frame, location_status, screen_request, service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -126,6 +127,9 @@ pub struct Hub {
     screen: Option<ScreenState>,
     wear: Option<WearState>,
     settings: Option<Settings>,
+    relay: Relay,
+    /// The time set by the owner ([`Hub::set_time`]); `None`: `CLOCK_MONOTONIC`.
+    time: Option<u64>,
 }
 
 fn frame(body: service_frame::Body) -> ServiceFrame {
@@ -156,7 +160,13 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::DictationState(_) | B::Transcript(_) => Topic::Dictation,
         B::Button(_) => Topic::Button,
         B::Location(_) | B::LocationStatus(_) => Topic::Location,
-        B::Welcome(_) | B::Error(_) | B::FocusState(_) => return None,
+        B::CompanionState(_) => Topic::Companion,
+        B::Welcome(_)
+        | B::Error(_)
+        | B::FocusState(_)
+        | B::ProviderDictationStart(_)
+        | B::ProviderDictationCancel(_)
+        | B::ProviderDictationConfirm(_) => return None,
     })
 }
 
@@ -173,6 +183,68 @@ impl Hub {
             screen: None,
             wear: None,
             settings: None,
+            relay: Relay::default(),
+            time: None,
+        }
+    }
+
+    /// Sets the time the hub uses from now on (tests); without it the hub reads
+    /// `CLOCK_MONOTONIC`. Times are in microseconds.
+    pub fn set_time(&mut self, now_us: u64) {
+        self.time = Some(now_us);
+    }
+
+    fn now(&self) -> u64 {
+        self.time.unwrap_or_else(crate::monotonic_us)
+    }
+
+    /// The companion link and the relayed dictation requests.
+    pub fn relay(&self) -> &Relay {
+        &self.relay
+    }
+
+    /// The earliest time [`Hub::on_timeout`] has work (a dictation request expires).
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.relay.next_deadline()
+    }
+
+    /// Ends the dictation requests that expired by `now_us`.
+    pub fn on_timeout(&mut self, now_us: u64) -> Vec<Effect> {
+        let mut out = Vec::new();
+        self.relay.on_timeout(now_us, &mut out);
+        let mut fx = Vec::new();
+        self.relay_effects(out, &mut fx);
+        fx
+    }
+
+    fn relay_effects(&self, out: Vec<Out>, fx: &mut Vec<Effect>) {
+        use service_frame::Body as S;
+        for o in out {
+            let (id, body) = match o {
+                Out::State(c, s) => (c, S::DictationState(s)),
+                Out::Transcript(c, t) => (c, S::Transcript(t)),
+                Out::Start(p, d) => (p, S::ProviderDictationStart(d)),
+                Out::Cancel(p, link) => (
+                    p,
+                    S::ProviderDictationCancel(crate::proto::DictationCancel { request_id: link }),
+                ),
+                Out::Confirm(p, c) => (p, S::ProviderDictationConfirm(c)),
+            };
+            if self.clients.contains_key(&id) {
+                fx.push(Effect::Send(id, frame(body)));
+            }
+        }
+    }
+
+    fn broadcast_companion(&self, fx: &mut Vec<Effect>) {
+        let st = self.relay.companion_state();
+        for (&id, c) in &self.clients {
+            if c.hello && c.subscribed(Topic::Companion) {
+                fx.push(Effect::Send(
+                    id,
+                    frame(service_frame::Body::CompanionState(st.clone())),
+                ));
+            }
         }
     }
 
@@ -241,6 +313,12 @@ impl Hub {
             self.touch.owner = None;
             self.touch.open_scroll = None;
         }
+        let mut out = Vec::new();
+        let now = self.now();
+        if self.relay.client_gone(id, now, &mut out) {
+            self.broadcast_companion(&mut fx);
+        }
+        self.relay_effects(out, &mut fx);
         fx
     }
 
@@ -339,15 +417,126 @@ impl Hub {
                     "notification-reply" => !d.notification_key.is_empty(),
                     _ => false,
                 };
-                let e = if valid {
-                    error(ErrorCode::NoCompanion, "no companion link", seq)
-                } else {
-                    error(ErrorCode::InvalidArgument, "invalid dictation request", seq)
-                };
-                fx.push(Effect::Send(id, e));
+                if !valid {
+                    fx.push(Effect::Send(
+                        id,
+                        error(ErrorCode::InvalidArgument, "invalid dictation request", seq),
+                    ));
+                    return fx;
+                }
+                let mut out = Vec::new();
+                let now = self.now();
+                match self.relay.start(id, d, now, &mut out) {
+                    Ok(()) => {}
+                    Err(Refusal::NoCompanion) => fx.push(Effect::Send(
+                        id,
+                        error(ErrorCode::NoCompanion, "no companion link", seq),
+                    )),
+                    Err(Refusal::Unsupported) => fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::Unsupported,
+                            "the phone does not offer free dictation",
+                            seq,
+                        ),
+                    )),
+                }
+                self.relay_effects(out, &mut fx);
             }
-            // Nothing to cancel or confirm without a companion link.
-            Some(B::DictationCancel(_)) | Some(B::DictationConfirm(_)) => {}
+            // Unknown requests (none started, or already ended) are ignored.
+            Some(B::DictationCancel(c)) => {
+                let mut out = Vec::new();
+                self.relay.cancel(id, c.request_id, &mut out);
+                self.relay_effects(out, &mut fx);
+            }
+            Some(B::DictationConfirm(c)) => {
+                let mut out = Vec::new();
+                if !self.relay.confirm(id, c, &mut out) {
+                    fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::InvalidArgument,
+                            "the request is not a reply waiting for confirmation",
+                            seq,
+                        ),
+                    ));
+                }
+                self.relay_effects(out, &mut fx);
+            }
+            Some(B::CompanionRegister(_)) => {
+                let now = self.now();
+                let was = self.relay.provider();
+                if !self.relay.register(id, now) {
+                    fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::Unavailable,
+                            "another companion link provider is registered",
+                            seq,
+                        ),
+                    ));
+                } else if was.is_none() {
+                    self.broadcast_companion(&mut fx);
+                }
+            }
+            Some(B::CompanionStatus(st)) => {
+                if self.relay.provider() != Some(id) {
+                    fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::InvalidArgument,
+                            "not the companion link provider",
+                            seq,
+                        ),
+                    ));
+                    return fx;
+                }
+                let mut out = Vec::new();
+                let now = self.now();
+                let changed = self.relay.status(
+                    st.phone_connected,
+                    st.phone_capabilities,
+                    st.phone_name,
+                    now,
+                    &mut out,
+                );
+                self.relay_effects(out, &mut fx);
+                if changed {
+                    self.broadcast_companion(&mut fx);
+                }
+            }
+            Some(B::ProviderDictationState(s)) => {
+                if self.relay.provider() == Some(id) {
+                    let mut out = Vec::new();
+                    self.relay.provider_state(s, &mut out);
+                    self.relay_effects(out, &mut fx);
+                } else {
+                    fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::InvalidArgument,
+                            "not the companion link provider",
+                            seq,
+                        ),
+                    ));
+                }
+            }
+            Some(B::ProviderTranscript(t)) => {
+                if self.relay.provider() == Some(id) {
+                    let mut out = Vec::new();
+                    self.relay.provider_transcript(t, &mut out);
+                    self.relay_effects(out, &mut fx);
+                } else {
+                    fx.push(Effect::Send(
+                        id,
+                        error(
+                            ErrorCode::InvalidArgument,
+                            "not the companion link provider",
+                            seq,
+                        ),
+                    ));
+                }
+            }
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {
@@ -406,6 +595,10 @@ impl Hub {
                         ..*s
                     })
                 }),
+                Topic::Companion => Some(service_frame::Body::CompanionState(CompanionState {
+                    snapshot: true,
+                    ..self.relay.companion_state()
+                })),
                 _ => None,
             };
             if let Some(b) = body {

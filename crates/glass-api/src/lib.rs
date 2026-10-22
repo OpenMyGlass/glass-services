@@ -5,10 +5,12 @@
 //! - [`codec`]: varint32-length framing with the 64 KiB limit;
 //! - [`Client`]: a blocking client;
 //! - [`Hub`]: the session and routing rules as a pure state machine (used by glassd and the mock);
+//! - [`companion`]: the companion link provider and the dictation relay, used by the hub;
 //! - [`MockService`]: an in-process mock server for tests of clients.
 
 pub mod client;
 pub mod codec;
+pub mod companion;
 pub mod hub;
 pub mod mock;
 

@@ -858,3 +858,262 @@ fn look_up_from_a_fake_imu() {
     assert_eq!(screen(&f), Some((Screen::On, "look-up".into())));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn companion(f: &ServiceFrame) -> Option<glass_api::proto::CompanionState> {
+    match &f.body {
+        Some(Body::CompanionState(c)) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+fn dictation(f: &ServiceFrame) -> Option<(u32, glass_api::proto::dictation_state::State, String)> {
+    match &f.body {
+        Some(Body::DictationState(d)) => Some((
+            d.request_id,
+            glass_api::proto::dictation_state::State::try_from(d.state).unwrap(),
+            d.error.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn free_start(rid: u32) -> Body2 {
+    Body2::DictationStart(glass_api::proto::DictationStart {
+        request_id: rid,
+        purpose: "free".into(),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn mock_companion_relays_a_free_dictation() {
+    use glass_api::proto::dictation_state::State as St;
+    let mut m = Mock::start("companion");
+    let mut c = m.client(&[Topic::Companion]);
+    assert!(c.has_capability("dictation") && c.has_capability("companion"));
+    // No provider yet: refused.
+    c.send(free_start(1)).unwrap();
+    let e = c
+        .recv_until(T, |f| matches!(f.body, Some(Body::Error(_))))
+        .unwrap()
+        .unwrap();
+    match e.body {
+        Some(Body::Error(e)) => {
+            assert_eq!(e.code, glass_api::proto::ErrorCode::NoCompanion as i32)
+        }
+        _ => unreachable!(),
+    }
+    m.send("companion on");
+    let st = c
+        .recv_until(T, |f| companion(f).is_some_and(|s| s.phone_connected))
+        .unwrap()
+        .and_then(|f| companion(&f))
+        .expect("companion state");
+    assert!(st.provider);
+    assert_eq!(st.phone_name, "Mock phone");
+    assert_eq!(st.phone_capabilities, vec!["dictation-free".to_string()]);
+    c.send(free_start(7)).unwrap();
+    let f = c
+        .recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dictation(&f), Some((7, St::Listening, String::new())));
+    m.send("transcript buy");
+    m.send("transcript-final buy milk");
+    let f = c
+        .recv_until(
+            T,
+            |f| matches!(&f.body, Some(Body::Transcript(t)) if t.r#final),
+        )
+        .unwrap()
+        .unwrap();
+    match f.body {
+        Some(Body::Transcript(t)) => {
+            assert_eq!((t.request_id, t.text.as_str()), (7, "buy milk"))
+        }
+        _ => unreachable!(),
+    }
+    let f = c
+        .recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dictation(&f), Some((7, St::Done, String::new())));
+    // An error, then the phone goes away mid-request.
+    c.send(free_start(8)).unwrap();
+    c.recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    m.send("dictation-error no-speech");
+    let f = c
+        .recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dictation(&f), Some((8, St::Failed, "no-speech".into())));
+    c.send(free_start(9)).unwrap();
+    c.recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    m.send("companion off");
+    let f = c
+        .recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dictation(&f), Some((9, St::Failed, "link-lost".into())));
+    m.send("companion gone");
+    c.recv_until(T, |f| companion(f).is_some_and(|s| !s.provider))
+        .unwrap()
+        .expect("provider gone");
+}
+
+#[test]
+fn a_provider_client_relays_over_the_socket() {
+    use glass_api::proto::{
+        CompanionRegister, CompanionStatus, DictationState, Transcript,
+        dictation_state::State as St,
+    };
+    let m = Mock::start("provider");
+    let mut provider = m.client(&[]);
+    provider
+        .send(Body2::CompanionRegister(CompanionRegister {
+            name: "it-provider".into(),
+        }))
+        .unwrap();
+    provider
+        .send(Body2::CompanionStatus(CompanionStatus {
+            phone_connected: true,
+            phone_capabilities: vec!["dictation-free".into()],
+            phone_name: "Phone".into(),
+        }))
+        .unwrap();
+    let mut app = m.client(&[]);
+    // The snapshot on Subscribe tells the state.
+    app.subscribe(&[Topic::Companion]).unwrap();
+    app.recv_until(T, |f| {
+        companion(f).is_some_and(|s| s.snapshot && s.phone_connected)
+    })
+    .unwrap()
+    .expect("phone connected");
+    app.send(free_start(3)).unwrap();
+    let f = provider
+        .recv_until(T, |f| {
+            matches!(f.body, Some(Body::ProviderDictationStart(_)))
+        })
+        .unwrap()
+        .unwrap();
+    let link = match f.body {
+        Some(Body::ProviderDictationStart(d)) => d.request_id,
+        _ => unreachable!(),
+    };
+    provider
+        .send(Body2::ProviderDictationState(DictationState {
+            request_id: link,
+            state: St::Listening as i32,
+            error: String::new(),
+        }))
+        .unwrap();
+    provider
+        .send(Body2::ProviderTranscript(Transcript {
+            request_id: link,
+            text: "hello".into(),
+            r#final: true,
+        }))
+        .unwrap();
+    let f = app
+        .recv_until(T, |f| dictation(f).is_some())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dictation(&f), Some((3, St::Listening, String::new())));
+    let f = app
+        .recv_until(T, |f| dictation(f).is_some_and(|d| d.1 == St::Done))
+        .unwrap();
+    assert!(f.is_some());
+    // The mock's own provider cannot register while a real one is.
+    drop(provider);
+    app.recv_until(T, |f| companion(f).is_some_and(|s| !s.provider))
+        .unwrap()
+        .expect("provider gone");
+}
+
+#[test]
+fn peer_check_refuses_unknown_uids() {
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if glassd::peers::ALWAYS.contains(&uid) {
+        eprintln!("skipped: the tests run as uid {uid}, which is always allowed");
+        return;
+    }
+    let dir = test_dir("peers");
+    {
+        let m = Mock::start_in(&dir, &["--peer-check", "on", "--allow-uid", "4242"]);
+        let r = Client::connect_with_timeout(&m.socket, "it", HANDSHAKE);
+        assert!(r.is_err(), "connection should be refused");
+    }
+    let own = uid.to_string();
+    let m = Mock::start_in(&dir, &["--allow-uid", own.as_str()]);
+    m.client(&[]);
+}
+
+#[test]
+fn listens_on_a_socket_passed_by_init() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let dir = test_dir("init-socket");
+    // As Android's init does: a socket that is bound but not listening.
+    let path = dir.join("glassd");
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as _;
+    }
+    // SAFETY: a valid sockaddr_un of the given size.
+    let r = unsafe {
+        libc::bind(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(r, 0, "bind: {}", std::io::Error::last_os_error());
+    // SAFETY: we own fd.
+    let listener = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let _ = listener.as_raw_fd();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_glassd"));
+    cmd.args(["--mock", "--socket"])
+        .arg(&path)
+        .env("ANDROID_SOCKET_glassd", fd.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // SAFETY: only fcntl on a descriptor of this process, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            Ok(())
+        });
+    }
+    let child = spawn(&mut cmd);
+    drop(listener);
+    // Until glassd calls listen(), connecting is refused.
+    let deadline = Instant::now() + HANDSHAKE;
+    let mut c = loop {
+        match Client::connect_with_timeout(&path, "it", HANDSHAKE) {
+            Ok(c) => break c,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
+    assert!(c.has_capability("mock"));
+    c.subscribe(&[Topic::Screen]).unwrap();
+    drop(c);
+    drop(child);
+    // glassd did not own the file, so it left it in place.
+    assert!(path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

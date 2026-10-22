@@ -36,6 +36,8 @@ pub const MOCK_CAPABILITIES: &[&str] = &[
     "head",
     "wear",
     "wink",
+    "dictation",
+    "companion",
 ];
 
 struct State {
@@ -338,6 +340,29 @@ mod tests {
                 velocity: 0.0,
                 timestamp_us: 1,
             })),
+        }
+    }
+
+    #[test]
+    fn try_recv_never_waits() {
+        let m = MockService::start().unwrap();
+        let mut c = Client::connect(m.path()).unwrap();
+        c.subscribe(&[crate::proto::Topic::Gesture]).unwrap();
+        c.acquire_focus().unwrap();
+        // Drain the session frames, then nothing is there and try_recv returns at once.
+        while c.recv(Some(Duration::from_millis(200))).unwrap().is_some() {}
+        let t = std::time::Instant::now();
+        assert!(c.try_recv().unwrap().is_none());
+        assert!(t.elapsed() < Duration::from_millis(5));
+        m.publish(tap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(f) = c.try_recv().unwrap() {
+                assert!(matches!(f.body, Some(service_frame::Body::Gesture(_))));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no frame");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

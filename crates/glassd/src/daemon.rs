@@ -4,7 +4,8 @@
 
 use crate::buttons::{ButtonTracker, LONG_PRESS_MS};
 use crate::display::{Display, TouchpadSleep};
-use crate::mockcmd::{self, Command};
+use crate::mockcmd::{self, Command, CompanionCommand};
+use crate::peers::PeerPolicy;
 use crate::queue::OutQueue;
 use crate::screen::{Change, Now, ScreenPolicy};
 use crate::settings_store::SettingsStore;
@@ -12,8 +13,10 @@ use crate::touch::{ScreenOffInput, Step, TouchGate};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
-    Button, ButtonAction, ButtonId, ClientFrame, HeadGesture, HeadGestureKind, ScreenState,
-    ServiceFrame, Settings, Wear, WearSource, Wink, service_frame,
+    Button, ButtonAction, ButtonId, ClientFrame, CompanionRegister, CompanionStatus,
+    DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, ScreenState, ServiceError,
+    ServiceFrame, Settings, Transcript, Wear, WearSource, Wink, client_frame, dictation_state,
+    service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -23,7 +26,7 @@ use glass_head::{Context as HeadContext, HeadService, Imu, Sample};
 use glass_hub::{GlassHub, Thresholds, Update, WearMachine};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -72,6 +75,11 @@ pub struct Options {
     pub iio: Option<PathBuf>,
     /// The IMU's character device (default `/dev/iio:deviceN`).
     pub iio_dev: Option<PathBuf>,
+    /// Which peers may connect (docs/api.md, "Who may connect").
+    pub peers: PeerPolicy,
+    /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
+    /// touches into navigation keys (docs/api.md, "Android glue").
+    pub grab_touchpad: bool,
 }
 
 /// Where an input device comes from.
@@ -109,6 +117,14 @@ struct Conn {
     closing: bool,
 }
 
+/// The simulated companion link provider of `--mock` (docs/api.md, "Mock"): a hub client
+/// without a connection, whose frames the daemon answers itself.
+struct MockCompanion {
+    id: ClientId,
+    /// Open requests, oldest first: (link id, is a reply).
+    links: Vec<(u32, bool)>,
+}
+
 struct MockInput {
     buf: Vec<u8>,
     commands: VecDeque<Command>,
@@ -120,6 +136,11 @@ pub struct Daemon {
     hub: Hub,
     listener: UnixListener,
     socket_path: PathBuf,
+    /// Whether glassd bound the socket itself (and removes it on exit); false for a socket
+    /// passed by Android's init.
+    owns_socket: bool,
+    peers: PeerPolicy,
+    mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
     rec: Recognizer,
@@ -172,6 +193,38 @@ struct HubWritten {
     detection: Option<bool>,
     wink: Option<bool>,
     pause: Option<bool>,
+}
+
+/// The environment variable through which Android's init passes a socket named `name`.
+pub fn init_socket_env(name: &str) -> String {
+    format!("ANDROID_SOCKET_{name}")
+}
+
+/// The listening socket: the one Android's init created for the socket's file name
+/// (`ANDROID_SOCKET_<name>`, a file descriptor number), else [`bind_socket`]. Returns it and
+/// whether glassd owns the file.
+pub fn listen(path: &Path) -> io::Result<(UnixListener, bool)> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if let Ok(v) = std::env::var(init_socket_env(name)) {
+        let fd: RawFd = v.trim().parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}={v:?} is not a file descriptor", init_socket_env(name)),
+            )
+        })?;
+        // init only binds the socket; the daemon listens (as vold and installd do). On a
+        // socket that already listens this only changes the backlog.
+        // SAFETY: listen on a descriptor number; an invalid one only returns an error.
+        if unsafe { libc::listen(fd, 16) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: init passes the descriptor of a Unix stream socket and nothing else in
+        // this process uses it.
+        let l = unsafe { UnixListener::from_raw_fd(fd) };
+        l.set_nonblocking(true)?;
+        return Ok((l, false));
+    }
+    Ok((bind_socket(path)?, true))
 }
 
 /// Binds the socket: removes a stale socket file, refuses to start if another daemon answers,
@@ -322,6 +375,11 @@ fn open_touchpad(opts: &Options) -> Option<(Device, Config)> {
     if let Err(e) = dev.set_clock_monotonic() {
         warn!("EVIOCSCLOCKID failed ({e}); stamping events when read");
     }
+    if opts.grab_touchpad
+        && let Err(e) = dev.grab(true)
+    {
+        warn!("EVIOCGRAB failed ({e}); other readers also get the touchpad");
+    }
     let axis = |code, fallback: AxisRange| match dev.abs_info(code) {
         Ok(a) if a.maximum > a.minimum => AxisRange::new(a.minimum, a.maximum),
         _ => fallback,
@@ -346,7 +404,7 @@ fn open_touchpad(opts: &Options) -> Option<(Device, Config)> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_cred(fd: RawFd) -> String {
+fn peer_ucred(fd: RawFd) -> Option<(u32, i32)> {
     let mut c = libc::ucred {
         pid: 0,
         uid: 0,
@@ -363,21 +421,21 @@ fn peer_cred(fd: RawFd) -> String {
             &mut len,
         )
     };
-    if r == 0 {
-        format!("uid {} pid {}", c.uid, c.pid)
-    } else {
-        "unknown peer".into()
-    }
+    (r == 0).then_some((c.uid, c.pid))
 }
 
+/// macOS and the BSDs (host development): the uid only.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn peer_cred(_fd: RawFd) -> String {
-    "peer".into()
+fn peer_ucred(fd: RawFd) -> Option<(u32, i32)> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: valid out-pointers for getpeereid.
+    let r = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    (r == 0).then_some((uid, -1))
 }
 
 impl Daemon {
     pub fn new(opts: &Options, display: Box<dyn Display>) -> io::Result<Daemon> {
-        let listener = bind_socket(&opts.socket)?;
+        let (listener, owns_socket) = listen(&opts.socket)?;
         let t = now();
         let (device, mut cfg) = if opts.mock {
             (None, Config::default())
@@ -425,6 +483,8 @@ impl Daemon {
                 "head",
                 "wear",
                 "wink",
+                "dictation",
+                "companion",
             ]
         } else {
             let mut c = Vec::new();
@@ -444,6 +504,7 @@ impl Daemon {
             if power_dev.is_some() {
                 c.push("button-power");
             }
+            c.extend(["dictation", "companion"]);
             c
         };
         let mut hub = Hub::new(env!("CARGO_PKG_VERSION"), &caps);
@@ -466,6 +527,9 @@ impl Daemon {
             hub,
             listener,
             socket_path: opts.socket.clone(),
+            owns_socket,
+            peers: opts.peers.clone(),
+            mock_companion: None,
             conns: BTreeMap::new(),
             device,
             rec: Recognizer::new(cfg),
@@ -513,6 +577,7 @@ impl Daemon {
             self.wear.next_deadline(),
             self.camera.next_deadline(),
             self.power.next_deadline(),
+            self.hub.next_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -641,6 +706,10 @@ impl Daemon {
                 self.button_frames(id, vec![b]);
             }
         }
+        if self.hub.next_deadline().is_some_and(|d| t.mono_us >= d) {
+            let fx = self.hub.on_timeout(t.mono_us);
+            self.effects(fx);
+        }
         if let Some(m) = &mut self.mock
             && m.resume_at.is_some_and(|r| t.mono_us >= r)
         {
@@ -652,12 +721,22 @@ impl Daemon {
     fn accept(&mut self) {
         loop {
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let cred = peer_ucred(stream.as_raw_fd());
+                    let who = cred.map_or("unknown peer".to_string(), |(uid, pid)| {
+                        format!("uid {uid} pid {pid}")
+                    });
+                    if self.peers.enabled() && !cred.is_some_and(|(uid, _)| self.peers.allows(uid))
+                    {
+                        warn!("refused a connection from {who}: not allowed on the socket");
+                        deny(&mut stream);
+                        continue;
+                    }
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
                     let id = self.hub.add_client();
-                    info!("client {id} connected ({})", peer_cred(stream.as_raw_fd()));
+                    info!("client {id} connected ({who})");
                     self.conns.insert(
                         id,
                         Conn {
@@ -767,6 +846,9 @@ impl Daemon {
         let t = now();
         for e in fx {
             match e {
+                Effect::Send(id, f) if self.mock_companion.as_ref().is_some_and(|m| m.id == id) => {
+                    self.mock_companion_frame(f)
+                }
                 Effect::Send(id, f) => {
                     if let Some(c) = self.conns.get_mut(&id) {
                         c.queue.push(&f, t.mono_us);
@@ -981,7 +1063,172 @@ impl Daemon {
                     m.resume_at = Some(t.mono_us + ms * 1000);
                 }
             }
+            Command::Companion(c) => self.mock_companion_command(c),
         }
+    }
+
+    /// A frame from the simulated provider to the hub.
+    fn mock_companion_says(&mut self, body: client_frame::Body) -> Vec<Effect> {
+        let Some(m) = &self.mock_companion else {
+            return Vec::new();
+        };
+        let id = m.id;
+        let fx = self.hub.on_frame(
+            id,
+            ClientFrame {
+                seq: 0,
+                body: Some(body),
+            },
+        );
+        for e in &fx {
+            if let Effect::Send(to, f) = e
+                && *to == id
+                && let Some(service_frame::Body::Error(err)) = &f.body
+            {
+                warn!("mock companion: {}", err.message);
+            }
+        }
+        fx
+    }
+
+    fn mock_companion_command(&mut self, c: CompanionCommand) {
+        use dictation_state::State as St;
+        let newest = self
+            .mock_companion
+            .as_ref()
+            .and_then(|m| m.links.last().copied());
+        let state = |link: u32, st: St, error: &str| {
+            client_frame::Body::ProviderDictationState(DictationState {
+                request_id: link,
+                state: st as i32,
+                error: error.into(),
+            })
+        };
+        let fx = match c {
+            CompanionCommand::On { capabilities } => {
+                if self.mock_companion.is_none() {
+                    let id = self.hub.add_client();
+                    self.mock_companion = Some(MockCompanion {
+                        id,
+                        links: Vec::new(),
+                    });
+                    let mut fx = self.mock_companion_says(client_frame::Body::Hello(Hello {
+                        api_version: glass_api::API_VERSION,
+                        client_name: "mock-companion".into(),
+                    }));
+                    fx.extend(
+                        self.mock_companion_says(client_frame::Body::CompanionRegister(
+                            CompanionRegister {
+                                name: "mock-companion".into(),
+                            },
+                        )),
+                    );
+                    if self.hub.relay().provider() != Some(id) {
+                        warn!("mock companion: a real provider is registered");
+                        self.mock_companion = None;
+                        fx.extend(self.hub.remove_client(id));
+                        self.effects(fx);
+                        return;
+                    }
+                    self.effects(fx);
+                }
+                self.mock_companion_says(client_frame::Body::CompanionStatus(CompanionStatus {
+                    phone_connected: true,
+                    phone_capabilities: capabilities,
+                    phone_name: "Mock phone".into(),
+                }))
+            }
+            CompanionCommand::Off => {
+                if let Some(m) = &mut self.mock_companion {
+                    m.links.clear();
+                }
+                self.mock_companion_says(client_frame::Body::CompanionStatus(CompanionStatus {
+                    phone_connected: false,
+                    ..Default::default()
+                }))
+            }
+            CompanionCommand::Gone => match self.mock_companion.take() {
+                Some(m) => self.hub.remove_client(m.id),
+                None => Vec::new(),
+            },
+            CompanionCommand::Transcript { text, last } => match newest {
+                Some((link, reply)) => {
+                    if last
+                        && !reply
+                        && let Some(m) = &mut self.mock_companion
+                    {
+                        m.links.retain(|l| l.0 != link);
+                    }
+                    self.mock_companion_says(client_frame::Body::ProviderTranscript(Transcript {
+                        request_id: link,
+                        text,
+                        r#final: last,
+                    }))
+                }
+                None => {
+                    warn!("mock companion: no open dictation request");
+                    Vec::new()
+                }
+            },
+            CompanionCommand::Error { error } => match newest {
+                Some((link, _)) => {
+                    if let Some(m) = &mut self.mock_companion {
+                        m.links.retain(|l| l.0 != link);
+                    }
+                    self.mock_companion_says(state(link, St::Failed, &error))
+                }
+                None => {
+                    warn!("mock companion: no open dictation request");
+                    Vec::new()
+                }
+            },
+            CompanionCommand::ReplyResult { ok } => match newest {
+                Some((link, true)) => {
+                    if let Some(m) = &mut self.mock_companion {
+                        m.links.retain(|l| l.0 != link);
+                    }
+                    let st = if ok { St::Sent } else { St::Failed };
+                    self.mock_companion_says(state(link, st, if ok { "" } else { "send-failed" }))
+                }
+                _ => {
+                    warn!("mock companion: no open reply");
+                    Vec::new()
+                }
+            },
+        };
+        self.effects(fx);
+    }
+
+    /// A frame glassd sent to the simulated provider.
+    fn mock_companion_frame(&mut self, f: ServiceFrame) {
+        let Some(m) = &mut self.mock_companion else {
+            return;
+        };
+        let fx = match f.body {
+            Some(service_frame::Body::ProviderDictationStart(d)) => {
+                info!("mock companion: dictation {} ({})", d.request_id, d.purpose);
+                m.links.push((d.request_id, d.purpose != "free"));
+                self.mock_companion_says(client_frame::Body::ProviderDictationState(
+                    DictationState {
+                        request_id: d.request_id,
+                        state: dictation_state::State::Listening as i32,
+                        error: String::new(),
+                    },
+                ))
+            }
+            Some(service_frame::Body::ProviderDictationCancel(c)) => {
+                m.links.retain(|l| l.0 != c.request_id);
+                Vec::new()
+            }
+            Some(service_frame::Body::ProviderDictationConfirm(c)) => {
+                if !c.send {
+                    m.links.retain(|l| l.0 != c.request_id);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        self.effects(fx);
     }
 
     /// A press of a button from the mock: down, then (long) the hold time, then up.
@@ -1254,9 +1501,27 @@ impl Daemon {
     }
 }
 
+/// Tells a refused peer why, then drops the connection.
+fn deny(stream: &mut UnixStream) {
+    use std::io::Write;
+    let f = ServiceFrame {
+        body: Some(service_frame::Body::Error(ServiceError {
+            code: ErrorCode::Denied as i32,
+            message: "not allowed on this socket".into(),
+            seq: 0,
+        })),
+    };
+    if let Ok(bytes) = glass_api::frame_bytes(&f) {
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+        let _ = stream.write_all(&bytes);
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        if self.owns_socket {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -1297,6 +1562,8 @@ mod tests {
             state_dir: None,
             iio: None,
             iio_dev: None,
+            peers: PeerPolicy::open(),
+            grab_touchpad: false,
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

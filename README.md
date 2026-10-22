@@ -7,6 +7,7 @@ Clean-room Glass system services for Google Glass Explorer Edition: touchpad ges
 | [`docs/api.md`](docs/api.md) | The interface between `glassd` and clients (launcher, apps, Android glue) |
 | [`proto/glass/services/v1/services.proto`](proto/glass/services/v1/services.proto) | Its messages |
 | [`docs/plans/`](docs/plans/) | Plans and decisions |
+| [`android/`](android/) | The Android glue and the prebuilt directory the device tree includes ([`android/README.md`](android/README.md)) |
 | `docs/specs/` | Facts: kernel interfaces (from the GPL kernel source) and clean-room specs of the stock components (added by their own PRs) |
 
 ## Crates
@@ -35,6 +36,8 @@ camera and power buttons (found by name, or `--camera-device` / `--power-device`
 fb[:path]`; on Android the framework does, and the default is `--display log`). Settings are
 stored in `--state-dir` (default `$GLASSD_STATE_DIR`, else
 `/data/glassd` on Android, `/var/lib/glassd` elsewhere). `glassd --help` lists every option.
+
+Android (4.4 and 6.0): `tools/android-dist.sh DIR` builds `glassd` with NDK r25c for API 19 and the glue APK into the directory the device tree includes; see [`android/README.md`](android/README.md).
 
 Cross builds (as in CI): `cargo build --release --target armv7-linux-androideabi` with the NDK's
 `armv7a-linux-androideabi22-clang` as linker, and `cargo zigbuild --release --target

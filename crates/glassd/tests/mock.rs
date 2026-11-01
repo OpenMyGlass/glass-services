@@ -985,6 +985,7 @@ fn a_provider_client_relays_over_the_socket() {
             phone_connected: true,
             phone_capabilities: vec!["dictation-free".into()],
             phone_name: "Phone".into(),
+            ..Default::default()
         }))
         .unwrap();
     let mut app = m.client(&[]);
@@ -1117,5 +1118,221 @@ fn listens_on_a_socket_passed_by_init() {
     drop(child);
     // glassd did not own the file, so it left it in place.
     assert!(path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-mock daemon holding the companion link itself: a TCP companion pairs and
+/// authenticates over a real socket, the launcher sees the link through the `companion`
+/// capability (paired + connected + transport), and a posted notification reaches the
+/// timeline. The companion side here drives glassd's own wire/identity primitives, exercising
+/// the daemon's listener, the Glass-role handshake, and the launcher surfacing end to end.
+#[test]
+fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
+    use glass_api::proto::CompanionState;
+    use glassd::companion::identity::{Identity, decode_nonce, random_nonce_b64, verify_challenge};
+    use glassd::companion::wire::{FrameDecoder, frame_bytes};
+    use omg_protocol::{
+        AuthChallenge, AuthResponse, AuthResult, Frame, Hello, Notification, NotificationPosted,
+        PROTOCOL_VERSION, PairRequest, PairResult, Role, capability,
+    };
+    use std::io::Read as _;
+    use std::net::TcpStream;
+
+    const PORT: u16 = 47713;
+
+    struct TcpCompanion {
+        stream: TcpStream,
+        dec: FrameDecoder,
+        id: Identity,
+        glass_pub: Option<String>,
+        our_nonce: Vec<u8>,
+        answered: bool,
+        got_resp: bool,
+        verify_ok: bool,
+        sent_result: bool,
+        peer_result: Option<bool>,
+    }
+
+    impl TcpCompanion {
+        fn send(&mut self, f: &Frame) {
+            self.stream.write_all(&frame_bytes(f).unwrap()).unwrap();
+        }
+        fn recv(&mut self) -> Frame {
+            let mut buf = [0u8; 4096];
+            let deadline = Instant::now() + T;
+            loop {
+                if let Some(f) = self.dec.next_frame().unwrap() {
+                    return f;
+                }
+                assert!(Instant::now() < deadline, "no frame from glassd");
+                let n = self.stream.read(&mut buf).expect("read");
+                assert!(n > 0, "glassd closed the companion link");
+                self.dec.push(&buf[..n]);
+            }
+        }
+        fn maybe_finish(&mut self) {
+            if self.answered && self.got_resp && !self.sent_result {
+                self.sent_result = true;
+                let ok = self.verify_ok;
+                self.send(&Frame::AuthResult(AuthResult {
+                    ok,
+                    message: String::new(),
+                }));
+            }
+        }
+        fn authenticated(&self) -> bool {
+            self.sent_result && self.verify_ok && self.peer_result == Some(true)
+        }
+    }
+
+    let dir = test_dir("companion-tcp");
+    let socket = dir.join("glassd.sock");
+    let _child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(NO_HARDWARE)
+            .arg("--companion")
+            .arg("on")
+            .arg("--companion-tcp-port")
+            .arg(PORT.to_string())
+            .arg("--power-supply")
+            .arg(dir.join("no-battery"))
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    let deadline = Instant::now() + T;
+    while !socket.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The launcher sees the new capability and, before pairing, an unpaired snapshot.
+    let mut launcher = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
+    assert!(launcher.has_capability("companion-link"));
+    launcher.subscribe(&[Topic::Companion]).unwrap();
+    launcher.send(Body2::GetState(Default::default())).unwrap();
+    let f = launcher
+        .recv_until(T, |f| matches!(f.body, Some(Body::CompanionState(_))))
+        .unwrap()
+        .unwrap();
+    let state = |f: &ServiceFrame| match &f.body {
+        Some(Body::CompanionState(c)) => Some(c.clone()),
+        _ => None,
+    };
+    let snap: CompanionState = state(&f).unwrap();
+    assert!(snap.snapshot && !snap.paired && !snap.phone_connected);
+
+    // Connect a TCP companion and run the Glass-role handshake from the companion side.
+    let stream = {
+        let deadline = Instant::now() + T;
+        loop {
+            match TcpStream::connect(("127.0.0.1", PORT)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("connect companion port: {e}"),
+            }
+        }
+    };
+    stream.set_read_timeout(Some(T)).unwrap();
+    let mut c = TcpCompanion {
+        stream,
+        dec: FrameDecoder::new(),
+        id: Identity::generate(),
+        glass_pub: None,
+        our_nonce: Vec::new(),
+        answered: false,
+        got_resp: false,
+        verify_ok: false,
+        sent_result: false,
+        peer_result: None,
+    };
+    c.send(&Frame::Hello(Hello {
+        protocol_version: PROTOCOL_VERSION,
+        role: Role::Companion,
+        app_version: "it/0.1".into(),
+        device_name: "it-phone".into(),
+        identity_pub: c.id.public_b64(),
+        capabilities: capability::BACKBONE.iter().map(|s| s.to_string()).collect(),
+    }));
+    while !c.authenticated() {
+        match c.recv() {
+            Frame::Hello(h) => {
+                assert_eq!(h.role, Role::Glass);
+                c.glass_pub = Some(h.identity_pub);
+                c.send(&Frame::PairRequest(PairRequest {
+                    companion_name: "it-phone".into(),
+                    companion_pub: c.id.public_b64(),
+                    nonce: random_nonce_b64(16),
+                    bootstrap_token: None,
+                }));
+            }
+            Frame::PairAccept(_) => {
+                c.send(&Frame::PairResult(PairResult {
+                    ok: true,
+                    message: "ok".into(),
+                }));
+                let nb = random_nonce_b64(32);
+                c.our_nonce = decode_nonce(&nb).unwrap();
+                c.send(&Frame::AuthChallenge(AuthChallenge { nonce: nb }));
+            }
+            Frame::AuthChallenge(ch) => {
+                let nonce = decode_nonce(&ch.nonce).unwrap();
+                let sig = c.id.sign_challenge(&nonce);
+                c.send(&Frame::AuthResponse(AuthResponse { signature: sig }));
+                c.answered = true;
+                c.maybe_finish();
+            }
+            Frame::AuthResponse(resp) => {
+                let gp = c.glass_pub.clone().unwrap();
+                c.verify_ok = verify_challenge(&gp, &c.our_nonce, &resp.signature);
+                c.got_resp = true;
+                c.maybe_finish();
+            }
+            Frame::AuthResult(r) => c.peer_result = Some(r.ok),
+            _ => {}
+        }
+    }
+
+    // The launcher now sees the link: paired, connected, over the TCP transport.
+    let f = launcher
+        .recv_until(T, |f| {
+            state(f).is_some_and(|c| c.phone_connected && c.paired)
+        })
+        .unwrap()
+        .and_then(|f| state(&f))
+        .expect("companion connected");
+    assert_eq!(f.phone_name, "it-phone");
+    assert_eq!(f.transport, "wifi-tcp");
+
+    // A posted notification reaches the launcher timeline.
+    c.send(&Frame::NotificationPosted(NotificationPosted {
+        notification: Notification {
+            key: "n1".into(),
+            app_name: "Signal".into(),
+            title: "Giorgio".into(),
+            text: "ciao".into(),
+            posted_at_ms: 1,
+            icon_sha256: None,
+            actions: Vec::new(),
+            wake: true,
+        },
+    }));
+    let got = launcher
+        .recv_until(
+            T,
+            |f| matches!(&f.body, Some(Body::CompanionNotification(n)) if n.key == "n1"),
+        )
+        .unwrap();
+    assert!(got.is_some(), "notification reached the timeline");
+
+    // The bond persisted.
+    assert!(dir.join("state/companion.json").exists());
+    drop(launcher);
     let _ = std::fs::remove_dir_all(&dir);
 }

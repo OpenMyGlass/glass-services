@@ -41,6 +41,14 @@ pub enum Effect {
         client: ClientId,
         request: HeadRequest,
     },
+    /// The owner acted on a companion notification card: invoke `action_index`, or dismiss it
+    /// when `action_index` is `None`. The owner of the hub relays it to the companion link.
+    CompanionNotificationAction {
+        /// Notification key.
+        key: String,
+        /// Action to invoke, or `None` to dismiss.
+        action_index: Option<u32>,
+    },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -176,7 +184,9 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::DictationState(_) | B::Transcript(_) => Topic::Dictation,
         B::Button(_) => Topic::Button,
         B::Location(_) | B::LocationStatus(_) => Topic::Location,
-        B::CompanionState(_) => Topic::Companion,
+        B::CompanionState(_) | B::CompanionNotification(_) | B::CompanionNotificationRemoved(_) => {
+            Topic::Companion
+        }
         B::Welcome(_)
         | B::Error(_)
         | B::FocusState(_)
@@ -513,6 +523,8 @@ impl Hub {
                     st.phone_connected,
                     st.phone_capabilities,
                     st.phone_name,
+                    st.paired,
+                    st.transport,
                     now,
                     &mut out,
                 );
@@ -552,6 +564,14 @@ impl Hub {
                         ),
                     ));
                 }
+            }
+            // The owner acted on a notification card; the owner of the hub relays it to the
+            // companion link. A dismiss (`dismiss`) or an action index.
+            Some(B::CompanionNotificationAction(a)) => {
+                fx.push(Effect::CompanionNotificationAction {
+                    key: a.key,
+                    action_index: (!a.dismiss).then_some(a.action_index),
+                });
             }
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {

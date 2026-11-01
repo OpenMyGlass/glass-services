@@ -14,3 +14,19 @@ glass-gesture.workspace = true
 glass-head.workspace = true
 glass-hub.workspace = true
 libc.workspace = true
+omg-protocol.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Real Bluetooth RFCOMM server via the Linux BlueZ socket API. Off by default so builds for
+# images without a guaranteed BlueZ stack stay lean; TCP always works. See
+# crates/glassd/src/companion/transport.rs.
+linux-bt = []
+
+[dev-dependencies]
+# For the companion-link integration test, to craft wire frames the way a real companion does.
+omg-protocol.workspace = true

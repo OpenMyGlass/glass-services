@@ -61,6 +61,10 @@ pub struct Relay {
     phone_connected: bool,
     phone_capabilities: Vec<String>,
     phone_name: String,
+    /// A companion is bonded (persisted). Reported when glassd itself holds the link.
+    paired: bool,
+    /// The live link transport ("bt-rfcomm" / "wifi-tcp"), empty if none.
+    transport: String,
     changed_us: u64,
     links: BTreeMap<u32, Link>,
     next_link: u32,
@@ -100,6 +104,12 @@ impl Relay {
             },
             snapshot: false,
             timestamp_us: self.changed_us,
+            paired: self.paired,
+            transport: if self.provider.is_some() {
+                self.transport.clone()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -113,6 +123,7 @@ impl Relay {
                 self.phone_connected = false;
                 self.phone_capabilities.clear();
                 self.phone_name.clear();
+                self.transport.clear();
                 self.changed_us = now_us;
                 true
             }
@@ -121,23 +132,30 @@ impl Relay {
 
     /// The provider reports the phone link. Returns whether the state changed; requests
     /// fail with `link-lost` when the phone goes away.
+    #[allow(clippy::too_many_arguments)]
     pub fn status(
         &mut self,
         connected: bool,
         capabilities: Vec<String>,
         name: String,
+        paired: bool,
+        transport: String,
         now_us: u64,
         out: &mut Vec<Out>,
     ) -> bool {
         let changed = connected != self.phone_connected
             || capabilities != self.phone_capabilities
-            || name != self.phone_name;
+            || name != self.phone_name
+            || paired != self.paired
+            || transport != self.transport;
         if self.phone_connected && !connected {
             self.fail_all("link-lost", out);
         }
         self.phone_connected = connected;
         self.phone_capabilities = capabilities;
         self.phone_name = name;
+        self.paired = paired;
+        self.transport = transport;
         if changed {
             self.changed_us = now_us;
         }
@@ -432,6 +450,7 @@ mod tests {
             phone_connected: connected,
             phone_capabilities: caps.iter().map(|s| s.to_string()).collect(),
             phone_name: "Pixel".into(),
+            ..Default::default()
         })
     }
 

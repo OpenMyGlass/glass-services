@@ -19,6 +19,15 @@ libc = "0.2"
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.10"
+# The companion-link wire protocol, shared verbatim with the OpenMyGlass companion so the
+# schema cannot drift. Pinned to a rev; this is the one dependency glassd takes on the
+# companion workspace (pure data + serde, no async, no I/O). See crates/glassd/src/companion.
+omg-protocol = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "7b69ea3d468c9ed2692a4317a018d57a4ad352b2" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
+getrandom = "0.2"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = "s"

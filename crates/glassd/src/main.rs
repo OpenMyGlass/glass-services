@@ -42,6 +42,10 @@ usage: glassd [options]
   --grab-touchpad <on|off>
                           take the touchpad for glassd alone (EVIOCGRAB; default: on on
                           Android, where the glue injects keys instead, off elsewhere)
+  --radio <on|off>        control the Wi-Fi and Bluetooth radios through rfkill and the
+                          interface (default: on on Linux; off on Android, where the
+                          framework owns the radios)
+  --wifi-iface <name>     the Wi-Fi interface to control with --radio (default: wlan0)
   --peer-check <on|off>   check each peer's uid (default: on on Android, where the socket
                           is 0666; off elsewhere unless --allow-* is given). Root and
                           system (1000) are always allowed
@@ -102,6 +106,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         iio_dev: None,
         peers: PeerPolicy::open(),
         grab_touchpad: cfg!(target_os = "android"),
+        // On Android (route 1) the framework owns the radios; on plain Linux (Model B) glassd
+        // drives them.
+        radio: !cfg!(target_os = "android"),
+        wifi_iface: glassd::radio::DEFAULT_WIFI_IFACE.into(),
     };
     let mut peer_check = None;
     let mut allow_uids = Vec::new();
@@ -169,6 +177,14 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                     v => return Err(format!("--grab-touchpad: unknown value {v:?}")),
                 }
             }
+            "--radio" => {
+                o.radio = match value("--radio")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--radio: unknown value {v:?}")),
+                }
+            }
+            "--wifi-iface" => o.wifi_iface = value("--wifi-iface")?,
             "--allow-package" => allow_packages.push(value("--allow-package")?),
             "--allow-uid" => {
                 let v = value("--allow-uid")?;

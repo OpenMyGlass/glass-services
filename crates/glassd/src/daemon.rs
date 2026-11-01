@@ -7,6 +7,7 @@ use crate::display::{Display, TouchpadSleep};
 use crate::mockcmd::{self, Command, CompanionCommand};
 use crate::peers::PeerPolicy;
 use crate::queue::OutQueue;
+use crate::radio::Radio;
 use crate::screen::{Change, Now, ScreenPolicy};
 use crate::settings_store::SettingsStore;
 use crate::touch::{ScreenOffInput, Step, TouchGate};
@@ -80,6 +81,11 @@ pub struct Options {
     /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
     /// touches into navigation keys (docs/api.md, "Android glue").
     pub grab_touchpad: bool,
+    /// Control the Wi-Fi and Bluetooth radios (Model B / plain Linux). Off on Android, where
+    /// the framework owns the radios.
+    pub radio: bool,
+    /// The Wi-Fi interface to control when `radio` is on (default `wlan0`).
+    pub wifi_iface: String,
 }
 
 /// Where an input device comes from.
@@ -158,6 +164,8 @@ pub struct Daemon {
     power_dev: Option<Device>,
     touch_sleep: TouchpadSleep,
     store: Option<SettingsStore>,
+    /// Wi-Fi / Bluetooth control (`None`: this build does not manage the radios, e.g. Android).
+    radio: Option<Radio>,
     imu: Option<Imu>,
     head: HeadService,
     /// `HeadRequest` wishes per client: (relative look-up, nudge).
@@ -185,6 +193,16 @@ fn sync_attr(
             false
         }
     }
+}
+
+/// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
+/// off, keeping the per-radio wishes so they are restored when it is turned off.
+fn effective_radio(s: &Settings) -> (bool, bool) {
+    let airplane = s.airplane_mode.unwrap_or(false);
+    (
+        !airplane && s.wifi_enabled.unwrap_or(false),
+        !airplane && s.bluetooth_enabled.unwrap_or(false),
+    )
 }
 
 /// What was last written to the glasshub, so each value is written only on a change.
@@ -472,8 +490,20 @@ impl Daemon {
         let hub_present = glasshub.is_some() || opts.mock;
         let detection = settings.on_head_detection_enabled.unwrap_or(false) && hub_present;
         let wear = WearMachine::new(t.mono_us, detection);
+        // The radio controller: recorded (no real commands) with --mock, real otherwise when
+        // --radio is on. Android leaves the radios to the framework (--radio off).
+        let radio = if opts.mock {
+            opts.radio.then(|| {
+                Radio::recording(
+                    opts.wifi_iface.clone(),
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                )
+            })
+        } else {
+            opts.radio.then(|| Radio::system(opts.wifi_iface.clone()))
+        };
         let caps: Vec<&str> = if opts.mock {
-            vec![
+            let mut c = vec![
                 "mock",
                 "touchpad",
                 "screen",
@@ -485,7 +515,11 @@ impl Daemon {
                 "wink",
                 "dictation",
                 "companion",
-            ]
+            ];
+            if radio.is_some() {
+                c.push("radio");
+            }
+            c
         } else {
             let mut c = Vec::new();
             if device.is_some() {
@@ -503,6 +537,9 @@ impl Daemon {
             }
             if power_dev.is_some() {
                 c.push("button-power");
+            }
+            if radio.is_some() {
+                c.push("radio");
             }
             c.extend(["dictation", "companion"]);
             c
@@ -547,6 +584,7 @@ impl Daemon {
             power_dev,
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
+            radio,
             imu,
             head: HeadService::default(),
             head_requests: BTreeMap::new(),
@@ -559,6 +597,10 @@ impl Daemon {
         d.sync_glasshub();
         d.read_don_doff();
         d.update_head();
+        // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
+        // off by default and a prior run's state does not leak in.
+        let s = d.settings();
+        d.apply_radio(&s);
         Ok(d)
     }
 
@@ -1413,11 +1455,22 @@ impl Daemon {
         let detection = s.on_head_detection_enabled.unwrap_or(false) && self.hub_present();
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
+        self.apply_radio(s);
         if let Some(st) = &self.store
             && let Err(e) = st.save(s)
         {
             warn!("cannot store the settings in {}: {e}", st.path().display());
         }
+    }
+
+    /// Drives the radios to match the settings. Airplane mode forces both off while keeping the
+    /// per-radio wishes, which are restored when it is turned off.
+    fn apply_radio(&mut self, s: &Settings) {
+        let Some(radio) = self.radio.as_mut() else {
+            return;
+        };
+        let (wifi, bluetooth) = effective_radio(s);
+        radio.apply(wifi, bluetooth);
     }
 
     /// The head detectors' context from the screen, the wear, the settings and the requests
@@ -1564,6 +1617,8 @@ mod tests {
             iio_dev: None,
             peers: PeerPolicy::open(),
             grab_touchpad: false,
+            radio: false,
+            wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)
@@ -1620,6 +1675,25 @@ mod tests {
         // Turning detection on again has no effect without a hub.
         detection_on(&mut d);
         assert!(!d.wear.detection());
+    }
+
+    #[test]
+    fn airplane_mode_forces_both_radios_off_but_keeps_the_wishes() {
+        let mut s = settings_rules::defaults();
+        s.wifi_enabled = Some(true);
+        s.bluetooth_enabled = Some(true);
+        s.airplane_mode = Some(false);
+        assert_eq!(effective_radio(&s), (true, true));
+        // Airplane on: both off, the wishes are untouched (so they restore on the way back).
+        s.airplane_mode = Some(true);
+        assert_eq!(effective_radio(&s), (false, false));
+        assert_eq!(s.wifi_enabled, Some(true));
+        assert_eq!(s.bluetooth_enabled, Some(true));
+        // Airplane off again: back to the wishes.
+        s.airplane_mode = Some(false);
+        assert_eq!(effective_radio(&s), (true, true));
+        // Defaults: Wi-Fi off.
+        assert_eq!(effective_radio(&settings_rules::defaults()), (false, false));
     }
 
     #[test]

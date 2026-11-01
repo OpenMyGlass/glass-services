@@ -135,7 +135,7 @@ message Welcome {
   uint32 api_version = 1;                    // the version this session uses: min(client, service)
   string service_version = 2;
   repeated string capabilities = 3;          // "touchpad", "head", "wear", "wink", "screen", "button-camera", ...,
-                                             // "dictation", "companion", "mock" (docs/api.md)
+                                             // "radio", "dictation", "companion", "mock" (docs/api.md)
 }
 
 enum ErrorCode {
@@ -274,6 +274,13 @@ message Settings {
   optional bool on_head_detection_enabled = 4;
   optional uint32 screen_timeout_ms = 5;     // 3000 to 600000; default 15000
   optional bool nudge_sleep_enabled = 6;     // default false
+  // Radios (Model B / plain Linux; "radio" capability). glassd drives rfkill and the
+  // interface. wifi_enabled and bluetooth_enabled are the per-radio wishes; airplane_mode is
+  // the master off-switch over all radios and, while it is on, both radios stay off whatever
+  // their wish is (the wishes are remembered and restored when it goes off).
+  optional bool wifi_enabled = 7;            // default false: Wi-Fi is off, brought up on demand
+  optional bool bluetooth_enabled = 8;       // default false
+  optional bool airplane_mode = 9;           // default false: all radios off, prior wishes kept
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 

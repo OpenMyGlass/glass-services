@@ -10,6 +10,7 @@ pub mod log;
 pub mod mockcmd;
 pub mod peers;
 pub mod queue;
+pub mod radio;
 pub mod screen;
 pub mod settings_store;
 pub mod touch;

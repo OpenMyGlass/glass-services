@@ -54,6 +54,12 @@ pub fn encode(s: &Settings) -> String {
         "nudge_sleep_enabled={}\n",
         b(s.nudge_sleep_enabled, d.nudge_sleep_enabled)
     );
+    out += &format!("wifi_enabled={}\n", b(s.wifi_enabled, d.wifi_enabled));
+    out += &format!(
+        "bluetooth_enabled={}\n",
+        b(s.bluetooth_enabled, d.bluetooth_enabled)
+    );
+    out += &format!("airplane_mode={}\n", b(s.airplane_mode, d.airplane_mode));
     out
 }
 
@@ -79,6 +85,9 @@ pub fn decode(text: &str) -> Settings {
             "on_head_detection_enabled" => change.on_head_detection_enabled = flag(),
             "screen_timeout_ms" => change.screen_timeout_ms = v.parse().ok(),
             "nudge_sleep_enabled" => change.nudge_sleep_enabled = flag(),
+            "wifi_enabled" => change.wifi_enabled = flag(),
+            "bluetooth_enabled" => change.bluetooth_enabled = flag(),
+            "airplane_mode" => change.airplane_mode = flag(),
             _ => {}
         }
     }
@@ -198,8 +207,23 @@ mod tests {
             "on_head_detection_enabled=false",
             "screen_timeout_ms=15000",
             "nudge_sleep_enabled=false",
+            "wifi_enabled=false",
+            "bluetooth_enabled=false",
+            "airplane_mode=false",
         ] {
             assert!(t.lines().any(|l| l == k), "{k} in {t}");
         }
+    }
+
+    #[test]
+    fn radio_settings_round_trip() {
+        let s = decode("wifi_enabled=true\nbluetooth_enabled=true\nairplane_mode=true\n");
+        assert_eq!(s.wifi_enabled, Some(true));
+        assert_eq!(s.bluetooth_enabled, Some(true));
+        assert_eq!(s.airplane_mode, Some(true));
+        // Defaults when absent.
+        let d = settings_rules::defaults();
+        assert_eq!(decode("").wifi_enabled, d.wifi_enabled);
+        assert_eq!(decode("").airplane_mode, Some(false));
     }
 }

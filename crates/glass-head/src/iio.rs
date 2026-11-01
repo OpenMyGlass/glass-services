@@ -13,8 +13,8 @@
 //!   per count). The driver does not rotate: `gyro_matrix` and `accl_matrix` are applied
 //!   here, `out = M · chip`.
 //! - Only the attributes in [`WRITABLE`] are written: power, rate, the sensor enables, the
-//!   scan elements, the buffer enable and the trigger. Never the DMP firmware, self test,
-//!   registers or the look-up tuning.
+//!   scan elements, the buffer length and enable, and the trigger. Never the DMP firmware,
+//!   self test, registers or the look-up tuning.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -34,6 +34,13 @@ pub const RATE_HZ: u32 = 50;
 /// instead, which is not available), so the look-up uses the lowest rate the driver offers.
 pub const LOOK_UP_RATE_HZ: u32 = 10;
 
+/// How many records the kernel buffer holds. On this 3.4 staging IIO the buffer's storage is
+/// allocated from `buffer/length` when `buffer/enable` is written: with a zero (or unset)
+/// length the enable write fails with `EINVAL`. The value must be set, with the buffer
+/// disabled, before enabling it. A few seconds at the gyro rate is plenty; glassd drains it
+/// every loop.
+pub const BUFFER_LENGTH: u32 = 128;
+
 /// Attributes (relative to the device directory) this module writes. Scan element enables
 /// (`scan_elements/*_en`) are allowed too.
 pub const WRITABLE: &[&str] = &[
@@ -42,6 +49,7 @@ pub const WRITABLE: &[&str] = &[
     "gyro_enable",
     "accl_enable",
     "compass_enable",
+    "buffer/length",
     "buffer/enable",
     "trigger/current_trigger",
 ];
@@ -547,6 +555,10 @@ impl Imu {
                 "no scan element enabled",
             ));
         }
+        // The buffer's storage is sized from `buffer/length` when it is enabled; on this 3.4
+        // staging IIO a zero or unset length makes the enable write fail with EINVAL. Set it
+        // (while the buffer is still disabled) after the scan elements, then enable.
+        self.write_if_present("buffer/length", &BUFFER_LENGTH.to_string())?;
         self.write_if_present("buffer/enable", "1")?;
         let file = OpenOptions::new()
             .read(true)
@@ -749,6 +761,7 @@ mod tests {
             "sampling_frequency",
             "gyro_enable",
             "accl_enable",
+            "buffer/length",
             "buffer/enable",
             "dmp_firmware",
             "self_test",
@@ -797,6 +810,9 @@ mod tests {
         assert_eq!(rd("power_state"), "1\n");
         assert_eq!(rd("sampling_frequency"), "50\n");
         assert_eq!(rd("gyro_enable"), "1\n");
+        // The channels must be enabled and the buffer length set before the buffer is enabled
+        // (a zero length is EINVAL on this 3.4 IIO); here they all read back set.
+        assert_eq!(rd("buffer/length"), format!("{BUFFER_LENGTH}\n"));
         assert_eq!(rd("buffer/enable"), "1\n");
         assert_eq!(rd("trigger/current_trigger"), "mpu9150-dev0\n");
         assert_eq!(rd("scan_elements/in_quaternion_r_en"), "0\n");
@@ -824,6 +840,32 @@ mod tests {
         assert!(imu.fd().is_none());
         assert_eq!(rd("buffer/enable"), "0\n");
         assert_eq!(rd("power_state"), "0\n");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn buffer_length_is_allowed_and_set_nonzero_before_enabling() {
+        // glassd's own guard must permit buffer/length (the latent bug was that it did not, so
+        // the length stayed unset and `buffer/enable=1` returned EINVAL on the 3.4 IIO).
+        assert!(allowed("buffer/length"));
+        assert!(WRITABLE.contains(&"buffer/length"));
+        assert_ne!(BUFFER_LENGTH, 0);
+        let root = fake_device("buflen");
+        let dir = root.join("iio:device0");
+        let node = root.join("node");
+        fs::write(&node, b"").unwrap();
+        let mut imu = Imu::open(&dir, Some(node)).unwrap();
+        imu.set_channels(Channels {
+            accel: true,
+            gyro: true,
+        })
+        .unwrap();
+        let rd = |f: &str| fs::read_to_string(dir.join(f)).unwrap();
+        assert_eq!(rd("buffer/length"), format!("{BUFFER_LENGTH}\n"));
+        assert_eq!(rd("buffer/enable"), "1\n");
+        // Stopping clears the buffer; the length is harmless to leave.
+        imu.set_channels(Channels::default()).unwrap();
+        assert_eq!(rd("buffer/enable"), "0\n");
         fs::remove_dir_all(&root).unwrap();
     }
 

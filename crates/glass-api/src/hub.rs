@@ -61,6 +61,11 @@ pub mod settings_rules {
             on_head_detection_enabled: Some(false),
             screen_timeout_ms: Some(15_000),
             nudge_sleep_enabled: Some(false),
+            // Radios off by default: on Model B the companion is the gateway over Bluetooth and
+            // Wi-Fi is brought up on demand (big transfers / fallback); see docs/api.md.
+            wifi_enabled: Some(false),
+            bluetooth_enabled: Some(false),
+            airplane_mode: Some(false),
             snapshot: false,
         }
     }
@@ -85,6 +90,17 @@ pub mod settings_rules {
         }
         if let Some(v) = change.screen_timeout_ms {
             current.screen_timeout_ms = Some(v.clamp(SCREEN_TIMEOUT_MIN_MS, SCREEN_TIMEOUT_MAX_MS));
+        }
+        // Radio wishes are plain booleans; airplane_mode gates them when applied, so the per-
+        // radio wish is kept here and restored when airplane_mode goes off.
+        if let Some(v) = change.wifi_enabled {
+            current.wifi_enabled = Some(v);
+        }
+        if let Some(v) = change.bluetooth_enabled {
+            current.bluetooth_enabled = Some(v);
+        }
+        if let Some(v) = change.airplane_mode {
+            current.airplane_mode = Some(v);
         }
         current.snapshot = false;
     }
@@ -1115,6 +1131,28 @@ mod tests {
         assert!(fx.iter().any(|e| matches!(e, Effect::SettingsChanged(_))));
         // The change comes after the answers.
         assert!(matches!(fx.last(), Some(Effect::SettingsChanged(_))));
+    }
+
+    #[test]
+    fn radio_settings_merge_and_default_off() {
+        // Defaults: all radios off (Wi-Fi off, brought up on demand).
+        let d = settings_rules::defaults();
+        assert_eq!(d.wifi_enabled, Some(false));
+        assert_eq!(d.bluetooth_enabled, Some(false));
+        assert_eq!(d.airplane_mode, Some(false));
+        // Merge copies each radio field independently; absent fields are left alone.
+        let mut cur = d;
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                wifi_enabled: Some(true),
+                airplane_mode: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.wifi_enabled, Some(true));
+        assert_eq!(cur.bluetooth_enabled, Some(false));
+        assert_eq!(cur.airplane_mode, Some(true));
     }
 
     #[test]

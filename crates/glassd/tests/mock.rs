@@ -25,6 +25,8 @@ const NO_HARDWARE: &[&str] = &[
     "none",
     "--iio",
     "none",
+    "--radio",
+    "off",
 ];
 /// Handshake timeout for the integration tests (slow CI runners).
 const HANDSHAKE: Duration = Duration::from_secs(20);

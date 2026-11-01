@@ -2,6 +2,7 @@
 //! are a library so they can be tested on the host.
 
 pub mod buttons;
+pub mod companion;
 #[cfg(target_os = "android")]
 pub mod compat;
 pub mod daemon;

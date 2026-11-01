@@ -39,6 +39,8 @@ pub enum Command {
     },
     /// The simulated companion link provider (milestone 3).
     Companion(CompanionCommand),
+    /// Feed a Wi-Fi QR bootstrap payload (`OMG1:...`) to the companion link (decode + join).
+    CompanionQr(String),
 }
 
 /// Commands of the simulated companion link provider.
@@ -118,6 +120,13 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
                 text,
                 last: cmd == "transcript-final",
             })
+        }
+        "companion-qr" => {
+            let payload = rest(line);
+            if payload.is_empty() {
+                return Err("companion-qr <OMG1:...>".into());
+            }
+            Command::CompanionQr(payload)
         }
         "dictation-error" => {
             let error = rest(line);

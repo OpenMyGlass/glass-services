@@ -3,6 +3,7 @@
 //! (long press, screen timer, a full client queue, a mock `wait`).
 
 use crate::buttons::{ButtonTracker, LONG_PRESS_MS};
+use crate::companion::{self, Companion};
 use crate::display::{Display, TouchpadSleep};
 use crate::mockcmd::{self, Command, CompanionCommand};
 use crate::peers::PeerPolicy;
@@ -14,10 +15,11 @@ use crate::touch::{ScreenOffInput, Step, TouchGate};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
-    Button, ButtonAction, ButtonId, ClientFrame, CompanionRegister, CompanionStatus,
-    DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, ScreenState, ServiceError,
-    ServiceFrame, Settings, Transcript, Wear, WearSource, Wink, client_frame, dictation_state,
-    service_frame,
+    Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
+    CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
+    CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, ScreenState,
+    ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink, client_frame,
+    dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -86,6 +88,15 @@ pub struct Options {
     pub radio: bool,
     /// The Wi-Fi interface to control when `radio` is on (default `wlan0`).
     pub wifi_iface: String,
+    /// Run the companion link (Model B holds the phone link in glassd). Off on Android (the
+    /// Glass app is the provider) and with `--mock` (the simulated provider is used instead).
+    pub companion: bool,
+    /// TCP accept port for the companion link (`None` disables the TCP fallback path).
+    pub companion_tcp_port: Option<u16>,
+    /// Advertise and accept the Bluetooth RFCOMM companion link (needs the `linux-bt` feature).
+    pub companion_bt: bool,
+    /// Where to read the battery for the companion `BatteryStatus`/`Status`.
+    pub power_supply: PathBuf,
 }
 
 /// Where an input device comes from.
@@ -171,7 +182,21 @@ pub struct Daemon {
     /// `HeadRequest` wishes per client: (relative look-up, nudge).
     head_requests: BTreeMap<ClientId, (bool, bool)>,
     samples: Vec<Sample>,
+    /// The companion link (Model B holds the phone link in glassd); `None` on Android/`--mock`.
+    companion: Option<Companion>,
+    /// The internal hub client the companion link registers as (the provider), so the launcher
+    /// sees the link through the `companion` capability.
+    companion_provider: Option<ClientId>,
+    /// Where the battery is read for the companion status.
+    power_supply: PathBuf,
+    /// The last battery `(percent, charging)` pushed to the companion.
+    battery_last: Option<(u8, bool)>,
+    /// When to poll the battery next (`CLOCK_MONOTONIC` us).
+    battery_deadline: Option<u64>,
 }
+
+/// How often glassd re-reads the battery to push changes to the companion.
+const BATTERY_POLL_US: u64 = 30_000_000;
 
 /// Writes `v` with `write` unless it is the value last written; true if it was written.
 fn sync_attr(
@@ -502,6 +527,34 @@ impl Daemon {
         } else {
             opts.radio.then(|| Radio::system(opts.wifi_iface.clone()))
         };
+        // The companion link: on Model B glassd holds the phone link itself (it is the hub's
+        // companion provider). Off on Android (the Glass app is the provider) and with --mock
+        // (the simulated provider is used instead).
+        let companion = if opts.companion && !opts.mock {
+            let state_dir = opts
+                .state_dir
+                .clone()
+                .unwrap_or_else(crate::settings_store::default_state_dir);
+            let mut device = companion::link::DeviceState::default();
+            if let Some((percent, charging)) = companion::battery::read(&opts.power_supply) {
+                device.battery_percent = Some(percent);
+                device.charging = Some(charging);
+            }
+            match Companion::new(
+                &state_dir,
+                device,
+                opts.companion_tcp_port,
+                opts.companion_bt,
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("companion: disabled ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let caps: Vec<&str> = if opts.mock {
             let mut c = vec![
                 "mock",
@@ -542,6 +595,10 @@ impl Daemon {
                 c.push("radio");
             }
             c.extend(["dictation", "companion"]);
+            // glassd holds the phone link itself (not an external provider).
+            if companion.is_some() {
+                c.push("companion-link");
+            }
             c
         };
         let mut hub = Hub::new(env!("CARGO_PKG_VERSION"), &caps);
@@ -589,7 +646,15 @@ impl Daemon {
             head: HeadService::default(),
             head_requests: BTreeMap::new(),
             samples: Vec::new(),
+            companion,
+            companion_provider: None,
+            power_supply: opts.power_supply.clone(),
+            battery_last: None,
+            battery_deadline: None,
         };
+        if d.companion.is_some() {
+            d.battery_deadline = Some(now().mono_us);
+        }
         // A previous run may have left the touchpad asleep.
         if d.mock.is_none() {
             d.touch_sleep.set(false);
@@ -620,6 +685,7 @@ impl Daemon {
             self.camera.next_deadline(),
             self.power.next_deadline(),
             self.hub.next_deadline(),
+            self.battery_deadline,
         ]
         .into_iter()
         .flatten()
@@ -659,6 +725,8 @@ impl Daemon {
             WinkAttr,
             Imu,
             Client(ClientId),
+            CompanionListener(companion::transport::Transport),
+            CompanionConn(companion::ConnId),
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -702,6 +770,18 @@ impl Daemon {
             }
             add(c.stream.as_raw_fd(), ev, Src::Client(id));
         }
+        if let Some(comp) = &self.companion {
+            for (fd, transport) in comp.listener_fds() {
+                add(fd, libc::POLLIN, Src::CompanionListener(transport));
+            }
+            for (id, fd, want_write) in comp.conn_fds() {
+                let mut ev = libc::POLLIN;
+                if want_write {
+                    ev |= libc::POLLOUT;
+                }
+                add(fd, ev, Src::CompanionConn(id));
+            }
+        }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -728,6 +808,25 @@ impl Daemon {
                     if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                         self.read_client(id);
                     }
+                }
+                Src::CompanionListener(transport) => {
+                    let events = match &mut self.companion {
+                        Some(c) => c.accept(transport),
+                        None => Vec::new(),
+                    };
+                    self.companion_events(events);
+                }
+                Src::CompanionConn(id) => {
+                    let mut events = Vec::new();
+                    if let Some(c) = &mut self.companion {
+                        if pfd.revents & libc::POLLOUT != 0 {
+                            events.extend(c.on_writable(id));
+                        }
+                        if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                            events.extend(c.on_readable(id));
+                        }
+                    }
+                    self.companion_events(events);
                 }
             }
         }
@@ -757,7 +856,31 @@ impl Daemon {
         {
             m.resume_at = None;
         }
+        if self.battery_deadline.is_some_and(|d| t.mono_us >= d) {
+            self.poll_battery(t);
+        }
         self.run_mock_commands();
+    }
+
+    /// Reads the battery and pushes it to the companion when it changed.
+    fn poll_battery(&mut self, t: Now) {
+        self.battery_deadline = Some(t.mono_us + BATTERY_POLL_US);
+        if self.companion.is_none() {
+            return;
+        }
+        let Some(reading) = companion::battery::read(&self.power_supply) else {
+            return;
+        };
+        if self.battery_last == Some(reading) {
+            return;
+        }
+        self.battery_last = Some(reading);
+        let (percent, charging) = reading;
+        let events = match &mut self.companion {
+            Some(c) => c.battery_changed(percent, charging),
+            None => Vec::new(),
+        };
+        self.companion_events(events);
     }
 
     fn accept(&mut self) {
@@ -891,6 +1014,9 @@ impl Daemon {
                 Effect::Send(id, f) if self.mock_companion.as_ref().is_some_and(|m| m.id == id) => {
                     self.mock_companion_frame(f)
                 }
+                Effect::Send(id, f) if self.companion_provider == Some(id) => {
+                    self.companion_provider_frame(f)
+                }
                 Effect::Send(id, f) => {
                     if let Some(c) = self.conns.get_mut(&id) {
                         c.queue.push(&f, t.mono_us);
@@ -919,6 +1045,18 @@ impl Daemon {
                     if let Some(ms) = request.inhibit_look_up_ms {
                         self.head.inhibit_look_up(t.mono_us, ms);
                     }
+                }
+                Effect::CompanionNotificationAction { key, action_index } => {
+                    use omg_protocol::NotificationChoice;
+                    let choice = match action_index {
+                        Some(i) => NotificationChoice::Action(i),
+                        None => NotificationChoice::Dismiss,
+                    };
+                    let events = match &mut self.companion {
+                        Some(c) => c.notification_action(key, choice),
+                        None => Vec::new(),
+                    };
+                    self.companion_events(events);
                 }
             }
         }
@@ -1106,6 +1244,7 @@ impl Daemon {
                 }
             }
             Command::Companion(c) => self.mock_companion_command(c),
+            Command::CompanionQr(payload) => self.companion_qr(&payload),
         }
     }
 
@@ -1178,6 +1317,7 @@ impl Daemon {
                     phone_connected: true,
                     phone_capabilities: capabilities,
                     phone_name: "Mock phone".into(),
+                    ..Default::default()
                 }))
             }
             CompanionCommand::Off => {
@@ -1271,6 +1411,218 @@ impl Daemon {
             _ => Vec::new(),
         };
         self.effects(fx);
+    }
+
+    /// Carries out the companion link's events: link state to the launcher (via the internal
+    /// provider), notifications to the timeline, locale, and radio/Wi-Fi requests.
+    fn companion_events(&mut self, events: Vec<companion::Event>) {
+        use companion::Event as E;
+        for e in events {
+            match e {
+                E::Connected {
+                    name,
+                    capabilities,
+                    transport,
+                } => self.companion_connected(name, capabilities, transport),
+                E::Disconnected => self.companion_disconnected(),
+                // The link already acked LocaleChanged; delivering the locale to the launcher UI
+                // is glass-apps' concern (the services Settings has no locale field yet).
+                E::ApplyLocale(l) => info!("companion: locale -> {}", l.code()),
+                E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
+                    to_proto_notification(n),
+                )),
+                E::RemoveNotification(key) => {
+                    self.publish(service_frame::Body::CompanionNotificationRemoved(
+                        CompanionNotificationRemoved { key },
+                    ))
+                }
+                E::SetRadio { radio, on } => self.companion_set_radio(radio, on),
+                E::SetAirplane(on) => {
+                    self.apply_settings_change(Settings {
+                        airplane_mode: Some(on),
+                        ..Default::default()
+                    });
+                    self.report_radio_state();
+                }
+                E::WifiBringUp(_) => {
+                    self.apply_settings_change(Settings {
+                        wifi_enabled: Some(true),
+                        ..Default::default()
+                    });
+                    self.report_radio_state();
+                }
+                E::WifiTearDown => {
+                    self.apply_settings_change(Settings {
+                        wifi_enabled: Some(false),
+                        ..Default::default()
+                    });
+                    self.report_radio_state();
+                }
+            }
+        }
+    }
+
+    fn companion_set_radio(&mut self, radio: omg_protocol::Radio, on: bool) {
+        let change = match radio {
+            omg_protocol::Radio::Wifi => Settings {
+                wifi_enabled: Some(on),
+                ..Default::default()
+            },
+            omg_protocol::Radio::Bt => Settings {
+                bluetooth_enabled: Some(on),
+                ..Default::default()
+            },
+        };
+        self.apply_settings_change(change);
+        self.report_radio_state();
+    }
+
+    /// Merges a settings change (e.g. from the companion), applies it, persists it, and tells
+    /// the launcher's `Settings` subscribers, as a `SetSettings` from a client would.
+    fn apply_settings_change(&mut self, change: Settings) {
+        let mut s = self.settings();
+        settings_rules::merge(&mut s, &change);
+        self.settings_changed(&s);
+        self.publish(service_frame::Body::Settings(s));
+    }
+
+    /// Reports the current radio state to the companion.
+    fn report_radio_state(&mut self) {
+        let Some((wifi, bt)) = self.radio.as_ref().map(|r| r.state()) else {
+            return;
+        };
+        let s = self.settings();
+        let radios = omg_protocol::RadioState {
+            wifi_on: wifi.unwrap_or(false),
+            bt_on: bt.unwrap_or(false),
+            airplane_mode: s.airplane_mode.unwrap_or(false),
+            wifi_ssid: None,
+            wifi_ip: None,
+        };
+        let events = match &mut self.companion {
+            Some(c) => c.radio_state_changed(radios),
+            None => Vec::new(),
+        };
+        self.companion_events(events);
+    }
+
+    /// A companion authenticated: register as the hub's companion provider (if not already) and
+    /// report the link to the launcher.
+    fn companion_connected(
+        &mut self,
+        name: String,
+        capabilities: Vec<String>,
+        transport: companion::transport::Transport,
+    ) {
+        if self.companion_provider.is_none() {
+            let id = self.hub.add_client();
+            self.companion_provider = Some(id);
+            let mut fx = self.companion_provider_says(client_frame::Body::Hello(Hello {
+                api_version: glass_api::API_VERSION,
+                client_name: "companion-link".into(),
+            }));
+            fx.extend(
+                self.companion_provider_says(client_frame::Body::CompanionRegister(
+                    CompanionRegister {
+                        name: "companion-link".into(),
+                    },
+                )),
+            );
+            if self.hub.relay().provider() != Some(id) {
+                warn!("companion: another provider is registered; not surfacing the link");
+                self.companion_provider = None;
+                fx.extend(self.hub.remove_client(id));
+                self.effects(fx);
+                return;
+            }
+            self.effects(fx);
+        }
+        let paired = self.companion.as_ref().is_some_and(|c| c.paired());
+        let fx =
+            self.companion_provider_says(client_frame::Body::CompanionStatus(CompanionStatus {
+                phone_connected: true,
+                phone_capabilities: capabilities,
+                phone_name: name,
+                paired,
+                transport: transport.as_str().into(),
+            }));
+        self.effects(fx);
+    }
+
+    fn companion_disconnected(&mut self) {
+        let paired = self.companion.as_ref().is_some_and(|c| c.paired());
+        let fx =
+            self.companion_provider_says(client_frame::Body::CompanionStatus(CompanionStatus {
+                phone_connected: false,
+                phone_capabilities: Vec::new(),
+                phone_name: String::new(),
+                paired,
+                transport: String::new(),
+            }));
+        self.effects(fx);
+    }
+
+    fn companion_provider_says(&mut self, body: client_frame::Body) -> Vec<Effect> {
+        let Some(id) = self.companion_provider else {
+            return Vec::new();
+        };
+        self.hub.on_frame(
+            id,
+            ClientFrame {
+                seq: 0,
+                body: Some(body),
+            },
+        )
+    }
+
+    /// A frame the hub routed to the companion provider. glassd's link does not relay dictation
+    /// yet, so a relayed `DictationStart` is failed with `unsupported` rather than left hanging.
+    fn companion_provider_frame(&mut self, f: ServiceFrame) {
+        let fx = match f.body {
+            Some(service_frame::Body::ProviderDictationStart(d)) => self.companion_provider_says(
+                client_frame::Body::ProviderDictationState(DictationState {
+                    request_id: d.request_id,
+                    state: dictation_state::State::Failed as i32,
+                    error: "unsupported".into(),
+                }),
+            ),
+            _ => Vec::new(),
+        };
+        self.effects(fx);
+    }
+
+    /// Feeds a decoded Wi-Fi QR bootstrap (`OMG1:` payload): join the network with the merged
+    /// radio control, then dial the companion if the QR carried an address (item 6). The
+    /// camera-side scan is a later phase; this is the decode+join entry point.
+    pub fn companion_qr(&mut self, payload: &str) {
+        let boot = match companion::bootstrap::decode(payload) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("companion: bad QR bootstrap ({e:?})");
+                return;
+            }
+        };
+        info!(
+            "companion: QR ssid {:?} addr {:?}",
+            boot.ssid, boot.companion_addr
+        );
+        if let Some(radio) = &mut self.radio {
+            let conf = companion::bootstrap::wpa_supplicant_conf(
+                &boot.ssid,
+                boot.auth,
+                boot.psk.as_deref(),
+            );
+            radio.join_wifi(&conf, Path::new("/var/run/wpa_supplicant_glassd.conf"));
+        }
+        if let Some(addr) = &boot.companion_addr {
+            match &mut self.companion {
+                Some(c) => match c.connect_tcp(addr) {
+                    Ok(events) => self.companion_events(events),
+                    Err(e) => warn!("companion: cannot dial {addr} ({e})"),
+                },
+                None => info!("companion: --companion off; not dialing {addr}"),
+            }
+        }
     }
 
     /// A press of a button from the mock: down, then (long) the hold time, then up.
@@ -1554,6 +1906,27 @@ impl Daemon {
     }
 }
 
+/// Maps the companion-link `Notification` to the launcher `CompanionNotification` timeline card.
+fn to_proto_notification(n: omg_protocol::Notification) -> CompanionNotification {
+    CompanionNotification {
+        key: n.key,
+        app_name: n.app_name,
+        title: n.title,
+        text: n.text,
+        posted_at_ms: n.posted_at_ms,
+        actions: n
+            .actions
+            .into_iter()
+            .map(|a| CompanionNotificationActionInfo {
+                index: a.index,
+                title: a.title,
+                reply: a.reply,
+            })
+            .collect(),
+        wake: n.wake,
+    }
+}
+
 /// Tells a refused peer why, then drops the connection.
 fn deny(stream: &mut UnixStream) {
     use std::io::Write;
@@ -1619,6 +1992,10 @@ mod tests {
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
+            companion: false,
+            companion_tcp_port: None,
+            companion_bt: false,
+            power_supply: crate::companion::battery::DEFAULT_ROOT.into(),
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

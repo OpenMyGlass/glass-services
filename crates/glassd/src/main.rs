@@ -46,6 +46,15 @@ usage: glassd [options]
                           interface (default: on on Linux; off on Android, where the
                           framework owns the radios)
   --wifi-iface <name>     the Wi-Fi interface to control with --radio (default: wlan0)
+  --companion <on|off>    hold the phone (OpenMyGlass companion) link in glassd over Bluetooth
+                          RFCOMM / TCP (default: on on Linux; off on Android, where the Glass
+                          app is the provider; off with --mock)
+  --companion-tcp-port <port|off>
+                          TCP accept port for the companion link (default: 7700; off disables
+                          the TCP fallback, leaving only Bluetooth)
+  --companion-bt <on|off> advertise and accept the Bluetooth RFCOMM companion link (needs the
+                          linux-bt build feature; default: on when built with it)
+  --power-supply <dir>    where to read the battery (default: /sys/class/power_supply)
   --peer-check <on|off>   check each peer's uid (default: on on Android, where the socket
                           is 0666; off elsewhere unless --allow-* is given). Root and
                           system (1000) are always allowed
@@ -110,6 +119,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         // drives them.
         radio: !cfg!(target_os = "android"),
         wifi_iface: glassd::radio::DEFAULT_WIFI_IFACE.into(),
+        // On Model B glassd holds the phone link itself; on Android the Glass app is the
+        // provider, so the daemon's own companion link is off there.
+        companion: !cfg!(target_os = "android"),
+        companion_tcp_port: Some(glassd::companion::transport::DEFAULT_TCP_PORT),
+        companion_bt: cfg!(feature = "linux-bt"),
+        power_supply: glassd::companion::battery::DEFAULT_ROOT.into(),
     };
     let mut peer_check = None;
     let mut allow_uids = Vec::new();
@@ -185,6 +200,32 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                 }
             }
             "--wifi-iface" => o.wifi_iface = value("--wifi-iface")?,
+            "--companion" => {
+                o.companion = match value("--companion")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--companion: unknown value {v:?}")),
+                }
+            }
+            "--companion-tcp-port" => {
+                let v = value("--companion-tcp-port")?;
+                o.companion_tcp_port = if v == "off" {
+                    None
+                } else {
+                    Some(
+                        v.parse()
+                            .map_err(|_| format!("--companion-tcp-port: not a port: {v:?}"))?,
+                    )
+                };
+            }
+            "--companion-bt" => {
+                o.companion_bt = match value("--companion-bt")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--companion-bt: unknown value {v:?}")),
+                }
+            }
+            "--power-supply" => o.power_supply = PathBuf::from(value("--power-supply")?),
             "--allow-package" => allow_packages.push(value("--allow-package")?),
             "--allow-uid" => {
                 let v = value("--allow-uid")?;

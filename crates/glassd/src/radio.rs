@@ -184,6 +184,26 @@ impl Radio {
         }
     }
 
+    /// Brings Wi-Fi up and joins the network described by a QR bootstrap (docs/api.md, the
+    /// companion link). The supplicant config `conf` is [`crate::companion::bootstrap::
+    /// wpa_supplicant_conf`]; it is written to `conf_path`, then `wpa_supplicant` is started on
+    /// the interface and `udhcpc` asks for a lease. Association is otherwise left to the
+    /// supplicant, as [`Radio`] documents. Best effort: a missing tool is logged, not fatal.
+    /// Returns whether Wi-Fi was enabled (the rfkill step); association runs regardless.
+    pub fn join_wifi(&mut self, conf: &str, conf_path: &std::path::Path) -> bool {
+        let enabled = self.set_wifi(true);
+        if let Err(e) = std::fs::write(conf_path, conf) {
+            warn!("radio: cannot write {} ({e})", conf_path.display());
+        }
+        let iface = self.wifi_iface.clone();
+        let conf_arg = conf_path.to_string_lossy().into_owned();
+        // A previous supplicant on this interface would hold the control socket.
+        self.step("wpa_supplicant", &["-B", "-i", &iface, "-c", &conf_arg]);
+        self.step("udhcpc", &["-i", &iface, "-n"]);
+        info!("radio: joining Wi-Fi on {iface}");
+        enabled
+    }
+
     /// The Wi-Fi supplicant installed on the image, if glassd can see one (`wpa_supplicant` or
     /// `iwd`), for the association flow to use. Best effort; `None` if neither is found.
     pub fn wifi_supplicant(&mut self) -> Option<&'static str> {

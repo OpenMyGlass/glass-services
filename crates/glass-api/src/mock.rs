@@ -314,7 +314,9 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
                     }));
                 }
             }
-            Effect::SettingsChanged(_) | Effect::Head { .. } => {}
+            Effect::SettingsChanged(_)
+            | Effect::Head { .. }
+            | Effect::CompanionNotificationAction { .. } => {}
         }
     }
 }

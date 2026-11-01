@@ -31,6 +31,8 @@ message ClientFrame {
     CompanionStatus companion_status = 14;       // the phone link changed
     DictationState provider_dictation_state = 15; // a relayed request's state; request_id = the link id
     Transcript provider_transcript = 16;          // a relayed request's transcript; request_id = the link id
+    // The owner picked an action on, or dismissed, a companion notification card (on the Glass):
+    CompanionNotificationAction companion_notification_action = 17; // milestone 3
   }
 }
 
@@ -128,6 +130,9 @@ message ServiceFrame {
     DictationStart provider_dictation_start = 18;
     DictationCancel provider_dictation_cancel = 19;
     DictationConfirm provider_dictation_confirm = 20;
+    // Companion notifications relayed from the phone to the timeline (TOPIC_COMPANION):
+    CompanionNotification companion_notification = 21;                 // milestone 3
+    CompanionNotificationRemoved companion_notification_removed = 22;  // milestone 3
   }
 }
 
@@ -351,6 +356,10 @@ message CompanionStatus {                    // provider -> glassd, after Compan
   bool phone_connected = 1;                  // a phone's bridge session is up (its Hello was received)
   repeated string phone_capabilities = 2;    // the capabilities of the phone's Hello, e.g. "dictation-free"
   string phone_name = 3;                     // for display, e.g. the phone's Bluetooth name; may be empty
+  // When glassd itself holds the link (Model B, the companion subsystem), it also reports the
+  // persistent bond and the transport in use. An external provider leaves these at their default.
+  bool paired = 4;                           // a companion is bonded (persisted; survives reboot)
+  string transport = 5;                      // the live link transport: "bt-rfcomm" or "wifi-tcp"
 }
 
 message CompanionState {                     // TOPIC_COMPANION
@@ -360,4 +369,34 @@ message CompanionState {                     // TOPIC_COMPANION
   string phone_name = 4;
   bool snapshot = 5;                         // sent because of Subscribe or GetState
   uint64 timestamp_us = 6;                   // time of the change (for a snapshot: of the last change)
+  bool paired = 7;                           // a companion is bonded (persisted)
+  string transport = 8;                      // the live link transport: "bt-rfcomm" or "wifi-tcp" (empty if none)
+}
+
+// A phone notification relayed to the Glass timeline (glassd -> clients on TOPIC_COMPANION). The
+// phone has already filtered and truncated it (OpenMyGlass companion), so the fields render as is.
+message CompanionNotification {
+  string key = 1;                            // stable key, identifies the card across updates/actions
+  string app_name = 2;
+  string title = 3;
+  string text = 4;
+  uint64 posted_at_ms = 5;                   // when posted on the phone, Unix ms
+  repeated CompanionNotificationActionInfo actions = 6;
+  bool wake = 7;                             // the phone marked it allowed to wake the prism
+}
+
+message CompanionNotificationActionInfo {
+  uint32 index = 1;                          // action index on the phone
+  string title = 2;                          // button label
+  bool reply = 3;                            // choosing it opens a dictated reply (has a RemoteInput)
+}
+
+message CompanionNotificationRemoved {       // glassd -> clients on TOPIC_COMPANION
+  string key = 1;
+}
+
+message CompanionNotificationAction {        // client -> glassd: the owner's choice on a card
+  string key = 1;
+  uint32 action_index = 2;                   // the action to invoke (when dismiss is false)
+  bool dismiss = 3;                          // true: dismiss the card instead of invoking an action
 }

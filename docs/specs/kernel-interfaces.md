@@ -391,11 +391,15 @@ touch these attributes or `calibrate`.
   enabled (inv_mpu_ring.c:680-681). Readers must handle this byte. **[device]** dump a few records.
 - Recommended sequence (README in the driver directory, lines 281-313):
   `power_state=1`; set `sampling_frequency`; set `gyro_enable`,
-  `accl_enable`, `compass_enable`; enable scan elements; `buffer/enable=1`;
-  read `/dev/iio:device0`. The README says `fifo_rate`; the actual IIO
-  attribute is `sampling_frequency` (README:287; inv_mpu_core.c:1447-1449).
-  Most settings return `EPERM` while the buffer is
-  enabled or the chip is asleep (inv_mpu_core.c:546-549, 561).
+  `accl_enable`, `compass_enable`; enable scan elements; set `buffer/length`;
+  `buffer/enable=1`; read `/dev/iio:device0`. The README says `fifo_rate`; the
+  actual IIO attribute is `sampling_frequency` (README:287;
+  inv_mpu_core.c:1447-1449). Most settings return `EPERM` while the buffer is
+  enabled or the chip is asleep (inv_mpu_core.c:546-549, 561). **[device]**
+  `buffer/enable=1` returns `EINVAL` when `buffer/length` is unset/zero: the
+  staging kfifo sizes its storage from the length when the buffer is enabled,
+  so the length must be written first (with the buffer disabled). glassd sets
+  it (`glass-head::iio::BUFFER_LENGTH`) after the scan elements, then enables.
 
 ### 3.3 Rates and ranges
 

@@ -34,7 +34,7 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
 3. The client sends `Subscribe{topics}`. Each `Subscribe` replaces the previous set. After every `Subscribe`, `glassd` sends a **snapshot** for each topic in the new set that has state: `WearState` and `Settings` (`snapshot: true`), `ScreenState` (`reason: "snapshot"`), and for `TOPIC_LOCATION` the current `LocationStatus` plus the last fix if there is one (`Location{snapshot: true}`). Snapshot timestamps are the time of the last change. A topic whose source does not exist sends no snapshot.
 4. `GetState` sends the same snapshot for the currently subscribed topics, plus `FocusState` for this client.
 
-Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `dictation` and `companion` (this `glassd` relays dictation and reports the companion link; whether a phone is there is told by `TOPIC_COMPANION` and `ERROR_CODE_NO_COMPANION`), `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent. `glassd` advertises a hardware source only when it found it at start: `touchpad`, `button-camera` and `button-power` by input device name, `wink` when the glasshub is present, `head` when the IMU is present; `screen` and `wear` are always there (without a glasshub the wear is forced or set with the power key); `hinge` only in the mock until the hinge switch is identified on a device.
+Capabilities say which sources exist on this device or build: `touchpad`, `head`, `wear`, `wink`, `screen`, `button-camera`, `button-power`, `hinge`, `radio` (Wi-Fi / Bluetooth / airplane control through the `Settings` fields below; present on Model B, absent on Android where the framework owns the radios), `dictation` and `companion` (this `glassd` relays dictation and reports the companion link; whether a phone is there is told by `TOPIC_COMPANION` and `ERROR_CODE_NO_COMPANION`), `location`, and `mock` when the server is the mock. A topic whose source is missing is accepted and stays silent. `glassd` advertises a hardware source only when it found it at start: `touchpad`, `button-camera` and `button-power` by input device name, `wink` when the glasshub is present, `head` when the IMU is present; `screen` and `wear` are always there (without a glasshub the wear is forced or set with the power key); `hinge` only in the mock until the hinge switch is identified on a device.
 
 ### Requests and errors
 
@@ -163,6 +163,11 @@ Who switches the panel:
 | `on_head_detection_enabled` | default false |
 | `screen_timeout_ms` | 3000 to 600000, default 15000; there is no "never" |
 | `nudge_sleep_enabled` | default false |
+| `wifi_enabled` | default false (`radio`): Wi-Fi off, brought up on demand |
+| `bluetooth_enabled` | default false (`radio`) |
+| `airplane_mode` | default false (`radio`): master off-switch over all radios |
+
+The last three exist on Model B (plain Linux), reported by the `radio` capability; on Android (route 1) the framework owns the radios and `glassd` does not advertise `radio` or act on these fields. `glassd` switches the hardware with `rfkill` and the interface and leaves association (Wi-Fi: wpa_supplicant/iwd + udhcpc, the companion/QR setup flow) and pairing (Bluetooth: bluez) to their userspace. `wifi_enabled` and `bluetooth_enabled` are the per-radio wishes; `airplane_mode` is the umbrella: while it is on, both radios are forced off, the wishes are kept, and turning it off restores them. So the launcher's Wi-Fi / Bluetooth / airplane toggles are `SetSettings` on these fields, and the current state is read from the `Settings` snapshot (`GetState` or a `TOPIC_SETTINGS` subscription). The default is Wi-Fi off: on Model B the companion is the gateway over Bluetooth and Glass brings Wi-Fi up only for big transfers or as a fallback.
 
 ## Companion link provider (`TOPIC_COMPANION`, milestone 3)
 

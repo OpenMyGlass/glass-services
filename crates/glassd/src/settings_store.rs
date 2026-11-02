@@ -48,7 +48,7 @@ pub fn encode(s: &Settings) -> String {
         "screen_timeout_ms={}\n",
         s.screen_timeout_ms
             .or(d.screen_timeout_ms)
-            .unwrap_or(15_000)
+            .unwrap_or(120_000)
     );
     out += &format!(
         "nudge_sleep_enabled={}\n",
@@ -244,7 +244,7 @@ mod tests {
             "head_wake_angle_deg=30",
             "wink_enabled=false",
             "on_head_detection_enabled=false",
-            "screen_timeout_ms=15000",
+            "screen_timeout_ms=120000",
             "nudge_sleep_enabled=false",
             "wifi_enabled=false",
             "bluetooth_enabled=false",

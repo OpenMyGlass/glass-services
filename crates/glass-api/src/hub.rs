@@ -70,7 +70,10 @@ pub mod settings_rules {
             head_wake_angle_deg: Some(30.0),
             wink_enabled: Some(false),
             on_head_detection_enabled: Some(false),
-            screen_timeout_ms: Some(15_000),
+            // Humane idle timeout for interactive use: stay lit ~2 min, then a brief dim
+            // and off. (Was 15 s, which fought the user during a guided walkthrough.) The
+            // energy policy's eco/suspend stages still kick in after screen-off.
+            screen_timeout_ms: Some(120_000),
             nudge_sleep_enabled: Some(false),
             // Radios off by default: on Model B the companion is the gateway over Bluetooth and
             // Wi-Fi is brought up on demand (big transfers / fallback); see docs/api.md.

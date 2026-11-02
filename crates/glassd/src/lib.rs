@@ -10,6 +10,7 @@ pub mod display;
 pub mod log;
 pub mod mockcmd;
 pub mod peers;
+pub mod power;
 pub mod queue;
 pub mod radio;
 pub mod screen;

@@ -7,6 +7,7 @@ use crate::companion::{self, Companion};
 use crate::display::{Display, TouchpadSleep};
 use crate::mockcmd::{self, Command, CompanionCommand};
 use crate::peers::PeerPolicy;
+use crate::power::{Power, PowerAction, PowerPaths, PowerPolicy};
 use crate::queue::OutQueue;
 use crate::radio::Radio;
 use crate::screen::{Change, Now, ScreenPolicy};
@@ -18,7 +19,7 @@ use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
     CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
     CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, Locale,
-    ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
+    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
     client_frame, dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
@@ -104,6 +105,12 @@ pub struct Options {
     pub companion_bt: bool,
     /// Where to read the battery for the companion `BatteryStatus`/`Status`.
     pub power_supply: PathBuf,
+    /// Run the Model B energy policy (idle -> blank/brightness/cpufreq/runtime-PM and, when
+    /// `deep_sleep_enabled`, suspend-to-RAM). Off on Android, where the framework owns power.
+    /// Named `energy` to avoid clashing with the `power` power-button device source.
+    pub energy: bool,
+    /// The sysfs paths and cpufreq helper the energy policy drives (`--power-*`).
+    pub power_paths: PowerPaths,
 }
 
 /// Where an input device comes from.
@@ -184,6 +191,11 @@ pub struct Daemon {
     store: Option<SettingsStore>,
     /// Wi-Fi / Bluetooth control (`None`: this build does not manage the radios, e.g. Android).
     radio: Option<Radio>,
+    /// The idle -> suspend decision (always present; inert when the back end is absent).
+    power_policy: PowerPolicy,
+    /// The energy-policy side-effect back end (`None`: not managing power, e.g. Android/mock-off).
+    /// Named `power_io` to avoid clashing with the `power` power-button tracker.
+    power_io: Option<Power>,
     imu: Option<Imu>,
     head: HeadService,
     /// `HeadRequest` wishes per client: (relative look-up, nudge).
@@ -565,6 +577,28 @@ impl Daemon {
         } else {
             opts.radio.then(|| Radio::system(opts.wifi_iface.clone()))
         };
+        // The energy-policy back end: recorded with --mock (never touches the host's power
+        // sysfs), real otherwise when --power is on. Android leaves power to the framework.
+        let power = if !opts.energy {
+            None
+        } else if opts.mock {
+            Some(Power::recording(
+                opts.power_paths.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            ))
+        } else {
+            // Expand the runtime-PM device list from the live buses (real back end only).
+            Some(Power::system(
+                opts.power_paths.clone().with_default_runtime_pm(),
+            ))
+        };
+        // The policy is inert without a back end: force power_saver off so it never arms a
+        // suspend it cannot carry out (Android / --power off).
+        let power_policy = PowerPolicy::new(
+            settings.power_saver.unwrap_or(true) && power.is_some(),
+            settings.deep_sleep_enabled.unwrap_or(false),
+            settings.deep_sleep_idle_ms.unwrap_or(60_000),
+        );
         // The companion link: on Model B glassd holds the phone link itself (it is the hub's
         // companion provider). Off on Android (the Glass app is the provider) and with --mock
         // (the simulated provider is used instead).
@@ -614,6 +648,9 @@ impl Daemon {
             if radio.is_some() {
                 c.push("radio");
             }
+            if power.is_some() {
+                c.push("power");
+            }
             c
         } else {
             let mut c = Vec::new();
@@ -635,6 +672,9 @@ impl Daemon {
             }
             if radio.is_some() {
                 c.push("radio");
+            }
+            if power.is_some() {
+                c.push("power");
             }
             c.extend(["dictation", "companion"]);
             // glassd holds the phone link itself (not an external provider).
@@ -684,6 +724,8 @@ impl Daemon {
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
             radio,
+            power_policy,
+            power_io: power,
             imu,
             head: HeadService::default(),
             head_requests: BTreeMap::new(),
@@ -708,6 +750,11 @@ impl Daemon {
         // off by default and a prior run's state does not leak in.
         let s = d.settings();
         d.apply_radio(&s);
+        // Start the energy policy: runtime-PM auto, arm wake sources, take the wakelock, and set
+        // the active (screen-on) cpufreq profile. Best effort; inert without a back end.
+        if let Some(power) = &mut d.power_io {
+            power.start(crate::power::CpuProfile::Balanced);
+        }
         Ok(d)
     }
 
@@ -726,6 +773,9 @@ impl Daemon {
             self.wear.next_deadline(),
             self.camera.next_deadline(),
             self.power.next_deadline(),
+            self.power_io
+                .as_ref()
+                .and_then(|_| self.power_policy.next_deadline()),
             self.hub.next_deadline(),
             self.battery_deadline,
         ]
@@ -834,6 +884,12 @@ impl Daemon {
                 Err(e)
             };
         }
+        // Reaching here past `poll` while a suspend was armed means the system is awake again (a
+        // wake source resumed it, or a timer fired): re-take the wakelock and re-drive the panel
+        // before handling whatever woke us.
+        if self.power_policy.is_suspended() {
+            self.resume_from_suspend();
+        }
         for (pfd, src) in fds.iter().zip(srcs) {
             if pfd.revents == 0 {
                 continue;
@@ -900,6 +956,13 @@ impl Daemon {
         }
         if self.battery_deadline.is_some_and(|d| t.mono_us >= d) {
             self.poll_battery(t);
+        }
+        // Energy policy: the deep-idle window may have elapsed (screen off long enough).
+        if self.power_io.is_some()
+            && let Some(PowerAction::Suspend) = self.power_policy.on_timeout(t.mono_us)
+            && let Some(power) = &mut self.power_io
+        {
+            power.suspend();
         }
         self.run_mock_commands();
     }
@@ -1112,8 +1175,38 @@ impl Daemon {
     fn apply_change(&mut self, c: Change) {
         info!("screen {:?} ({})", c.screen, c.reason);
         self.display.set(c.screen);
+        self.drive_power(c.screen);
         let state: ScreenState = c.to_state();
         self.publish(service_frame::Body::ScreenState(state));
+    }
+
+    /// Follows a screen change through the energy policy: tell the policy whether the panel is
+    /// off (dim counts as on), then apply the cpufreq profile and the panel brightness. The
+    /// screen-off blanking itself is `FBIOBLANK` in [`crate::display`] and is not changed here.
+    fn drive_power(&mut self, screen: Screen) {
+        let off = screen == Screen::Off;
+        self.power_policy.screen_changed(now().mono_us, off);
+        let profile = self.power_policy.cpu_profile();
+        // With the policy off, keep the panel at full brightness whatever the screen state.
+        let bright = if self.power_policy.power_saver() {
+            screen
+        } else {
+            Screen::On
+        };
+        if let Some(power) = &mut self.power_io {
+            power.set_cpu_profile(profile);
+            power.set_brightness_for(bright);
+        }
+    }
+
+    /// The system resumed after a suspend: re-arm the policy, re-take the wakelock, and force the
+    /// display to be re-driven on the next wake (so the panel bring-up is never skipped).
+    fn resume_from_suspend(&mut self) {
+        self.power_policy.resumed(now().mono_us);
+        if let Some(power) = &mut self.power_io {
+            power.resume();
+        }
+        self.display.invalidate();
     }
 
     fn touch_outputs(&mut self, outs: &[Output], t: Now) {
@@ -1857,6 +1950,7 @@ impl Daemon {
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
         self.apply_radio(s);
+        self.apply_power(s);
         // Keep the companion's reported UI language in step (idempotent; pushes LocaleChanged to
         // the phone only when the value actually changed and it was not the companion's own set).
         if s.locale.is_some() {
@@ -1881,6 +1975,20 @@ impl Daemon {
         };
         let (wifi, bluetooth) = effective_radio(s);
         radio.apply(wifi, bluetooth);
+    }
+
+    /// Applies the energy-policy settings: update the idle -> suspend decision and re-apply the
+    /// cpufreq profile and brightness for the current screen (so toggling `power_saver` restores
+    /// a full-brightness, responsive state at once). Inert without a back end.
+    fn apply_power(&mut self, s: &Settings) {
+        // No back end: the policy stays inert (power_saver forced off).
+        let enabled = self.power_io.is_some();
+        self.power_policy.apply_settings(
+            s.power_saver.unwrap_or(true) && enabled,
+            s.deep_sleep_enabled.unwrap_or(false),
+            s.deep_sleep_idle_ms.unwrap_or(60_000),
+        );
+        self.drive_power(self.policy.screen());
     }
 
     /// The head detectors' context from the screen, the wear, the settings and the requests
@@ -2057,6 +2165,8 @@ mod tests {
             companion_tcp_port: None,
             companion_bt: false,
             power_supply: crate::companion::battery::DEFAULT_ROOT.into(),
+            energy: false,
+            power_paths: PowerPaths::default(),
         };
         let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
         (daemon, hub)

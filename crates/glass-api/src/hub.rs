@@ -59,6 +59,9 @@ pub mod settings_rules {
     pub const HEAD_WAKE_ANGLE_MAX: f32 = 40.0;
     pub const SCREEN_TIMEOUT_MIN_MS: u32 = 3_000;
     pub const SCREEN_TIMEOUT_MAX_MS: u32 = 600_000;
+    /// Idle after screen-off before the energy policy suspends to RAM (`deep_sleep_idle_ms`).
+    pub const DEEP_SLEEP_IDLE_MIN_MS: u32 = 5_000;
+    pub const DEEP_SLEEP_IDLE_MAX_MS: u32 = 1_800_000;
 
     /// The defaults of docs/api.md ("Settings").
     pub fn defaults() -> Settings {
@@ -77,6 +80,12 @@ pub mod settings_rules {
             // Default UI language: English (matches omg_protocol::Locale::DEFAULT on the
             // companion). The launcher's first-run picker and the companion SetLocale change it.
             locale: Some(Locale::En as i32),
+            // Energy policy on by default (blank/brightness/cpufreq/runtime-PM, all reversible);
+            // deep sleep (suspend-to-RAM) off by default until resume is validated on the device
+            // (docs/api.md "Energy policy"; glass-kernel docs/model-b-energy.md open item 3).
+            power_saver: Some(true),
+            deep_sleep_enabled: Some(false),
+            deep_sleep_idle_ms: Some(60_000),
             snapshot: false,
         }
     }
@@ -112,6 +121,16 @@ pub mod settings_rules {
         }
         if let Some(v) = change.airplane_mode {
             current.airplane_mode = Some(v);
+        }
+        if let Some(v) = change.power_saver {
+            current.power_saver = Some(v);
+        }
+        if let Some(v) = change.deep_sleep_enabled {
+            current.deep_sleep_enabled = Some(v);
+        }
+        if let Some(v) = change.deep_sleep_idle_ms {
+            current.deep_sleep_idle_ms =
+                Some(v.clamp(DEEP_SLEEP_IDLE_MIN_MS, DEEP_SLEEP_IDLE_MAX_MS));
         }
         // Only a known, supported locale is accepted; LOCALE_UNSPECIFIED and any unknown value
         // leave the current one untouched (so a client can clear-less update without resetting
@@ -1184,6 +1203,51 @@ mod tests {
         assert_eq!(cur.wifi_enabled, Some(true));
         assert_eq!(cur.bluetooth_enabled, Some(false));
         assert_eq!(cur.airplane_mode, Some(true));
+    }
+
+    #[test]
+    fn energy_policy_settings_defaults_and_clamp() {
+        let d = settings_rules::defaults();
+        // Policy on by default, deep sleep off (safe default until resume is validated).
+        assert_eq!(d.power_saver, Some(true));
+        assert_eq!(d.deep_sleep_enabled, Some(false));
+        assert_eq!(d.deep_sleep_idle_ms, Some(60_000));
+        // The idle window is clamped to its range.
+        let mut cur = d;
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                deep_sleep_enabled: Some(true),
+                deep_sleep_idle_ms: Some(1), // below the minimum
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.deep_sleep_enabled, Some(true));
+        assert_eq!(
+            cur.deep_sleep_idle_ms,
+            Some(settings_rules::DEEP_SLEEP_IDLE_MIN_MS)
+        );
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                deep_sleep_idle_ms: Some(u32::MAX),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cur.deep_sleep_idle_ms,
+            Some(settings_rules::DEEP_SLEEP_IDLE_MAX_MS)
+        );
+        // power_saver merges independently.
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                power_saver: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.power_saver, Some(false));
+        assert_eq!(cur.deep_sleep_enabled, Some(true));
     }
 
     #[test]

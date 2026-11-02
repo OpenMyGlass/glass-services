@@ -61,6 +61,17 @@ pub fn encode(s: &Settings) -> String {
     );
     out += &format!("airplane_mode={}\n", b(s.airplane_mode, d.airplane_mode));
     out += &format!("locale={}\n", locale_code(s.locale.or(d.locale)));
+    out += &format!("power_saver={}\n", b(s.power_saver, d.power_saver));
+    out += &format!(
+        "deep_sleep_enabled={}\n",
+        b(s.deep_sleep_enabled, d.deep_sleep_enabled)
+    );
+    out += &format!(
+        "deep_sleep_idle_ms={}\n",
+        s.deep_sleep_idle_ms
+            .or(d.deep_sleep_idle_ms)
+            .unwrap_or(60_000)
+    );
     out
 }
 
@@ -113,6 +124,9 @@ pub fn decode(text: &str) -> Settings {
             "bluetooth_enabled" => change.bluetooth_enabled = flag(),
             "airplane_mode" => change.airplane_mode = flag(),
             "locale" => change.locale = locale_from_code(v),
+            "power_saver" => change.power_saver = flag(),
+            "deep_sleep_enabled" => change.deep_sleep_enabled = flag(),
+            "deep_sleep_idle_ms" => change.deep_sleep_idle_ms = v.parse().ok(),
             _ => {}
         }
     }
@@ -236,9 +250,30 @@ mod tests {
             "bluetooth_enabled=false",
             "airplane_mode=false",
             "locale=en",
+            "power_saver=true",
+            "deep_sleep_enabled=false",
+            "deep_sleep_idle_ms=60000",
         ] {
             assert!(t.lines().any(|l| l == k), "{k} in {t}");
         }
+    }
+
+    #[test]
+    fn energy_policy_settings_round_trip() {
+        let s = decode("power_saver=false\ndeep_sleep_enabled=true\ndeep_sleep_idle_ms=120000\n");
+        assert_eq!(s.power_saver, Some(false));
+        assert_eq!(s.deep_sleep_enabled, Some(true));
+        assert_eq!(s.deep_sleep_idle_ms, Some(120_000));
+        // Out-of-range idle is clamped through the merge rules.
+        let s = decode("deep_sleep_idle_ms=1\n");
+        assert_eq!(
+            s.deep_sleep_idle_ms,
+            Some(settings_rules::DEEP_SLEEP_IDLE_MIN_MS)
+        );
+        // Defaults when absent.
+        let d = settings_rules::defaults();
+        assert_eq!(decode("").power_saver, d.power_saver);
+        assert_eq!(decode("").deep_sleep_enabled, d.deep_sleep_enabled);
     }
 
     #[test]

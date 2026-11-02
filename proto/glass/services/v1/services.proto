@@ -140,7 +140,7 @@ message Welcome {
   uint32 api_version = 1;                    // the version this session uses: min(client, service)
   string service_version = 2;
   repeated string capabilities = 3;          // "touchpad", "head", "wear", "wink", "screen", "button-camera", ...,
-                                             // "radio", "dictation", "companion", "mock" (docs/api.md)
+                                             // "radio", "power", "dictation", "companion", "mock" (docs/api.md)
 }
 
 enum ErrorCode {
@@ -301,6 +301,15 @@ message Settings {
   optional bool bluetooth_enabled = 8;       // default false
   optional bool airplane_mode = 9;           // default false: all radios off, prior wishes kept
   optional Locale locale = 10;               // UI language (it/en/fr/es); default en (LOCALE_EN)
+  // Energy policy (Model B / plain Linux; "power" capability). glassd owns the idle -> low-power
+  // state machine: it drops the cpufreq profile and peripheral runtime PM when idle, dims the
+  // panel brightness with the screen, and -- when deep_sleep_enabled -- lets the kernel suspend
+  // to RAM after a longer idle (the Android wakelock path: release the glassd wakelock + write
+  // "mem" to /sys/power/state). All best effort; a missing sysfs path is logged, never fatal. On
+  // Android the framework owns power, so glassd neither advertises "power" nor acts on these.
+  optional bool power_saver = 11;            // default true: run the energy policy (blank/brightness/cpufreq/runtime-PM)
+  optional bool deep_sleep_enabled = 12;     // default false: also let the system suspend-to-RAM when idle
+  optional uint32 deep_sleep_idle_ms = 13;   // 5000 to 1800000; idle after screen-off before suspend; default 60000
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 

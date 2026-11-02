@@ -551,7 +551,7 @@ impl Daemon {
             }),
             None => settings_rules::defaults(),
         };
-        let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(15_000));
+        let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(120_000));
         let (glasshub, camera_dev, power_dev, imu) = if opts.mock {
             (None, None, None, None)
         } else {

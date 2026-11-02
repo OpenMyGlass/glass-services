@@ -27,6 +27,8 @@ const NO_HARDWARE: &[&str] = &[
     "none",
     "--radio",
     "off",
+    "--power",
+    "off",
 ];
 /// Handshake timeout for the integration tests (slow CI runners).
 const HANDSHAKE: Duration = Duration::from_secs(20);
@@ -159,6 +161,41 @@ fn tap_on_stdin_reaches_the_focus_holder() {
     m.send("swipe forward 2");
     let g = c.recv_until(T, |f| gesture(f).is_some()).unwrap().unwrap();
     assert_eq!(gesture(&g), Some((GestureKind::SwipeForward, 2)));
+}
+
+#[test]
+fn energy_policy_capability_and_sleep_wake_with_the_policy_active() {
+    // --mock runs the energy policy on its recording back end (it never writes the host's power
+    // sysfs), so the `power` capability is advertised and sleep/wake drive it without trouble.
+    let mut m = Mock::start("energy");
+    let mut c = m.client(&[Topic::Gesture, Topic::Screen, Topic::Settings]);
+    assert!(c.has_capability("power"));
+    // Enabling deep sleep with a short idle window is accepted and clamped to the minimum.
+    let s = set_settings(
+        &mut c,
+        Settings {
+            deep_sleep_enabled: Some(true),
+            deep_sleep_idle_ms: Some(1),
+            power_saver: Some(true),
+            ..Default::default()
+        },
+    );
+    assert_eq!(s.deep_sleep_enabled, Some(true));
+    assert_eq!(
+        s.deep_sleep_idle_ms,
+        Some(glass_api::hub::settings_rules::DEEP_SLEEP_IDLE_MIN_MS)
+    );
+    // The screen policy still blanks and wakes with the energy policy driving alongside it.
+    focused(&mut c);
+    m.send("swipe down 2");
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(
+        screen(&f),
+        Some((Screen::Off, "two-finger-swipe-down".into()))
+    );
+    m.send("tap");
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "tap".into())));
 }
 
 #[test]
@@ -574,7 +611,8 @@ fn fake_glasshub_camera_and_touchpad_sysfs() {
     for cap in ["wear", "wink", "button-camera", "screen"] {
         assert!(cl.has_capability(cap), "{cap}");
     }
-    for cap in ["mock", "touchpad", "button-power", "hinge"] {
+    // `--power off` (via NO_HARDWARE): the energy policy is gated off, so no `power` capability.
+    for cap in ["mock", "touchpad", "button-power", "hinge", "power"] {
         assert!(!cl.has_capability(cap), "{cap}");
     }
     let read = |f: &str| std::fs::read_to_string(hub.join(f)).unwrap();

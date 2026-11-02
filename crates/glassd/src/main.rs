@@ -63,6 +63,17 @@ usage: glassd [options]
   --companion-bt <on|off> advertise and accept the Bluetooth RFCOMM companion link (needs the
                           linux-bt build feature; default: on when built with it)
   --power-supply <dir>    where to read the battery (default: /sys/class/power_supply)
+  --power <on|off>        run the Model B energy policy: when idle, eco cpufreq + dimmer panel +
+                          peripheral runtime-PM, and (deep_sleep_enabled setting) suspend-to-RAM
+                          (default: on on Linux; off on Android, where the framework owns power)
+  --power-brightness <path|none>
+                          panel brightness sysfs file the energy policy dims (default
+                          /sys/devices/platform/omapdss/manager2/panel-notle-dpi/brightness)
+  --cpu-tune <name>       the cpufreq helper to run for the eco/balanced profiles (on PATH;
+                          default omg-tune.sh)
+  --power-wakeup <dir>    a device directory whose power/wakeup is armed before suspend
+                          (repeatable; default: none — most wake sources are armed by their
+                          drivers)
   --peer-check <on|off>   check each peer's uid (default: on on Android, where the socket
                           is 0666; off elsewhere unless --allow-* is given). Root and
                           system (1000) are always allowed
@@ -144,6 +155,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         companion_tcp_port: Some(glassd::companion::transport::DEFAULT_TCP_PORT),
         companion_bt: cfg!(feature = "linux-bt"),
         power_supply: glassd::companion::battery::DEFAULT_ROOT.into(),
+        // On Android (route 1) the framework owns power; on plain Linux (Model B) glassd runs
+        // the energy policy.
+        energy: !cfg!(target_os = "android"),
+        power_paths: glassd::power::PowerPaths::default(),
     };
     let mut peer_check = None;
     let mut allow_uids = Vec::new();
@@ -258,6 +273,21 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                 }
             }
             "--power-supply" => o.power_supply = PathBuf::from(value("--power-supply")?),
+            "--power" => {
+                o.energy = match value("--power")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--power: unknown value {v:?}")),
+                }
+            }
+            "--power-brightness" => {
+                o.power_paths.brightness = path_or_none(value("--power-brightness")?)
+            }
+            "--cpu-tune" => o.power_paths.cpu_tune = value("--cpu-tune")?,
+            "--power-wakeup" => o
+                .power_paths
+                .wakeup
+                .push(PathBuf::from(value("--power-wakeup")?)),
             "--allow-package" => allow_packages.push(value("--allow-package")?),
             "--allow-uid" => {
                 let v = value("--allow-uid")?;

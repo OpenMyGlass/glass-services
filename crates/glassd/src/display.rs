@@ -16,6 +16,12 @@ use std::path::{Path, PathBuf};
 /// Turns the panel on, dims it, or turns it off.
 pub trait Display {
     fn set(&mut self, screen: Screen);
+
+    /// Forget the cached blank state, so the next [`Display::set`] re-issues the ioctl even if it
+    /// matches the last requested value. Called after a suspend/resume cycle, where the kernel may
+    /// have powered the panel/DSS down and back: it guarantees the display is re-driven on the
+    /// next wake rather than skipped as "unchanged" (defends the Model B bring-up). Default: none.
+    fn invalidate(&mut self) {}
 }
 
 /// Does nothing but log the requested state.
@@ -106,6 +112,10 @@ impl Display for FbDisplay {
             }
             Err(e) => crate::warn!("FBIOBLANK {arg} on {}: {e}", self.path.display()),
         }
+    }
+
+    fn invalidate(&mut self) {
+        self.current = None;
     }
 }
 

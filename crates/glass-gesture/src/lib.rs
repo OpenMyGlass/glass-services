@@ -655,7 +655,11 @@ impl Recognizer {
         let displacement = self.cum.0 / self.width();
         let last = self.last_scroll.map_or(0.0, |s| s.displacement);
         let delta = displacement - last;
-        if delta == 0.0 {
+        // Coalesce: hold back until the net movement since the last reported frame clears the
+        // noise floor (config in device units, compared here in device units = delta * width).
+        // This keeps `last_scroll` unchanged so the unreported movement accumulates, instead of
+        // emitting one frame per raw sensor delta (jitter stream / audio buzz).
+        if delta.abs() * self.width() < self.cfg.scroll_min_step {
             return;
         }
         let s = Scroll {
@@ -767,6 +771,14 @@ impl Recognizer {
 
     /// The swipe at the end of a scroll (touchpad-gestures.md §4.3), if any.
     fn classify(&self, t: u64, dir: Option<Dir>) -> Option<Dir> {
+        // Hysteresis / commit gate: leaving the tap radius starts a scroll, but a discrete swipe
+        // fires only once the finger has really travelled (dominant-axis total from touch-down).
+        // A short wobble just past the slop scrolls a little and lifts without a swipe — in
+        // particular it no longer produces an accidental vertical swipe, which has no velocity
+        // gate of its own.
+        if self.cum.0.abs().max(self.cum.1.abs()) < self.cfg.swipe_min_travel {
+            return None;
+        }
         let (dx, dy) = (self.cum.0 - self.entry.0, self.cum.1 - self.entry.1);
         match self.scroll_fingers {
             1 => {}

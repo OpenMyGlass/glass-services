@@ -358,6 +358,13 @@ impl Companion {
         self.on_active(move |l| l.radio_state_changed(radios.clone()))
     }
 
+    /// The UI language changed on the Glass: keep the reported device state in step and tell the
+    /// live companion (a no-op on the active link when it was the companion's own `SetLocale`).
+    pub fn locale_changed(&mut self, locale: Locale) -> Vec<Event> {
+        self.device.locale = locale;
+        self.on_active(move |l| l.locale_changed(locale))
+    }
+
     /// The owner picked a notification action (or dismissed it) on the Glass: relay it.
     pub fn notification_action(&mut self, key: String, choice: NotificationChoice) -> Vec<Event> {
         self.on_active(move |l| l.notification_action(key.clone(), choice))

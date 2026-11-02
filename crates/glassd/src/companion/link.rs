@@ -255,6 +255,22 @@ impl Link {
         }
     }
 
+    /// The UI language changed on the Glass (e.g. the launcher's first-run picker): report it to
+    /// the companion so the phone app follows. No-op when it already matches, which also means a
+    /// locale the companion itself just pushed (`SetLocale` already set `device.locale`) is not
+    /// echoed back.
+    pub fn locale_changed(&mut self, locale: Locale) -> Vec<Out> {
+        if self.device.locale == locale {
+            return Vec::new();
+        }
+        self.device.locale = locale;
+        if self.is_running() {
+            vec![Out::Send(Frame::LocaleChanged(LocaleChanged { locale }))]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The radio state changed on the Glass: report it to the companion.
     pub fn radio_state_changed(&mut self, radios: RadioState) -> Vec<Out> {
         self.device.radios = Some(radios.clone());

@@ -37,12 +37,37 @@ pub struct Config {
     pub forward_is_positive_x: bool,
     /// `true` if "down" is increasing raw Y. Stock: +Y is down (touchpad-gestures.md §3).
     pub down_is_positive_y: bool,
-    /// Tap radius in device units. Stock uses Android's scaled touch slop (8 dp) in the
-    /// touchpad's raw units (touchpad-gestures.md §4.2). **[device]** the density is unknown;
-    /// 12 assumes 1.5 units per dp. Provisional.
+    /// Tap radius in device units: a contact that never leaves a circle of this radius around
+    /// its touch-down point is a tap (or a long press), never a scroll/swipe. Stock used
+    /// Android's scaled touch slop (8 dp) in raw units (touchpad-gestures.md §4.2).
+    ///
+    /// **[device] Over-sensitivity fix (2026-11-02):** the owner found clean taps registering as
+    /// scrolls/swipes. The old default (12) was far too tight on the real `sensor00fn11` pad,
+    /// whose X range is ~0..1366 (device-tests 2026-10-31): 12 units is only ~0.9 % of the pad
+    /// width, so the small sideways wobble of a normal tap crossed it and started a scroll. 24
+    /// (~1.8 % of a 1366-wide pad, ~2.4 % of the 1000-wide test pad) keeps an ordinary tap a tap
+    /// while staying far below the hundreds of units a deliberate swipe travels. Provisional:
+    /// re-tune on device (glassd `--tap-slop`).
     pub touch_slop: f32,
     /// Three fingers may move this many times the slop and still tap (§4.2: 2).
     pub three_finger_slop_factor: f32,
+    /// Smallest net contact travel, in device units, before a scroll is reported as a discrete
+    /// swipe gesture. Measured from touch-down along the dominant axis. It is the hysteresis
+    /// band above [`touch_slop`](Self::touch_slop): leaving the tap radius ([`touch_slop`], 24)
+    /// starts a *scroll*, but a *swipe* gesture only fires once the finger has actually travelled
+    /// this far (40). Between the two, a short wobble past the slop scrolls a little and lifts
+    /// without spraying a SwipeForward/Backward/Up/Down — which previously fired on any tiny
+    /// beyond-slop move, especially vertically (no velocity gate there). A deliberate swipe
+    /// clears 40 units (~3 % of the pad) easily. Provisional; glassd `--swipe-min-travel`.
+    pub swipe_min_travel: f32,
+    /// Scroll coalescing / noise floor, in device units: a new `Scroll` frame is emitted only
+    /// once the net displacement has changed by at least this much since the last one. It stops
+    /// the recognizer spraying one `Scroll` per raw sensor delta (the pad reports at a high rate)
+    /// and silences the stream a resting/slightly-jittering finger produced — the source of the
+    /// launcher's audio-feedback buzz. 4 units is below a deliberate drag's per-frame step (so
+    /// dragging stays smooth) but above typical 1-3 unit sensor jitter. Provisional;
+    /// glassd `--scroll-min-step`.
+    pub scroll_min_step: f32,
     /// Hold time for a long press (§4.2: Android's default 500 ms).
     pub long_press_ms: u64,
     /// A forward swipe needs an X release velocity above this, in device units per ms
@@ -75,8 +100,10 @@ impl Default for Config {
             pressure_max: 255,
             forward_is_positive_x: true,
             down_is_positive_y: true,
-            touch_slop: 12.0,
+            touch_slop: 24.0,
             three_finger_slop_factor: 2.0,
+            swipe_min_travel: 40.0,
+            scroll_min_step: 4.0,
             long_press_ms: 500,
             forward_min_velocity: 0.7,
             backward_min_velocity: 1.0,

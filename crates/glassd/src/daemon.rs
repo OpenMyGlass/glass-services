@@ -17,9 +17,9 @@ use glass_api::hub::settings_rules;
 use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
     CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
-    CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, ScreenState,
-    ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink, client_frame,
-    dictation_state, service_frame,
+    CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, Locale,
+    ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
+    client_frame, dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -63,6 +63,13 @@ pub struct Options {
     pub invert_x: bool,
     /// "Down" is decreasing raw Y.
     pub invert_y: bool,
+    /// Gesture-recognizer threshold overrides for on-device fine-tuning (all in touchpad device
+    /// units; `None` keeps the [`glass_gesture::Config`] default). See the recognizer config for
+    /// what each means; exposed as flags so the tap/swipe feel can be re-tuned on the real pad
+    /// without rebuilding.
+    pub tap_slop: Option<f32>,
+    pub swipe_min_travel: Option<f32>,
+    pub scroll_min_step: Option<f32>,
     pub screen_off_input: ScreenOffInput,
     /// The glasshub sysfs directory (`None`: no glasshub).
     pub glasshub: Option<PathBuf>,
@@ -222,6 +229,28 @@ fn sync_attr(
 
 /// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
 /// off, keeping the per-radio wishes so they are restored when it is turned off.
+/// Maps the companion's locale to the services `Locale` enum (both cover the same it/en/fr/es
+/// set; see `omg_protocol::Locale` and the `Locale` proto enum).
+fn proto_locale(l: omg_protocol::Locale) -> Locale {
+    match l {
+        omg_protocol::Locale::It => Locale::It,
+        omg_protocol::Locale::En => Locale::En,
+        omg_protocol::Locale::Fr => Locale::Fr,
+        omg_protocol::Locale::Es => Locale::Es,
+    }
+}
+
+/// Maps a stored services `Settings.locale` value back to the companion's locale, falling back
+/// to `omg_protocol::Locale::DEFAULT` (en) for unset/unknown values.
+fn companion_locale(v: Option<i32>) -> omg_protocol::Locale {
+    match v.and_then(|v| Locale::try_from(v).ok()) {
+        Some(Locale::It) => omg_protocol::Locale::It,
+        Some(Locale::Fr) => omg_protocol::Locale::Fr,
+        Some(Locale::Es) => omg_protocol::Locale::Es,
+        _ => omg_protocol::Locale::En,
+    }
+}
+
 fn effective_radio(s: &Settings) -> (bool, bool) {
     let airplane = s.airplane_mode.unwrap_or(false);
     (
@@ -490,6 +519,15 @@ impl Daemon {
         };
         cfg.forward_is_positive_x = !opts.invert_x;
         cfg.down_is_positive_y = !opts.invert_y;
+        if let Some(v) = opts.tap_slop {
+            cfg.touch_slop = v;
+        }
+        if let Some(v) = opts.swipe_min_travel {
+            cfg.swipe_min_travel = v;
+        }
+        if let Some(v) = opts.scroll_min_step {
+            cfg.scroll_min_step = v;
+        }
         let store = opts.state_dir.as_ref().map(SettingsStore::new);
         let settings = match &store {
             Some(st) => st.load().unwrap_or_else(|e| {
@@ -535,7 +573,11 @@ impl Daemon {
                 .state_dir
                 .clone()
                 .unwrap_or_else(crate::settings_store::default_state_dir);
-            let mut device = companion::link::DeviceState::default();
+            // Report the persisted UI language to the companion from the start.
+            let mut device = companion::link::DeviceState {
+                locale: companion_locale(settings.locale),
+                ..Default::default()
+            };
             if let Some((percent, charging)) = companion::battery::read(&opts.power_supply) {
                 device.battery_percent = Some(percent);
                 device.charging = Some(charging);
@@ -1425,9 +1467,16 @@ impl Daemon {
                     transport,
                 } => self.companion_connected(name, capabilities, transport),
                 E::Disconnected => self.companion_disconnected(),
-                // The link already acked LocaleChanged; delivering the locale to the launcher UI
-                // is glass-apps' concern (the services Settings has no locale field yet).
-                E::ApplyLocale(l) => info!("companion: locale -> {}", l.code()),
+                // The link already acked LocaleChanged. Persist the chosen language in Settings
+                // and tell TOPIC_SETTINGS subscribers, so the launcher i18n picks it up the same
+                // way as any other setting (it reads Settings.locale from the snapshot).
+                E::ApplyLocale(l) => {
+                    info!("companion: locale -> {}", l.code());
+                    self.apply_settings_change(Settings {
+                        locale: Some(proto_locale(l) as i32),
+                        ..Default::default()
+                    });
+                }
                 E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
                     to_proto_notification(n),
                 )),
@@ -1808,6 +1857,15 @@ impl Daemon {
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
         self.apply_radio(s);
+        // Keep the companion's reported UI language in step (idempotent; pushes LocaleChanged to
+        // the phone only when the value actually changed and it was not the companion's own set).
+        if s.locale.is_some() {
+            let events = match &mut self.companion {
+                Some(c) => c.locale_changed(companion_locale(s.locale)),
+                None => Vec::new(),
+            };
+            self.companion_events(events);
+        }
         if let Some(st) = &self.store
             && let Err(e) = st.save(s)
         {
@@ -1979,6 +2037,9 @@ mod tests {
             device_name: TOUCHPAD_NAME.into(),
             invert_x: false,
             invert_y: false,
+            tap_slop: None,
+            swipe_min_travel: None,
+            scroll_min_step: None,
             screen_off_input: ScreenOffInput::Touches,
             glasshub: Some(hub.clone()),
             gaze_params: None,
@@ -2006,6 +2067,21 @@ mod tests {
         s.on_head_detection_enabled = Some(true);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
+    }
+
+    #[test]
+    fn locale_maps_round_trip_between_the_proto_and_the_companion() {
+        for l in [Locale::It, Locale::En, Locale::Fr, Locale::Es] {
+            let round = proto_locale(companion_locale(Some(l as i32)));
+            assert_eq!(round, l);
+        }
+        // Unset / unknown fall back to the companion default (en).
+        assert_eq!(companion_locale(None), omg_protocol::Locale::En);
+        assert_eq!(
+            companion_locale(Some(Locale::Unspecified as i32)),
+            omg_protocol::Locale::En
+        );
+        assert_eq!(companion_locale(Some(12345)), omg_protocol::Locale::En);
     }
 
     #[test]

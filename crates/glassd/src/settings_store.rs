@@ -4,7 +4,7 @@
 //! values are clamped as for `SetSettings`.
 
 use glass_api::hub::settings_rules;
-use glass_api::proto::Settings;
+use glass_api::proto::{Locale, Settings};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -60,7 +60,31 @@ pub fn encode(s: &Settings) -> String {
         b(s.bluetooth_enabled, d.bluetooth_enabled)
     );
     out += &format!("airplane_mode={}\n", b(s.airplane_mode, d.airplane_mode));
+    out += &format!("locale={}\n", locale_code(s.locale.or(d.locale)));
     out
+}
+
+/// The ISO 639-1 code (`it`/`en`/`fr`/`es`) stored for a locale field, defaulting to `en`.
+fn locale_code(v: Option<i32>) -> &'static str {
+    match v.and_then(|v| Locale::try_from(v).ok()) {
+        Some(Locale::It) => "it",
+        Some(Locale::Fr) => "fr",
+        Some(Locale::Es) => "es",
+        // Unspecified / unknown / En all persist as the default "en".
+        _ => "en",
+    }
+}
+
+/// Parses a stored locale code into the proto enum value; `None` for anything unsupported.
+fn locale_from_code(v: &str) -> Option<i32> {
+    let l = match v.to_ascii_lowercase().as_str() {
+        "it" => Locale::It,
+        "en" => Locale::En,
+        "fr" => Locale::Fr,
+        "es" => Locale::Es,
+        _ => return None,
+    };
+    Some(l as i32)
 }
 
 /// The defaults, with the values found in `text` merged in (clamped).
@@ -88,6 +112,7 @@ pub fn decode(text: &str) -> Settings {
             "wifi_enabled" => change.wifi_enabled = flag(),
             "bluetooth_enabled" => change.bluetooth_enabled = flag(),
             "airplane_mode" => change.airplane_mode = flag(),
+            "locale" => change.locale = locale_from_code(v),
             _ => {}
         }
     }
@@ -210,9 +235,31 @@ mod tests {
             "wifi_enabled=false",
             "bluetooth_enabled=false",
             "airplane_mode=false",
+            "locale=en",
         ] {
             assert!(t.lines().any(|l| l == k), "{k} in {t}");
         }
+    }
+
+    #[test]
+    fn locale_round_trips_and_rejects_unsupported() {
+        use glass_api::proto::Locale;
+        let s = decode("locale=it\n");
+        assert_eq!(s.locale, Some(Locale::It as i32));
+        assert_eq!(decode("locale=FR\n").locale, Some(Locale::Fr as i32));
+        // Unsupported or malformed codes keep the default (en).
+        let d = settings_rules::defaults();
+        assert_eq!(decode("locale=de\n").locale, d.locale);
+        assert_eq!(decode("locale=\n").locale, d.locale);
+        assert_eq!(d.locale, Some(Locale::En as i32));
+        // Full file round trip.
+        let dir = dir("locale");
+        let st = SettingsStore::new(&dir);
+        let mut want = settings_rules::defaults();
+        want.locale = Some(Locale::Es as i32);
+        st.save(&want).unwrap();
+        assert_eq!(st.load().unwrap().locale, Some(Locale::Es as i32));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

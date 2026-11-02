@@ -399,12 +399,24 @@ fn open_glasshub(opts: &Options) -> Option<GlassHub> {
         root.display(),
         hub.version().unwrap_or_else(|e| format!("unreadable: {e}"))
     );
+    let gaze_found = opts
+        .gaze_params
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
     let thresholds = opts
         .gaze_params
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|t| Thresholds::parse_params(&t))
         .unwrap_or_default();
+    // If gaze_params is absent (likely on Model B) the wink detector keeps the firmware's
+    // built-in thresholds; log what we have, since un-tuned thresholds are a prime suspect
+    // for winks never being detected.
+    info!(
+        "OMGB-SENSOR: wink thresholds: gaze_params_found={gaze_found} wink_min={:?} wink_max={:?} (None = firmware default)",
+        thresholds.wink_min, thresholds.wink_max
+    );
     if let Err(e) = hub
         .set_on_head_detection(false)
         .and_then(|()| hub.apply_thresholds(&thresholds))
@@ -1960,11 +1972,14 @@ impl Daemon {
     fn read_wink(&mut self) {
         let Some(h) = &mut self.glasshub else { return };
         match h.ack_wink() {
-            // 0: no wink pending (a spurious wake, or already acknowledged).
-            Ok(0) => {}
-            Ok(_) => {
-                info!("OMGB-SENSOR: glasshub wink interrupt acknowledged");
-                self.wink(now().mono_us)
+            // The wink sysfs fd was notified (the poll woke on it): log the raw value even
+            // when 0, so the next run shows whether the MCU's wink interrupt fires at all
+            // (0 = poll woke but no wink pending — e.g. the detector never triggered).
+            Ok(n) => {
+                info!("OMGB-SENSOR: wink poll fired; ack_wink raw={n}");
+                if n != 0 {
+                    self.wink(now().mono_us)
+                }
             }
             Err(e) => self.drop_glasshub(&e.to_string()),
         }

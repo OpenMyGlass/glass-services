@@ -1648,6 +1648,11 @@ impl Daemon {
     fn apply_settings_change(&mut self, change: Settings) {
         let mut s = self.settings();
         settings_rules::merge(&mut s, &change);
+        // Make the merged settings current BEFORE applying them: settings_changed() runs
+        // sync_glasshub(), which reads self.settings() (= the hub's stored settings). Without
+        // this the sync saw the *old* settings and e.g. wink_enabled never reached the
+        // glasshub until a later timer tick (and could be missed entirely).
+        self.hub.set_settings_source(s.clone());
         self.settings_changed(&s);
         self.publish(service_frame::Body::Settings(s));
     }
@@ -1907,14 +1912,20 @@ impl Daemon {
         let pause = self.wear.hub_paused();
         let Some(h) = &self.glasshub else { return };
         let w = &mut self.hub_written;
-        let armed = sync_attr(&mut w.detection, detection, "on-head detection", |v| {
+        let det_changed = sync_attr(&mut w.detection, detection, "on-head detection", |v| {
             h.set_on_head_detection(v)
-        }) && detection;
-        sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
-        let resumed = sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v)) && !pause;
-        info!(
-            "OMGB-SENSOR: glasshub sync: on_head_detection={detection} wink={wink} pause={pause}"
-        );
+        });
+        let wink_changed = sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
+        let pause_changed = sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v));
+        let armed = det_changed && detection;
+        let resumed = pause_changed && !pause;
+        // Log only on an actual change (this is called every timer tick; logging every time
+        // floods kmsg and is useless).
+        if det_changed || wink_changed || pause_changed {
+            info!(
+                "OMGB-SENSOR: glasshub sync changed: on_head_detection={detection} wink={wink} pause={pause}"
+            );
+        }
         // The state may have changed while detection was off or the hub paused, without a
         // notification: read it again. (This ends: a second pass writes nothing.)
         if armed || resumed {

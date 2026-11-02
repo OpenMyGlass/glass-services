@@ -164,6 +164,27 @@ callback handled the current event or the sequence.
 | Two-finger swipe release window | both fingers must lift within 100 ms of each other | `TwoScrollState` |
 | Multi-pointer distance | mean of per-pointer deltas over the pointer ids present in both events | `Utils` |
 
+> **glassd deviation (over-sensitivity tuning, 2026-11-02).** The table above is the stock GDK
+> reference. `glassd`'s recognizer intentionally departs from it to fix the owner's complaint that
+> the real `sensor00fn11` pad is too sensitive (clean taps registering as scrolls/swipes, a resting
+> finger spraying movement events). The live values are the named fields of
+> `glass_gesture::Config` (all re-tunable on device via `glassd --tap-slop` /
+> `--swipe-min-travel` / `--scroll-min-step`):
+> - **Touch slop 24 device units** (was a provisional 12). On the measured pad (X range ~0..1366)
+>   12 units was ~0.9 % of the width, so a tap's small sideways wobble crossed it. 24 keeps an
+>   ordinary tap a tap while staying far below a deliberate swipe.
+> - **Swipe commit distance (`swipe_min_travel`) 40 device units** — a *new* gate with no stock
+>   analogue. Leaving the tap radius still *starts a scroll*, but a discrete swipe gesture fires
+>   only once the contact has travelled this far along the dominant axis. This adds hysteresis
+>   above the slop and, in particular, stops a tiny beyond-slop move producing an accidental
+>   **vertical** swipe (which stock gates by nothing — no velocity threshold).
+> - **Scroll noise floor (`scroll_min_step`) 4 device units** — a new coalescing gate: a `Scroll`
+>   frame is emitted only after the net displacement has moved this far since the last one, instead
+>   of one frame per raw sensor delta. It silences finger jitter / the resting-finger stream (and
+>   the launcher audio buzz it drove) while leaving a deliberate drag smooth.
+>
+> The horizontal release-velocity, angle, long-press and two-finger-window rules are unchanged.
+
 ### 4.3 State machine (described in our own words) **[C]**
 
 Only events whose source is `SOURCE_TOUCHPAD` are considered, and only from the

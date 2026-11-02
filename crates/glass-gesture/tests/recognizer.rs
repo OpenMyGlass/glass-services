@@ -126,8 +126,13 @@ fn three_fingers_get_twice_the_slop() {
     };
     let d = c.touch_slop * 1.5;
     assert_eq!(gestures(&moved(3, d)), vec![(GestureKind::Tap, 3)]);
-    // One finger moving that far is no tap (it is a short vertical swipe).
-    assert_eq!(gestures(&moved(1, d)), vec![(GestureKind::SwipeDown, 1)]);
+    // One finger moving that far leaves the tap radius (slop); a deliberate slide past
+    // swipe_min_travel is a vertical swipe.
+    assert!(gestures(&moved(1, d)).is_empty());
+    assert_eq!(
+        gestures(&moved(1, c.swipe_min_travel + 20.0)),
+        vec![(GestureKind::SwipeDown, 1)]
+    );
     // Beyond 2x slop with three fingers: nothing at all, not even scroll.
     let out = moved(3, c.touch_slop * 2.0 + 5.0);
     assert!(gestures(&out).is_empty());
@@ -696,6 +701,112 @@ fn bare_report_never_ends_a_protocol_a_touch() {
     let out = Recognizer::new(c).feed(&s.take());
     assert_eq!(counts(&out), vec![(0, 1), (1, 0)], "{out:?}");
     assert_eq!(gestures(&out), vec![(GestureKind::Tap, 1)]);
+}
+
+// ---- over-sensitivity tuning (2026-11-02): tap vs swipe discrimination and scroll spam ----
+
+#[test]
+fn clean_tap_tolerates_wobble_within_the_slop() {
+    // A normal tap wobbles a little; as long as it stays inside the tap radius it is a Tap,
+    // with no scroll at all. (Regression: the old 12-unit slop turned this into a swipe.)
+    let c = cfg();
+    assert!(c.touch_slop >= 20.0);
+    let out = run(&c, |s| {
+        s.frame(&[(0.0, 0.0)]);
+        s.advance_ms(30);
+        s.frame(&[(0.0, 18.0)]);
+        s.advance_ms(30);
+        s.frame(&[(15.0, -10.0)]);
+        s.advance_ms(30);
+        s.lift();
+    });
+    assert_eq!(gestures(&out), vec![(GestureKind::Tap, 1)]);
+    assert!(scrolls(&out).is_empty(), "{out:?}");
+}
+
+#[test]
+fn short_slide_past_the_slop_scrolls_but_is_not_a_swipe() {
+    // Between the tap radius and swipe_min_travel: the finger leaves the slop (so it scrolls a
+    // little) but does not travel far enough to commit to a discrete swipe gesture. This is the
+    // hysteresis band, and it also kills the old accidental vertical swipe on a tiny move.
+    let c = cfg();
+    let d = (c.touch_slop + c.swipe_min_travel) / 2.0; // comfortably between the two
+    for dir in [
+        Direction::Forward,
+        Direction::Down,
+        Direction::Up,
+        Direction::Backward,
+    ] {
+        let out = run(&c, |s| {
+            s.swipe(dir, 1, d, 80);
+        });
+        assert!(gestures(&out).is_empty(), "{dir:?} -> {out:?}");
+    }
+    // A horizontal one did produce scroll frames (it left the tap radius).
+    let out = run(&c, |s| s.swipe(Direction::Forward, 1, d, 80));
+    assert!(!scrolls(&out).is_empty(), "{out:?}");
+}
+
+#[test]
+fn a_deliberate_swipe_past_the_commit_distance_is_recognized() {
+    let c = cfg();
+    let d = c.swipe_min_travel + 40.0;
+    // Vertical: no velocity gate, so even a slow one of this length is a swipe.
+    assert_eq!(
+        gestures(&run(&c, |s| s.swipe(Direction::Down, 1, d, 300))),
+        vec![(GestureKind::SwipeDown, 1)]
+    );
+    // Fast horizontal flick.
+    assert_eq!(
+        gestures(&run(&c, |s| s.swipe(Direction::Forward, 1, 300.0, 60))),
+        vec![(GestureKind::SwipeForward, 1)]
+    );
+}
+
+#[test]
+fn a_resting_jittery_finger_does_not_spray_scrolls_or_swipe() {
+    // Decisive move to start a scroll, then the finger rests and jitters +-1 unit (below the
+    // scroll noise floor) for a long time before lifting. The jitter must add no scroll frames
+    // and must not turn into a swipe (the release velocity is ~0).
+    let c = cfg();
+    let out = run(&c, |s| {
+        s.stroke(1, (0.0, 0.0), (60.0, 0.0), 40);
+        for i in 0..40 {
+            s.advance_ms(10);
+            s.frame(&[(if i % 2 == 0 { 61.0 } else { 59.0 }, 0.0)]);
+        }
+        s.lift();
+    });
+    let sc = scrolls(&out);
+    // Only the decisive move (and the closing frame) report; the jitter is coalesced away.
+    assert!(sc.len() <= 6, "scroll frames: {} ({out:?})", sc.len());
+    assert!(sc.last().unwrap().ended);
+    assert!(gestures(&out).is_empty(), "{out:?}");
+}
+
+#[test]
+fn scroll_coalescing_bounds_the_frame_count_at_a_high_report_rate() {
+    // At the sensor's full rate the pad reports many tiny deltas. Coalescing must bound the
+    // Scroll frames to roughly travel / scroll_min_step, not one per raw report.
+    let c = cfg();
+    let out = run(&c, |s| {
+        s.frame_ms = 2; // high report rate: a frame every 2 ms
+        s.drag(1, 200.0, 400); // 200 units over 400 ms => ~200 raw frames
+    });
+    let sc = scrolls(&out);
+    let raw_frames = 400 / 2; // report rate during the drag
+    let expected_steps = 200.0 / c.scroll_min_step; // ~50
+    assert!(
+        sc.len() >= 10 && (sc.len() as f32) < expected_steps * 1.6,
+        "scroll frames {} vs ~{expected_steps} (raw {raw_frames})",
+        sc.len()
+    );
+    assert!(
+        (sc.len() as i32) < raw_frames / 2,
+        "not coalesced: {}",
+        sc.len()
+    );
+    assert!(gestures(&out).is_empty(), "{out:?}");
 }
 
 #[test]

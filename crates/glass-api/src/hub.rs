@@ -53,7 +53,7 @@ pub enum Effect {
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
 pub mod settings_rules {
-    use crate::proto::Settings;
+    use crate::proto::{Locale, Settings};
 
     pub const HEAD_WAKE_ANGLE_MIN: f32 = 10.0;
     pub const HEAD_WAKE_ANGLE_MAX: f32 = 40.0;
@@ -74,6 +74,9 @@ pub mod settings_rules {
             wifi_enabled: Some(false),
             bluetooth_enabled: Some(false),
             airplane_mode: Some(false),
+            // Default UI language: English (matches omg_protocol::Locale::DEFAULT on the
+            // companion). The launcher's first-run picker and the companion SetLocale change it.
+            locale: Some(Locale::En as i32),
             snapshot: false,
         }
     }
@@ -109,6 +112,14 @@ pub mod settings_rules {
         }
         if let Some(v) = change.airplane_mode {
             current.airplane_mode = Some(v);
+        }
+        // Only a known, supported locale is accepted; LOCALE_UNSPECIFIED and any unknown value
+        // leave the current one untouched (so a client can clear-less update without resetting
+        // the language).
+        if let Some(v) = change.locale
+            && Locale::try_from(v).is_ok_and(|l| l != Locale::Unspecified)
+        {
+            current.locale = Some(v);
         }
         current.snapshot = false;
     }
@@ -1173,6 +1184,39 @@ mod tests {
         assert_eq!(cur.wifi_enabled, Some(true));
         assert_eq!(cur.bluetooth_enabled, Some(false));
         assert_eq!(cur.airplane_mode, Some(true));
+    }
+
+    #[test]
+    fn locale_defaults_to_en_and_merge_validates() {
+        use crate::proto::Locale;
+        let mut cur = settings_rules::defaults();
+        assert_eq!(cur.locale, Some(Locale::En as i32));
+        // A supported locale is applied.
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                locale: Some(Locale::It as i32),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.locale, Some(Locale::It as i32));
+        // LOCALE_UNSPECIFIED and unknown values are ignored (the current one is kept).
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                locale: Some(Locale::Unspecified as i32),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.locale, Some(Locale::It as i32));
+        settings_rules::merge(
+            &mut cur,
+            &Settings {
+                locale: Some(999),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cur.locale, Some(Locale::It as i32));
     }
 
     #[test]

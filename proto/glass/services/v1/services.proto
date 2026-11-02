@@ -272,6 +272,20 @@ message Button {
   uint64 timestamp_us = 3;
 }
 
+// UI locale. Scope is European Latin only (owner decision 2026-11-01): Italian, English,
+// French, Spanish — no RTL, one always-resident Latin font. The companion's language picker
+// pushes one of these over the link (SetLocale) and the launcher offers a first-run picker;
+// glassd persists it in Settings.locale, the launcher i18n reads it from the Settings snapshot
+// (GetState / TOPIC_SETTINGS). The codes are ISO 639-1 (it/en/fr/es) and match
+// omg_protocol::Locale on the companion side.
+enum Locale {
+  LOCALE_UNSPECIFIED = 0;                    // not set; treated as the default (en)
+  LOCALE_IT = 1;                             // Italiano
+  LOCALE_EN = 2;                             // English
+  LOCALE_FR = 3;                             // Français
+  LOCALE_ES = 4;                             // Español
+}
+
 message Settings {
   optional bool head_wake_enabled = 1;
   optional float head_wake_angle_deg = 2;    // 10 to 40, above the horizon; default 30
@@ -286,6 +300,7 @@ message Settings {
   optional bool wifi_enabled = 7;            // default false: Wi-Fi is off, brought up on demand
   optional bool bluetooth_enabled = 8;       // default false
   optional bool airplane_mode = 9;           // default false: all radios off, prior wishes kept
+  optional Locale locale = 10;               // UI language (it/en/fr/es); default en (LOCALE_EN)
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 

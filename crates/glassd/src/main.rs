@@ -15,6 +15,14 @@ usage: glassd [options]
   --device-name <name>    find the touchpad by input device name (default: sensor00fn11)
   --invert-x              forward is decreasing raw X
   --invert-y              down is decreasing raw Y
+  --tap-slop <units>      gesture tuning (touchpad device units): tap radius; a contact that
+                          stays within it is a tap, not a scroll/swipe (default 24)
+  --swipe-min-travel <units>
+                          how far a contact must travel before a scroll becomes a discrete
+                          swipe gesture (default 40)
+  --scroll-min-step <units>
+                          scroll noise floor: least movement between two Scroll frames; damps
+                          jitter and the per-report scroll stream (default 4)
   --screen-off-input <encoded|touches>
                           screen-off wake: the kernel's encoded frames only (Android early
                           suspend), or the recognizer on real touches (default: encoded on
@@ -85,6 +93,14 @@ fn source(v: String) -> Source {
     }
 }
 
+/// A gesture threshold in touchpad device units: a finite number greater than zero.
+fn gesture_units(name: &str, v: String) -> Result<f32, String> {
+    match v.parse::<f32>() {
+        Ok(n) if n.is_finite() && n > 0.0 => Ok(n),
+        _ => Err(format!("{name}: expected a positive number, got {v:?}")),
+    }
+}
+
 struct Parsed {
     opts: Options,
     verbose: bool,
@@ -99,6 +115,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         device_name: TOUCHPAD_NAME.into(),
         invert_x: false,
         invert_y: false,
+        tap_slop: None,
+        swipe_min_travel: None,
+        scroll_min_step: None,
         // Android builds run with early suspend, where the kernel sends encoded frames.
         screen_off_input: if cfg!(target_os = "android") {
             ScreenOffInput::Encoded
@@ -146,6 +165,19 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
             "--device-name" => o.device_name = value("--device-name")?,
             "--invert-x" => o.invert_x = true,
             "--invert-y" => o.invert_y = true,
+            "--tap-slop" => o.tap_slop = Some(gesture_units("--tap-slop", value("--tap-slop")?)?),
+            "--swipe-min-travel" => {
+                o.swipe_min_travel = Some(gesture_units(
+                    "--swipe-min-travel",
+                    value("--swipe-min-travel")?,
+                )?)
+            }
+            "--scroll-min-step" => {
+                o.scroll_min_step = Some(gesture_units(
+                    "--scroll-min-step",
+                    value("--scroll-min-step")?,
+                )?)
+            }
             "--screen-off-input" => {
                 o.screen_off_input = match value("--screen-off-input")?.as_str() {
                     "encoded" => ScreenOffInput::Encoded,

@@ -201,6 +201,8 @@ pub struct Daemon {
     /// `HeadRequest` wishes per client: (relative look-up, nudge).
     head_requests: BTreeMap<ClientId, (bool, bool)>,
     samples: Vec<Sample>,
+    /// IMU read batches so far (for the `OMGB-SENSOR:` liveness diagnostic).
+    imu_reads: u64,
     /// The companion link (Model B holds the phone link in glassd); `None` on Android/`--mock`.
     companion: Option<Companion>,
     /// The internal hub client the companion link registers as (the provider), so the launcher
@@ -381,16 +383,19 @@ fn open_glasshub(opts: &Options) -> Option<GlassHub> {
     let hub = match GlassHub::open(root) {
         Ok(Some(h)) => h,
         Ok(None) => {
-            info!("no glasshub at {}", root.display());
+            info!("OMGB-SENSOR: no glasshub at {}", root.display());
             return None;
         }
         Err(e) => {
-            warn!("cannot open the glasshub at {}: {e}", root.display());
+            warn!(
+                "OMGB-SENSOR: cannot open the glasshub at {}: {e}",
+                root.display()
+            );
             return None;
         }
     };
     info!(
-        "glasshub {} (firmware {})",
+        "OMGB-SENSOR: glasshub opened {} (firmware {})",
         root.display(),
         hub.version().unwrap_or_else(|e| format!("unreadable: {e}"))
     );
@@ -414,7 +419,10 @@ fn open_imu(opts: &Options) -> Option<Imu> {
     let dir = match glass_head::iio::find(root, glass_head::iio::IMU_NAME) {
         Ok(Some(d)) => d,
         Ok(None) => {
-            info!("no IIO device named {:?}", glass_head::iio::IMU_NAME);
+            info!(
+                "OMGB-SENSOR: no IIO device named {:?}",
+                glass_head::iio::IMU_NAME
+            );
             return None;
         }
         Err(e) => {
@@ -424,11 +432,15 @@ fn open_imu(opts: &Options) -> Option<Imu> {
     };
     match Imu::open(&dir, opts.iio_dev.clone()) {
         Ok(imu) => {
-            info!("IMU {} ({:?})", dir.display(), imu.calibration());
+            info!(
+                "OMGB-SENSOR: IMU opened {} ({:?})",
+                dir.display(),
+                imu.calibration()
+            );
             Some(imu)
         }
         Err(e) => {
-            warn!("cannot open the IMU at {}: {e}", dir.display());
+            warn!("OMGB-SENSOR: cannot open the IMU at {}: {e}", dir.display());
             None
         }
     }
@@ -730,6 +742,7 @@ impl Daemon {
             head: HeadService::default(),
             head_requests: BTreeMap::new(),
             samples: Vec::new(),
+            imu_reads: 0,
             companion,
             companion_provider: None,
             power_supply: opts.power_supply.clone(),
@@ -746,6 +759,17 @@ impl Daemon {
         d.sync_glasshub();
         d.read_don_doff();
         d.update_head();
+        // Sensor bring-up summary (grep OMGB-SENSOR in the kmsg log; needs -v).
+        info!(
+            "OMGB-SENSOR: bring-up: imu={} glasshub={} head_wake_enabled={} wink_enabled={} on_head_detection={} wear.on_head={} screen={:?}",
+            d.imu.is_some(),
+            d.glasshub.is_some(),
+            d.settings().head_wake_enabled.unwrap_or(false),
+            d.settings().wink_enabled.unwrap_or(false),
+            d.settings().on_head_detection_enabled.unwrap_or(false),
+            d.wear.on_head(),
+            d.policy.screen(),
+        );
         // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
         // off by default and a prior run's state does not leak in.
         let s = d.settings();
@@ -1888,6 +1912,9 @@ impl Daemon {
         }) && detection;
         sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
         let resumed = sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v)) && !pause;
+        info!(
+            "OMGB-SENSOR: glasshub sync: on_head_detection={detection} wink={wink} pause={pause}"
+        );
         // The state may have changed while detection was off or the hub paused, without a
         // notification: read it again. (This ends: a second pass writes nothing.)
         if armed || resumed {
@@ -1909,6 +1936,7 @@ impl Daemon {
         let Some(h) = &mut self.glasshub else { return };
         match h.read_don_doff() {
             Ok(Some(on)) => {
+                info!("OMGB-SENSOR: glasshub don_doff read: on_head={on}");
                 let u = self.wear.sensor(now().mono_us, on);
                 self.wear_update(u);
             }
@@ -1923,7 +1951,10 @@ impl Daemon {
         match h.ack_wink() {
             // 0: no wink pending (a spurious wake, or already acknowledged).
             Ok(0) => {}
-            Ok(_) => self.wink(now().mono_us),
+            Ok(_) => {
+                info!("OMGB-SENSOR: glasshub wink interrupt acknowledged");
+                self.wink(now().mono_us)
+            }
             Err(e) => self.drop_glasshub(&e.to_string()),
         }
     }
@@ -2040,6 +2071,19 @@ impl Daemon {
             return;
         }
         let samples = std::mem::take(&mut self.samples);
+        // Liveness: confirm samples actually flow from the IMU character device, and show the
+        // current pitch, every ~2 s (100 batches at 20 ms). Reveals a silent/stalled IMU.
+        self.imu_reads += 1;
+        if self.imu_reads <= 3 || self.imu_reads.is_multiple_of(100) {
+            let last = samples.last();
+            info!(
+                "OMGB-SENSOR: IMU read #{} ({} samples) accel={:?} gyro={:?}",
+                self.imu_reads,
+                samples.len(),
+                last.and_then(|s| s.accel),
+                last.and_then(|s| s.gyro),
+            );
+        }
         for s in &samples {
             for g in self.head.push(s, t.mono_us) {
                 self.head_gesture(g);
@@ -2053,7 +2097,10 @@ impl Daemon {
     fn head_gesture(&mut self, g: HeadGesture) {
         let t = now();
         let kind = HeadGestureKind::try_from(g.kind).unwrap_or(HeadGestureKind::Unspecified);
-        info!("head {kind:?} at {:.1} deg", g.pitch_deg);
+        info!(
+            "OMGB-SENSOR: head gesture {kind:?} at {:.1} deg",
+            g.pitch_deg
+        );
         self.publish(service_frame::Body::HeadGesture(g));
         let change = match kind {
             HeadGestureKind::LookUp => self.policy.wake(t, "look-up", true),

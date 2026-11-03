@@ -34,6 +34,16 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How often `don_doff` is read while on-head detection is armed.
+const DON_DOFF_RECHECK_MS: u64 = 2000;
+/// The wait after each step of waking the hub's sensing (1 s is what was tested on hardware).
+const HUB_WAKE_STEP: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
 
 /// Name of the touchpad input device (docs/specs/kernel-interfaces.md §1.2).
 pub const TOUCHPAD_NAME: &str = "sensor00fn11";
@@ -182,6 +192,10 @@ pub struct Daemon {
     events: Vec<glass_evdev::Event>,
     glasshub: Option<GlassHub>,
     hub_written: HubWritten,
+    /// While on-head detection is armed: when to read `don_doff` again.
+    don_doff_recheck_us: Option<u64>,
+    /// The last `don_doff` value read, to log only its changes.
+    last_don_doff: Option<bool>,
     wear: WearMachine,
     camera: ButtonTracker,
     power: ButtonTracker,
@@ -399,6 +413,13 @@ fn open_glasshub(opts: &Options) -> Option<GlassHub> {
         root.display(),
         hub.version().unwrap_or_else(|e| format!("unreadable: {e}"))
     );
+    // The hub's sensing stays off (proxraw 65535, don_doff stuck at 0) until it sees a pause
+    // and a resume, and the driver writes the register only when the state changes. Stock
+    // goes through this at start-up; Model B has to do it itself (seen on the device: one
+    // toggle took proxraw from 65535 to 322).
+    if let Err(e) = wake_hub_sensing(&hub) {
+        warn!("glasshub wake: {e}");
+    }
     let thresholds = opts
         .gaze_params
         .as_ref()
@@ -412,6 +433,14 @@ fn open_glasshub(opts: &Options) -> Option<GlassHub> {
         warn!("glasshub thresholds: {e}");
     }
     Some(hub)
+}
+
+fn wake_hub_sensing(hub: &GlassHub) -> io::Result<()> {
+    hub.set_pause(true)?;
+    std::thread::sleep(HUB_WAKE_STEP);
+    hub.set_pause(false)?;
+    std::thread::sleep(HUB_WAKE_STEP);
+    Ok(())
 }
 
 fn open_imu(opts: &Options) -> Option<Imu> {
@@ -728,6 +757,8 @@ impl Daemon {
             events: Vec::new(),
             glasshub,
             hub_written: HubWritten::default(),
+            don_doff_recheck_us: None,
+            last_don_doff: None,
             wear,
             camera: ButtonTracker::new(ButtonId::Camera),
             power: ButtonTracker::new(ButtonId::Power),
@@ -795,6 +826,7 @@ impl Daemon {
             self.policy.next_deadline(),
             self.mock.as_ref().and_then(|m| m.resume_at),
             self.wear.next_deadline(),
+            self.don_doff_recheck_us,
             self.camera.next_deadline(),
             self.power.next_deadline(),
             self.power_io
@@ -923,7 +955,10 @@ impl Daemon {
                 Src::Touchpad => self.read_touchpad(),
                 Src::Stdin => self.read_stdin(),
                 Src::Key(id) => self.read_key(id),
-                Src::DonDoff => self.read_don_doff(),
+                Src::DonDoff => {
+                    info!("OMGB-SENSOR: glasshub don_doff notification");
+                    self.read_don_doff();
+                }
                 Src::WinkAttr => self.read_wink(),
                 Src::Imu => self.read_imu(),
                 Src::Client(id) => {
@@ -964,6 +999,11 @@ impl Daemon {
         }
         let u = self.wear.on_timeout(t.mono_us);
         self.wear_update(u);
+        if self.don_doff_recheck_us.is_some_and(|d| t.mono_us >= d) {
+            self.don_doff_recheck_us = None;
+            self.read_don_doff();
+            self.sync_don_doff_recheck(t.mono_us);
+        }
         for id in [ButtonId::Camera, ButtonId::Power] {
             if let Some(b) = self.tracker(id).on_timeout(t.mono_us) {
                 self.button_frames(id, vec![b]);
@@ -1916,13 +1956,23 @@ impl Daemon {
         }) && detection;
         sync_attr(&mut w.wink, wink, "wink", |v| h.set_wink(v));
         let resumed = sync_attr(&mut w.pause, pause, "pause", |v| h.set_pause(v)) && !pause;
-        info!(
-            "OMGB-SENSOR: glasshub sync: on_head_detection={detection} wink={wink} pause={pause}"
-        );
         // The state may have changed while detection was off or the hub paused, without a
         // notification: read it again. (This ends: a second pass writes nothing.)
         if armed || resumed {
             self.read_don_doff();
+        }
+        self.sync_don_doff_recheck(now().mono_us);
+    }
+
+    /// While on-head detection is armed, `don_doff` is also read on a timer. On Model B no
+    /// notification arrived after arming, though the sensor reads correctly (2026-11-03: 690
+    /// worn, 327 off, with `don_doff` 1 and 0), so a state change could go unseen.
+    fn sync_don_doff_recheck(&mut self, now_us: u64) {
+        let wanted = self.glasshub.is_some() && self.wear.detection();
+        if !wanted {
+            self.don_doff_recheck_us = None;
+        } else if self.don_doff_recheck_us.is_none() {
+            self.don_doff_recheck_us = Some(now_us + DON_DOFF_RECHECK_MS * 1000);
         }
     }
 
@@ -1940,9 +1990,14 @@ impl Daemon {
         let Some(h) = &mut self.glasshub else { return };
         match h.read_don_doff() {
             Ok(Some(on)) => {
-                info!("OMGB-SENSOR: glasshub don_doff read: on_head={on}");
-                if !on && !self.wear.sensor_trusted() {
-                    info!("glasshub don_doff 0 ignored: the sensor has not reported on-head yet");
+                if self.last_don_doff != Some(on) {
+                    self.last_don_doff = Some(on);
+                    info!("OMGB-SENSOR: glasshub don_doff read: on_head={on}");
+                    if !on && !self.wear.sensor_trusted() {
+                        info!(
+                            "glasshub don_doff 0 ignored: the sensor has not reported on-head yet"
+                        );
+                    }
                 }
                 let u = self.wear.sensor(now().mono_us, on);
                 self.wear_update(u);
@@ -2271,6 +2326,35 @@ mod tests {
             "1\n"
         );
         assert!(!d.wear.on_head(), "read again after don_doff_enable = 1");
+    }
+
+    #[test]
+    fn opening_the_hub_goes_through_a_pause_and_a_resume() {
+        let (_d, hub) = fake_hub_daemon("wake");
+        assert_eq!(std::fs::read_to_string(hub.join("pause")).unwrap(), "0\n");
+    }
+
+    #[test]
+    fn don_doff_changes_are_seen_without_a_notification() {
+        // Start off the head: a 0 before any 1 is ignored, so the Glass stays on the head.
+        let (mut d, hub) = fake_hub_daemon_with("recheck", "0\n");
+        assert_eq!(d.don_doff_recheck_us, None, "detection off: no timer");
+        detection_on(&mut d);
+        let due = d.don_doff_recheck_us.expect("armed: timer set");
+        // Put on, then taken off: no notification, only the timer sees them.
+        std::fs::write(hub.join("don_doff"), "1\n").unwrap();
+        d.timers(Now::at(due));
+        assert!(d.wear.sensor_trusted());
+        let due = d.don_doff_recheck_us.expect("the timer keeps running");
+        std::fs::write(hub.join("don_doff"), "0\n").unwrap();
+        d.timers(Now::at(due));
+        assert!(!d.wear.on_head());
+        // Detection off: the timer stops.
+        let mut s = d.settings();
+        s.on_head_detection_enabled = Some(false);
+        d.hub.set_settings_source(s);
+        d.settings_changed(&s);
+        assert_eq!(d.don_doff_recheck_us, None);
     }
 
     #[test]

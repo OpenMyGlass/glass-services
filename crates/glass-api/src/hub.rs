@@ -62,9 +62,9 @@ pub mod settings_rules {
     /// Idle after screen-off before the energy policy suspends to RAM (`deep_sleep_idle_ms`).
     pub const DEEP_SLEEP_IDLE_MIN_MS: u32 = 5_000;
     pub const DEEP_SLEEP_IDLE_MAX_MS: u32 = 1_800_000;
-    /// Earpiece gain steps (`audio_volume`): 12 is 0 dB, 15 is +6 dB.
-    pub const AUDIO_VOLUME_MAX: u32 = 15;
-    pub const AUDIO_VOLUME_DEFAULT: u32 = 12;
+    /// `audio_volume` in percent. The default is about 0 dB; the launcher maps it to gains.
+    pub const AUDIO_VOLUME_MAX: u32 = 100;
+    pub const AUDIO_VOLUME_DEFAULT: u32 = 87;
     /// The time zones offered: a name and a POSIX `TZ` string, which needs no tz database.
     /// `timezone_id` is an index here and is stored, so only append to this table.
     pub const TIME_ZONES: &[(&str, &str)] = &[

@@ -269,7 +269,7 @@ mod tests {
             "power_saver=true",
             "deep_sleep_enabled=false",
             "deep_sleep_idle_ms=60000",
-            "audio_volume=12",
+            "audio_volume=87",
             "time_24h=true",
             "timezone_id=2",
         ] {

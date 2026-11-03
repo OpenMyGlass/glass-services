@@ -62,14 +62,18 @@ pub mod settings_rules {
     /// Idle after screen-off before the energy policy suspends to RAM (`deep_sleep_idle_ms`).
     pub const DEEP_SLEEP_IDLE_MIN_MS: u32 = 5_000;
     pub const DEEP_SLEEP_IDLE_MAX_MS: u32 = 1_800_000;
+    /// Earpiece gain steps (`audio_volume`): 12 is 0 dB, 15 is +6 dB.
+    pub const AUDIO_VOLUME_MAX: u32 = 15;
+    pub const AUDIO_VOLUME_DEFAULT: u32 = 12;
 
     /// The defaults of docs/api.md ("Settings").
     pub fn defaults() -> Settings {
         Settings {
-            head_wake_enabled: Some(true),
+            // Owner decision 2026-11-03: wake by look-up off and on-head detection on.
+            head_wake_enabled: Some(false),
             head_wake_angle_deg: Some(30.0),
             wink_enabled: Some(false),
-            on_head_detection_enabled: Some(false),
+            on_head_detection_enabled: Some(true),
             // Humane idle timeout for interactive use: stay lit ~2 min, then a brief dim
             // and off. (Was 15 s, which fought the user during a guided walkthrough.) The
             // energy policy's eco/suspend stages still kick in after screen-off.
@@ -89,6 +93,7 @@ pub mod settings_rules {
             power_saver: Some(true),
             deep_sleep_enabled: Some(false),
             deep_sleep_idle_ms: Some(60_000),
+            audio_volume: Some(AUDIO_VOLUME_DEFAULT),
             snapshot: false,
         }
     }
@@ -104,6 +109,9 @@ pub mod settings_rules {
         }
         if let Some(v) = change.wink_enabled {
             current.wink_enabled = Some(v);
+        }
+        if let Some(v) = change.audio_volume {
+            current.audio_volume = Some(v.min(AUDIO_VOLUME_MAX));
         }
         if let Some(v) = change.on_head_detection_enabled {
             current.on_head_detection_enabled = Some(v);
@@ -1178,7 +1186,7 @@ mod tests {
         };
         assert_eq!(applied.head_wake_angle_deg, Some(40.0));
         assert_eq!(applied.screen_timeout_ms, Some(3000));
-        assert_eq!(applied.head_wake_enabled, Some(true));
+        assert_eq!(applied.head_wake_enabled, Some(false));
         assert_eq!(applied.nudge_sleep_enabled, Some(true));
         assert!(!applied.snapshot);
         assert!(fx.iter().any(|e| matches!(e, Effect::SettingsChanged(_))));

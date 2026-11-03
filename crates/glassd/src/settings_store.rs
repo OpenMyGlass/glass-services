@@ -72,6 +72,12 @@ pub fn encode(s: &Settings) -> String {
             .or(d.deep_sleep_idle_ms)
             .unwrap_or(60_000)
     );
+    out += &format!(
+        "audio_volume={}\n",
+        s.audio_volume
+            .or(d.audio_volume)
+            .unwrap_or(settings_rules::AUDIO_VOLUME_DEFAULT)
+    );
     out
 }
 
@@ -127,6 +133,7 @@ pub fn decode(text: &str) -> Settings {
             "power_saver" => change.power_saver = flag(),
             "deep_sleep_enabled" => change.deep_sleep_enabled = flag(),
             "deep_sleep_idle_ms" => change.deep_sleep_idle_ms = v.parse().ok(),
+            "audio_volume" => change.audio_volume = v.parse().ok(),
             _ => {}
         }
     }
@@ -240,10 +247,10 @@ mod tests {
     fn encode_lists_every_field() {
         let t = encode(&settings_rules::defaults());
         for k in [
-            "head_wake_enabled=true",
+            "head_wake_enabled=false",
             "head_wake_angle_deg=30",
             "wink_enabled=false",
-            "on_head_detection_enabled=false",
+            "on_head_detection_enabled=true",
             "screen_timeout_ms=120000",
             "nudge_sleep_enabled=false",
             "wifi_enabled=false",
@@ -253,6 +260,7 @@ mod tests {
             "power_saver=true",
             "deep_sleep_enabled=false",
             "deep_sleep_idle_ms=60000",
+            "audio_volume=12",
         ] {
             assert!(t.lines().any(|l| l == k), "{k} in {t}");
         }

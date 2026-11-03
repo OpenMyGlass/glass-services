@@ -19,6 +19,13 @@
 //! - hinge closed -> forced off; opened -> timed on (source `HINGE`);
 //! - on-head detection turned on -> defer; turned off -> forced on (source `FORCED`).
 //!
+//! The sensor is **trusted only after it has reported on the head once** (since boot). A
+//! `don_doff` of 0 before any 1 is kept out of the state: on the Model B glasshub firmware
+//! (1.22) `don_doff` can sit at 0 while the Glass is worn, and honouring it turned on-head
+//! detection into a lock-out (screen off, touchpad asleep, no way to navigate back to the
+//! setting). Stock Glass has the same effect in another form: its sensor state is UNKNOWN
+//! until the first DON/DOFF *event*, and a stuck sensor never produces one.
+//!
 //! The source of a manual mode is what caused it. A [`WearState`] is reported when the wear
 //! or its source changes; [`Update::wear_changed`] says whether the wear itself changed (the
 //! off-head and don actions run only then).
@@ -51,6 +58,8 @@ pub struct WearMachine {
     cause: WearSource,
     detection: bool,
     sensor: Option<bool>,
+    /// The sensor has reported on the head at least once: its off-head readings count.
+    sensor_trusted: bool,
     reported: WearState,
 }
 
@@ -74,6 +83,7 @@ impl WearMachine {
             cause: WearSource::Forced,
             detection,
             sensor: None,
+            sensor_trusted: false,
             reported: state(true, WearSource::Forced, now_us),
         }
     }
@@ -142,14 +152,26 @@ impl WearMachine {
         }
     }
 
-    /// A reading of the glasshub's `don_doff` (true = on the head).
+    /// A reading of the glasshub's `don_doff` (true = on the head). An off-head reading is
+    /// ignored until the sensor has reported on the head once (see the module doc); the
+    /// caller may log it with [`sensor_trusted`](Self::sensor_trusted).
     pub fn sensor(&mut self, now_us: u64, on: bool) -> Option<Update> {
+        if on {
+            self.sensor_trusted = true;
+        } else if !self.sensor_trusted {
+            return None;
+        }
         self.sensor = Some(on);
         if self.mode == Mode::Defer {
             self.report(now_us)
         } else {
             None
         }
+    }
+
+    /// Whether the sensor has reported on the head once, so its off-head readings count.
+    pub fn sensor_trusted(&self) -> bool {
+        self.sensor_trusted
     }
 
     /// A short press of the power key toggles a manual off-head.
@@ -225,7 +247,8 @@ mod tests {
     fn boot_with_detection_defers_to_the_sensor_after_30_s() {
         let mut m = WearMachine::new(0, true);
         // During the forced period the sensor is stored, not reported.
-        assert_eq!(m.sensor(S, false), None);
+        assert_eq!(m.sensor(S, true), None);
+        assert_eq!(m.sensor(2 * S, false), None);
         assert_eq!(
             ws(m.on_timeout(30 * S)),
             Some((Wear::OffHead, WearSource::Sensor, true))
@@ -235,6 +258,28 @@ mod tests {
             Some((Wear::OnHead, WearSource::Sensor, true))
         );
         assert_eq!(m.sensor(41 * S, true), None);
+    }
+
+    #[test]
+    fn an_off_head_reading_is_ignored_until_the_sensor_has_seen_on_head() {
+        let mut m = WearMachine::new(0, true);
+        assert!(!m.sensor_trusted());
+        // A stuck 0 before any 1 (Model B glasshub 1.22): not the sensor state.
+        assert_eq!(m.sensor(S, false), None);
+        assert_eq!(m.on_timeout(30 * S), None);
+        assert!(m.on_head());
+        assert_eq!(m.sensor(31 * S, false), None);
+        assert!(m.on_head());
+        // The first on-head reading makes the sensor trusted; from then on 0 counts.
+        assert_eq!(
+            ws(m.sensor(32 * S, true)),
+            Some((Wear::OnHead, WearSource::Sensor, false))
+        );
+        assert!(m.sensor_trusted());
+        assert_eq!(
+            ws(m.sensor(33 * S, false)),
+            Some((Wear::OffHead, WearSource::Sensor, true))
+        );
     }
 
     #[test]
@@ -326,6 +371,7 @@ mod tests {
     fn detection_setting_switches_modes() {
         let mut m = WearMachine::new(0, false);
         m.on_timeout(30 * S);
+        m.sensor(30 * S, true); // the sensor has seen on-head: trusted
         m.sensor(31 * S, false); // stored even with detection off
         assert_eq!(
             ws(m.set_detection(32 * S, true)),

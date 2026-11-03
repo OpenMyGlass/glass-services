@@ -170,6 +170,8 @@ Who switches the panel:
 | `power_saver` | default true (`power`): run the energy policy (dim/cpufreq/runtime-PM when idle) |
 | `deep_sleep_enabled` | default false (`power`): also suspend-to-RAM when idle |
 | `deep_sleep_idle_ms` | 5000 to 1800000, default 60000 (`power`): idle after screen-off before suspend |
+| `time_24h` | default true: 24-hour clock, else 12-hour |
+| `timezone_id` | index into `settings_rules::TIME_ZONES`, default 2 (Rome); an unknown index is ignored. The launcher applies the zone's POSIX `TZ` string. |
 | `audio_volume` | 0 to 15, default 12: earpiece gain steps, 12 = 0 dB, 15 = +6 dB. glassd stores it; the launcher applies it to the mixer. |
 
 The last three exist on Model B (plain Linux), reported by the `radio` capability; on Android (route 1) the framework owns the radios and `glassd` does not advertise `radio` or act on these fields. `glassd` switches the hardware with `rfkill` and the interface and leaves association (Wi-Fi: wpa_supplicant/iwd + udhcpc, the companion/QR setup flow) and pairing (Bluetooth: bluez) to their userspace. `wifi_enabled` and `bluetooth_enabled` are the per-radio wishes; `airplane_mode` is the umbrella: while it is on, both radios are forced off, the wishes are kept, and turning it off restores them. So the launcher's Wi-Fi / Bluetooth / airplane toggles are `SetSettings` on these fields, and the current state is read from the `Settings` snapshot (`GetState` or a `TOPIC_SETTINGS` subscription). The default is Wi-Fi off: on Model B the companion is the gateway over Bluetooth and Glass brings Wi-Fi up only for big transfers or as a fallback.

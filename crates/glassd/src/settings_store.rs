@@ -72,6 +72,13 @@ pub fn encode(s: &Settings) -> String {
             .or(d.deep_sleep_idle_ms)
             .unwrap_or(60_000)
     );
+    out += &format!("time_24h={}\n", b(s.time_24h, d.time_24h));
+    out += &format!(
+        "timezone_id={}\n",
+        s.timezone_id
+            .or(d.timezone_id)
+            .unwrap_or(settings_rules::TIMEZONE_DEFAULT)
+    );
     out += &format!(
         "audio_volume={}\n",
         s.audio_volume
@@ -134,6 +141,8 @@ pub fn decode(text: &str) -> Settings {
             "deep_sleep_enabled" => change.deep_sleep_enabled = flag(),
             "deep_sleep_idle_ms" => change.deep_sleep_idle_ms = v.parse().ok(),
             "audio_volume" => change.audio_volume = v.parse().ok(),
+            "time_24h" => change.time_24h = v.parse().ok(),
+            "timezone_id" => change.timezone_id = v.parse().ok(),
             _ => {}
         }
     }
@@ -261,6 +270,8 @@ mod tests {
             "deep_sleep_enabled=false",
             "deep_sleep_idle_ms=60000",
             "audio_volume=12",
+            "time_24h=true",
+            "timezone_id=2",
         ] {
             assert!(t.lines().any(|l| l == k), "{k} in {t}");
         }

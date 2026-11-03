@@ -65,6 +65,26 @@ pub mod settings_rules {
     /// Earpiece gain steps (`audio_volume`): 12 is 0 dB, 15 is +6 dB.
     pub const AUDIO_VOLUME_MAX: u32 = 15;
     pub const AUDIO_VOLUME_DEFAULT: u32 = 12;
+    /// The time zones offered: a name and a POSIX `TZ` string, which needs no tz database.
+    /// `timezone_id` is an index here and is stored, so only append to this table.
+    pub const TIME_ZONES: &[(&str, &str)] = &[
+        ("UTC", "UTC0"),
+        ("London", "GMT0BST,M3.5.0/1,M10.5.0"),
+        ("Roma, Paris, Madrid", "CET-1CEST,M3.5.0,M10.5.0/3"),
+        ("Athina, Helsinki", "EET-2EEST,M3.5.0/3,M10.5.0/4"),
+        ("Moskva", "MSK-3"),
+        ("Dubai", "<+04>-4"),
+        ("Delhi", "IST-5:30"),
+        ("Beijing, Singapore", "CST-8"),
+        ("Tokyo", "JST-9"),
+        ("Sydney", "AEST-10AEDT,M10.1.0,M4.1.0/3"),
+        ("New York", "EST5EDT,M3.2.0,M11.1.0"),
+        ("Chicago", "CST6CDT,M3.2.0,M11.1.0"),
+        ("Denver", "MST7MDT,M3.2.0,M11.1.0"),
+        ("Los Angeles", "PST8PDT,M3.2.0,M11.1.0"),
+        ("São Paulo", "<-03>3"),
+    ];
+    pub const TIMEZONE_DEFAULT: u32 = 2;
 
     /// The defaults of docs/api.md ("Settings").
     pub fn defaults() -> Settings {
@@ -94,6 +114,8 @@ pub mod settings_rules {
             deep_sleep_enabled: Some(false),
             deep_sleep_idle_ms: Some(60_000),
             audio_volume: Some(AUDIO_VOLUME_DEFAULT),
+            time_24h: Some(true),
+            timezone_id: Some(TIMEZONE_DEFAULT),
             snapshot: false,
         }
     }
@@ -109,6 +131,14 @@ pub mod settings_rules {
         }
         if let Some(v) = change.wink_enabled {
             current.wink_enabled = Some(v);
+        }
+        if let Some(v) = change.time_24h {
+            current.time_24h = Some(v);
+        }
+        if let Some(v) = change.timezone_id
+            && (v as usize) < TIME_ZONES.len()
+        {
+            current.timezone_id = Some(v);
         }
         if let Some(v) = change.audio_volume {
             current.audio_volume = Some(v.min(AUDIO_VOLUME_MAX));

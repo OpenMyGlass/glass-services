@@ -2286,13 +2286,19 @@ mod tests {
             energy: false,
             power_paths: PowerPaths::default(),
         };
-        let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        // The tests below start from detection off and turn it on themselves.
+        set_detection(&mut daemon, false);
         (daemon, hub)
     }
 
     fn detection_on(d: &mut Daemon) {
+        set_detection(d, true);
+    }
+
+    fn set_detection(d: &mut Daemon, on: bool) {
         let mut s = d.settings();
-        s.on_head_detection_enabled = Some(true);
+        s.on_head_detection_enabled = Some(on);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
     }

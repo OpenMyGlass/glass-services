@@ -446,6 +446,13 @@ fn off_head_camera_is_delivered_without_waking() {
 fn wear_sensor_needs_on_head_detection() {
     let mut m = Mock::start("sensor");
     let mut c = m.client(&[Topic::Screen, Topic::Wear, Topic::Settings]);
+    set_settings(
+        &mut c,
+        Settings {
+            on_head_detection_enabled: Some(false),
+            ..Default::default()
+        },
+    );
     // The sensor is trusted once it has reported on the head; then its readings are
     // stored even with detection off (nothing is reported: forced on the head).
     m.send("wear on");
@@ -619,12 +626,12 @@ fn fake_glasshub_camera_and_touchpad_sysfs() {
         assert!(!cl.has_capability(cap), "{cap}");
     }
     let read = |f: &str| std::fs::read_to_string(hub.join(f)).unwrap();
-    // Thresholds at start (defaults), detection and wink off, not paused.
+    // Thresholds at start (defaults), detection on by default, wink off, not paused.
     assert_eq!(read("don_threshold"), "450\n");
     assert_eq!(read("doff_threshold"), "400\n");
     assert_eq!(read("don_max_threshold"), "2000\n");
     assert_eq!(read("detector_gain"), "2\n");
-    assert_eq!(read("don_doff_enable"), "0\n");
+    assert_eq!(read("don_doff_enable"), "1\n");
     assert_eq!(read("wink_enable"), "0\n");
     assert_eq!(read("pause"), "0\n");
     assert_eq!(
@@ -706,6 +713,13 @@ fn sync(c: &mut Client) {
 fn head_gestures_follow_the_rules_in_the_mock() {
     let mut m = Mock::start("head");
     let mut c = m.client(&[Topic::Head, Topic::Screen]);
+    set_settings(
+        &mut c,
+        Settings {
+            head_wake_enabled: Some(true),
+            ..Default::default()
+        },
+    );
     // Screen on: no look-up detector runs.
     m.send("lookup");
     assert!(
@@ -870,6 +884,13 @@ fn look_up_from_a_fake_imu() {
     let mut c = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
     assert!(c.has_capability("head"));
     c.subscribe(&[Topic::Head, Topic::Screen]).unwrap();
+    set_settings(
+        &mut c,
+        Settings {
+            head_wake_enabled: Some(true),
+            ..Default::default()
+        },
+    );
     let rd = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
     // Screen on, nothing wanted: the IMU is not started.
     assert_ne!(rd("buffer/enable"), "1\n");

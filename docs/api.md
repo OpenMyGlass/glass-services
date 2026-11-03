@@ -109,7 +109,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 ## Wearing and wink (`TOPIC_WEAR`, milestone 2)
 
 - `WearState{wear, source}`:
-  - `WEAR_SOURCE_SENSOR`: the glasshub on-head detection, when `on_head_detection_enabled` is true (default false).
+  - `WEAR_SOURCE_SENSOR`: the glasshub on-head detection, when `on_head_detection_enabled` is true (the default).
   - `WEAR_SOURCE_FORCED`: detection off, so the Glass is assumed on the head (`WEAR_ON_HEAD`); also during the 30 s after boot.
   - `WEAR_SOURCE_POWER_KEY`: a short power-key press toggles a manual off-head; the next press gives a timed on-head (30 s, then back to the sensor if detection is on).
   - `WEAR_SOURCE_HINGE`: closing the hinge forces off-head; opening it gives a timed on-head. The Linux input code of the hinge switch is not confirmed yet (device needed), so this source may be missing (`hinge` capability).
@@ -157,10 +157,10 @@ Who switches the panel:
 
 | Field | Range |
 |---|---|
-| `head_wake_enabled` | default true |
+| `head_wake_enabled` | default false |
 | `head_wake_angle_deg` | 10 to 40 (degrees above the horizon), default 30 |
 | `wink_enabled` | default false |
-| `on_head_detection_enabled` | default false |
+| `on_head_detection_enabled` | default true |
 | `screen_timeout_ms` | 3000 to 600000, default 15000; there is no "never" |
 | `nudge_sleep_enabled` | default false |
 | `wifi_enabled` | default false (`radio`): Wi-Fi off, brought up on demand |
@@ -170,6 +170,7 @@ Who switches the panel:
 | `power_saver` | default true (`power`): run the energy policy (dim/cpufreq/runtime-PM when idle) |
 | `deep_sleep_enabled` | default false (`power`): also suspend-to-RAM when idle |
 | `deep_sleep_idle_ms` | 5000 to 1800000, default 60000 (`power`): idle after screen-off before suspend |
+| `audio_volume` | 0 to 15, default 12: earpiece gain steps, 12 = 0 dB, 15 = +6 dB. glassd stores it; the launcher applies it to the mixer. |
 
 The last three exist on Model B (plain Linux), reported by the `radio` capability; on Android (route 1) the framework owns the radios and `glassd` does not advertise `radio` or act on these fields. `glassd` switches the hardware with `rfkill` and the interface and leaves association (Wi-Fi: wpa_supplicant/iwd + udhcpc, the companion/QR setup flow) and pairing (Bluetooth: bluez) to their userspace. `wifi_enabled` and `bluetooth_enabled` are the per-radio wishes; `airplane_mode` is the umbrella: while it is on, both radios are forced off, the wishes are kept, and turning it off restores them. So the launcher's Wi-Fi / Bluetooth / airplane toggles are `SetSettings` on these fields, and the current state is read from the `Settings` snapshot (`GetState` or a `TOPIC_SETTINGS` subscription). The default is Wi-Fi off: on Model B the companion is the gateway over Bluetooth and Glass brings Wi-Fi up only for big transfers or as a fallback.
 

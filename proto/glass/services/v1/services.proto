@@ -312,7 +312,7 @@ message Settings {
   optional uint32 deep_sleep_idle_ms = 13;   // 5000 to 1800000; idle after screen-off before suspend; default 60000
   optional bool time_24h = 15;               // default true: 24-hour clock, else 12-hour
   optional uint32 timezone_id = 16;          // index into settings_rules::TIME_ZONES; default 2 (Rome)
-  optional uint32 audio_volume = 14;         // 0 to 15, TWL6040 earpiece gain steps; 12 = 0 dB; default 12
+  optional uint32 audio_volume = 14;         // 0 to 100 percent; default 87 (about 0 dB)
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 

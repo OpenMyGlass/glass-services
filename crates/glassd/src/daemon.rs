@@ -1198,6 +1198,10 @@ impl Daemon {
 
     fn apply_change(&mut self, c: Change) {
         info!("screen {:?} ({})", c.screen, c.reason);
+        if c.screen == Screen::Off {
+            // The head is still where it was at the sleep: no look-up wake for a while.
+            self.head.screen_went_off(c.at_us);
+        }
         self.display.set(c.screen);
         self.drive_power(c.screen);
         let state: ScreenState = c.to_state();
@@ -1937,6 +1941,9 @@ impl Daemon {
         match h.read_don_doff() {
             Ok(Some(on)) => {
                 info!("OMGB-SENSOR: glasshub don_doff read: on_head={on}");
+                if !on && !self.wear.sensor_trusted() {
+                    info!("glasshub don_doff 0 ignored: the sensor has not reported on-head yet");
+                }
                 let u = self.wear.sensor(now().mono_us, on);
                 self.wear_update(u);
             }
@@ -2176,10 +2183,19 @@ mod tests {
     }
 
     fn fake_hub_daemon(name: &str) -> (Daemon, PathBuf) {
+        fake_hub_daemon_with(name, "1\n")
+    }
+
+    /// A daemon with a fake glasshub whose `don_doff` starts at `don_doff`.
+    fn fake_hub_daemon_with(name: &str, don_doff: &str) -> (Daemon, PathBuf) {
         let d = dir(name);
         let hub = d.join("hub");
         std::fs::create_dir_all(&hub).unwrap();
-        for (f, v) in [("version", "1.14\n"), ("don_doff", "1\n"), ("wink", "0\n")] {
+        for (f, v) in [
+            ("version", "1.14\n"),
+            ("don_doff", don_doff),
+            ("wink", "0\n"),
+        ] {
             std::fs::write(hub.join(f), v).unwrap();
         }
         for f in glass_hub::sysfs::WRITABLE {
@@ -2245,6 +2261,8 @@ mod tests {
     fn don_doff_is_read_again_when_detection_is_armed() {
         let (mut d, hub) = fake_hub_daemon("rearm");
         assert!(d.wear.on_head());
+        // The sensor reported on the head once (the start-up read of "1"): trusted.
+        assert!(d.wear.sensor_trusted());
         // Changed while detection was off: no notification came.
         std::fs::write(hub.join("don_doff"), "0\n").unwrap();
         detection_on(&mut d);
@@ -2253,6 +2271,24 @@ mod tests {
             "1\n"
         );
         assert!(!d.wear.on_head(), "read again after don_doff_enable = 1");
+    }
+
+    #[test]
+    fn a_sensor_stuck_at_0_does_not_take_the_glass_off_the_head() {
+        // Model B glasshub 1.22: don_doff reads 0 from boot while the Glass is worn.
+        let (mut d, hub) = fake_hub_daemon_with("stuck", "0\n");
+        assert!(!d.wear.sensor_trusted());
+        detection_on(&mut d);
+        assert!(d.wear.on_head(), "a 0 before any 1 is not the sensor state");
+        assert_eq!(d.wear.on_timeout(now().mono_us + 31_000_000), None);
+        assert!(d.wear.on_head());
+        // Once it reports 1, a later 0 counts.
+        std::fs::write(hub.join("don_doff"), "1\n").unwrap();
+        d.read_don_doff();
+        assert!(d.wear.sensor_trusted());
+        std::fs::write(hub.join("don_doff"), "0\n").unwrap();
+        d.read_don_doff();
+        assert!(!d.wear.on_head());
     }
 
     #[test]

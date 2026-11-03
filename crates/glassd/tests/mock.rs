@@ -446,6 +446,9 @@ fn off_head_camera_is_delivered_without_waking() {
 fn wear_sensor_needs_on_head_detection() {
     let mut m = Mock::start("sensor");
     let mut c = m.client(&[Topic::Screen, Topic::Wear, Topic::Settings]);
+    // The sensor is trusted once it has reported on the head; then its readings are
+    // stored even with detection off (nothing is reported: forced on the head).
+    m.send("wear on");
     m.send("wear off");
     assert!(
         c.recv_until(Duration::from_millis(300), |f| wear(f).is_some())
@@ -711,6 +714,15 @@ fn head_gestures_follow_the_rules_in_the_mock() {
             .is_none()
     );
     sleep_request(&mut c);
+    // Right after a screen-off a look-up is the sleeping posture, not a wake: inhibited
+    // for 2000 ms.
+    m.send("lookup");
+    assert!(
+        c.recv_until(SHORT, |f| head(f).is_some())
+            .unwrap()
+            .is_none()
+    );
+    std::thread::sleep(Duration::from_millis(1800));
     m.send("lookup");
     let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
     assert_eq!(head(&f), Some(HeadGestureKind::LookUp));
@@ -891,6 +903,8 @@ fn look_up_from_a_fake_imu() {
         bytes.extend_from_slice(&[0, 0x04]);
         bytes.extend_from_slice(&(i * 20_000_000).to_le_bytes());
     }
+    // Past the 2000 ms look-up inhibition that the screen-off started.
+    std::thread::sleep(Duration::from_millis(2100));
     writer.write_all(&bytes).unwrap();
     let f = c.recv_until(T, |f| head(f).is_some()).unwrap().unwrap();
     assert_eq!(head(&f), Some(HeadGestureKind::LookUp));

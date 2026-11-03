@@ -16,7 +16,11 @@
 //! - `NUDGE` only with the screen on and outside the nudge inhibition; it sets the look-up
 //!   inhibition to at least 500 ms and restarts the nudge inhibition;
 //! - `RELATIVE_LOOK_UP` always; it starts the nudge inhibition;
-//! - a client can set the look-up inhibition for N ms (0 clears it).
+//! - a client can set the look-up inhibition for N ms (0 clears it);
+//! - a screen-off sets the look-up inhibition to at least 2000 ms: the head is still where
+//!   it was when the user put the screen to sleep, and a look-up that fires a second later
+//!   is that posture, not a wake (seen on the device: every swipe-down sleep was undone by
+//!   a look-up 1-3 s later).
 //!
 //! Times: the inhibitions use the caller's `CLOCK_MONOTONIC` (µs); the detectors use the
 //! sensor's own timestamps for their time steps.
@@ -29,6 +33,8 @@ use glass_api::proto::{HeadGesture, HeadGestureKind};
 
 pub const NUDGE_INHIBIT_MS: u64 = 1000;
 pub const LOOK_UP_INHIBIT_AFTER_NUDGE_MS: u64 = 500;
+/// No look-up wake this soon after the screen went off (any reason).
+pub const LOOK_UP_INHIBIT_AFTER_SLEEP_MS: u64 = 2000;
 
 /// What the daemon knows that the detectors depend on.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,6 +168,14 @@ impl HeadService {
         };
     }
 
+    /// The screen went off: no look-up wake for [`LOOK_UP_INHIBIT_AFTER_SLEEP_MS`] (a longer
+    /// inhibition already set stays).
+    pub fn screen_went_off(&mut self, now_us: u64) {
+        self.look_up_inhibit_until_us = self
+            .look_up_inhibit_until_us
+            .max(now_us + LOOK_UP_INHIBIT_AFTER_SLEEP_MS * 1000);
+    }
+
     fn event(&self, kind: HeadGestureKind, pitch_deg: f32, now_us: u64) -> HeadGesture {
         HeadGesture {
             kind: kind as i32,
@@ -236,9 +250,13 @@ impl HeadService {
         let pitch = |d: f32| self.gravity.pitch().unwrap_or(d);
         match kind {
             HeadGestureKind::LookUp if self.active.look_up && !self.look_up.fired() => {
-                self.look_up.force(true);
+                // An inhibited look-up (right after a screen-off) is dropped without
+                // latching the detector, so the mock can try again later.
                 let r = self.forward(kind, angle + 5.0, now_us);
-                self.set_context(self.ctx);
+                if r.is_some() {
+                    self.look_up.force(true);
+                    self.set_context(self.ctx);
+                }
                 r
             }
             HeadGestureKind::LookDown if self.active.look_up && self.look_up.fired() => {

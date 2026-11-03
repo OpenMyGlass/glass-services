@@ -135,10 +135,10 @@ pub mod settings_rules {
         if let Some(v) = change.time_24h {
             current.time_24h = Some(v);
         }
-        if let Some(v) = change.timezone_id {
-            if (v as usize) < TIME_ZONES.len() {
-                current.timezone_id = Some(v);
-            }
+        if let Some(v) = change.timezone_id
+            && (v as usize) < TIME_ZONES.len()
+        {
+            current.timezone_id = Some(v);
         }
         if let Some(v) = change.audio_volume {
             current.audio_volume = Some(v.min(AUDIO_VOLUME_MAX));

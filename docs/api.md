@@ -166,7 +166,7 @@ Who switches the panel:
 | `wifi_enabled` | default false (`radio`): Wi-Fi off, brought up on demand |
 | `bluetooth_enabled` | default false (`radio`) |
 | `airplane_mode` | default false (`radio`): master off-switch over all radios |
-| `locale` | UI language, one of `LOCALE_IT`/`LOCALE_EN`/`LOCALE_FR`/`LOCALE_ES`; default `LOCALE_EN`. Unset/unknown values are ignored (the current language is kept) |
+| `locale` | UI language, one of `LOCALE_IT`/`LOCALE_EN`/`LOCALE_FR`/`LOCALE_ES`; absent until chosen (clients then show English, and the launcher offers its first-run picker). Unset/unknown values in a change are ignored (the current language is kept) |
 | `power_saver` | default true (`power`): run the energy policy (dim/cpufreq/runtime-PM when idle) |
 | `deep_sleep_enabled` | default false (`power`): also suspend-to-RAM when idle |
 | `deep_sleep_idle_ms` | 5000 to 1800000, default 60000 (`power`): idle after screen-off before suspend |

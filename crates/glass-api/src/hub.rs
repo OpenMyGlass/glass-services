@@ -104,9 +104,10 @@ pub mod settings_rules {
             wifi_enabled: Some(false),
             bluetooth_enabled: Some(false),
             airplane_mode: Some(false),
-            // Default UI language: English (matches omg_protocol::Locale::DEFAULT on the
-            // companion). The launcher's first-run picker and the companion SetLocale change it.
-            locale: Some(Locale::En as i32),
+            // Unset until someone chooses: the launcher then shows its first-run language picker,
+            // and shows English meanwhile (matching omg_protocol::Locale::DEFAULT on the
+            // companion). The picker, the settings card and the companion SetLocale set it.
+            locale: None,
             // Energy policy on by default (blank/brightness/cpufreq/runtime-PM, all reversible);
             // deep sleep (suspend-to-RAM) off by default until resume is validated on the device
             // (docs/api.md "Energy policy"; glass-kernel docs/model-b-energy.md open item 3).
@@ -1292,10 +1293,10 @@ mod tests {
     }
 
     #[test]
-    fn locale_defaults_to_en_and_merge_validates() {
+    fn locale_starts_unset_and_merge_validates() {
         use crate::proto::Locale;
         let mut cur = settings_rules::defaults();
-        assert_eq!(cur.locale, Some(Locale::En as i32));
+        assert_eq!(cur.locale, None);
         // A supported locale is applied.
         settings_rules::merge(
             &mut cur,

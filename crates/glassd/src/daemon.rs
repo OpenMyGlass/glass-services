@@ -2418,6 +2418,12 @@ mod tests {
     }
 
     #[test]
+    fn the_companion_names_the_same_time_zones_as_the_table() {
+        let names: Vec<&str> = settings_rules::TIME_ZONES.iter().map(|z| z.0).collect();
+        assert_eq!(names, omg_protocol::TIME_ZONE_NAMES);
+    }
+
+    #[test]
     fn locale_maps_round_trip_between_the_proto_and_the_companion() {
         for l in [Locale::It, Locale::En, Locale::Fr, Locale::Es] {
             let round = proto_locale(companion_locale(Some(l as i32)));

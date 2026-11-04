@@ -60,7 +60,10 @@ pub fn encode(s: &Settings) -> String {
         b(s.bluetooth_enabled, d.bluetooth_enabled)
     );
     out += &format!("airplane_mode={}\n", b(s.airplane_mode, d.airplane_mode));
-    out += &format!("locale={}\n", locale_code(s.locale.or(d.locale)));
+    // Only once chosen: an absent locale is what sends the launcher to its first-run picker.
+    if s.locale.is_some() {
+        out += &format!("locale={}\n", locale_code(s.locale));
+    }
     out += &format!("power_saver={}\n", b(s.power_saver, d.power_saver));
     out += &format!(
         "deep_sleep_enabled={}\n",
@@ -265,7 +268,6 @@ mod tests {
             "wifi_enabled=false",
             "bluetooth_enabled=false",
             "airplane_mode=false",
-            "locale=en",
             "power_saver=true",
             "deep_sleep_enabled=false",
             "deep_sleep_idle_ms=60000",
@@ -305,7 +307,8 @@ mod tests {
         let d = settings_rules::defaults();
         assert_eq!(decode("locale=de\n").locale, d.locale);
         assert_eq!(decode("locale=\n").locale, d.locale);
-        assert_eq!(d.locale, Some(Locale::En as i32));
+        assert_eq!(d.locale, None);
+        assert!(!encode(&d).contains("locale="));
         // Full file round trip.
         let dir = dir("locale");
         let st = SettingsStore::new(&dir);

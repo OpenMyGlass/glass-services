@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use omg_protocol::{Locale, Notification, NotificationChoice, Radio, RadioState, WifiReason};
 
 use crate::{info, warn};
-use entropy::PoolWait;
+use entropy::{PoolWait, PullMeter};
 use link::{DeviceState, Link, Out};
 use store::Store;
 use transport::{BoxStream, Listeners, Transport};
@@ -162,6 +162,8 @@ pub struct Companion {
     rng: Rng,
     /// Where the input pool's level is read.
     entropy_avail: PathBuf,
+    /// How much entropy reached `/dev/urandom`, for a first identity.
+    pull_meter: PullMeter,
     /// A dial asked for before the pool was seeded.
     pending_dial: Option<String>,
     tcp_port: Option<u16>,
@@ -225,6 +227,7 @@ impl Companion {
             store_path,
             rng: Rng::Failed,
             entropy_avail: entropy::ENTROPY_AVAIL.into(),
+            pull_meter: PullMeter::default(),
             pending_dial: None,
             tcp_port,
             bt,
@@ -331,12 +334,15 @@ impl Companion {
         if self.store.is_none() {
             // A kernel that does not say cannot be waited on; Model B always mounts /proc.
             let bits = entropy::entropy_avail(&self.entropy_avail);
-            if bits.is_some_and(|b| b < entropy::MIN_BITS_FOR_IDENTITY) {
+            if let Some(b) = bits
+                && !self.pull_meter.update(b)
+            {
                 if !matches!(self.rng, Rng::Gathering { .. }) {
-                    info!(
-                        "companion: waiting for {} bits of entropy before generating the identity",
-                        entropy::MIN_BITS_FOR_IDENTITY
-                    );
+                    info!("companion: gathering entropy before generating the identity");
+                }
+                // Moves entropy into /dev/urandom, which the meter then sees leave the pool.
+                if b >= entropy::PULL_LEVEL {
+                    let _ = getrandom::getrandom(&mut [0u8; 32]);
                 }
                 self.rng = Rng::Gathering {
                     next_check_ms: now_ms() + ENTROPY_CHECK_MS,

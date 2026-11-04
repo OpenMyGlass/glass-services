@@ -19,9 +19,8 @@
 //! Readable is not enough for a long-term key, though. On 3.4 interrupts credit the nonblocking
 //! pool first, but input and disk events credit the input pool directly, so it can reach 64 bits
 //! with `/dev/urandom` barely seeded, and `/dev/urandom` pulls from it only at 192 bits or more.
-//! So a first identity also waits for [`MIN_BITS_FOR_IDENTITY`]: the 32-byte read that makes the
-//! key then pulls at least 128 credited bits, whatever the order. Later boots reuse the stored
-//! identity and skip this.
+//! So a first identity also waits for proof that `/dev/urandom` got real entropy; see
+//! [`PullMeter`]. Later boots reuse the stored identity and skip this.
 
 use std::fs::File;
 use std::io;
@@ -35,8 +34,36 @@ pub const RANDOM_DEVICE: &str = "/dev/random";
 
 /// The input pool's credited bits. Unlike `/dev/random` it cannot be polled for a higher level.
 pub const ENTROPY_AVAIL: &str = "/proc/sys/kernel/random/entropy_avail";
-/// The input pool's level at which a first identity may be generated. See the module doc.
-pub const MIN_BITS_FOR_IDENTITY: u32 = 256;
+/// With this level in the input pool, the 32-byte read that makes a key pulls at least
+/// [`MIN_BITS_MOVED`] credited bits by itself.
+pub const ENOUGH_BITS_IN_POOL: u32 = 256;
+/// Bits seen leaving the input pool that make `/dev/urandom` fit for a long-term key.
+pub const MIN_BITS_MOVED: u32 = 128;
+/// From this level on a read of `/dev/urandom` pulls from the input pool, leaving 128 bits there
+/// (`account` and `xfer_secondary_pool` in 3.4's `drivers/char/random.c`).
+pub const PULL_LEVEL: u32 = 192;
+
+/// Tells when `/dev/urandom` holds enough real entropy for a long-term key, from the input pool's
+/// level. A level of [`ENOUGH_BITS_IN_POOL`] alone is not a usable test: from [`PULL_LEVEL`] on
+/// any reader of `/dev/urandom` drains the pool, and the kernel itself does when Wi-Fi scans, so
+/// the level can stay under it for good (25 minutes on the Glass, at 130-182 bits). But each of
+/// those drops is entropy moved into `/dev/urandom`, since nothing here reads `/dev/random`.
+#[derive(Debug, Default)]
+pub struct PullMeter {
+    last: Option<u32>,
+    moved: u32,
+}
+
+impl PullMeter {
+    /// Takes a new reading; returns whether the pool has enough now.
+    pub fn update(&mut self, level: u32) -> bool {
+        if let Some(last) = self.last {
+            self.moved = self.moved.saturating_add(last.saturating_sub(level));
+        }
+        self.last = Some(level);
+        level >= ENOUGH_BITS_IN_POOL || self.moved >= MIN_BITS_MOVED
+    }
+}
 
 /// The credited bits now; `None` if the kernel does not say.
 pub fn entropy_avail(path: &Path) -> Option<u32> {
@@ -151,6 +178,26 @@ mod tests {
         assert!(!wait.seeded().unwrap());
         pool.seed();
         assert!(wait.seeded().unwrap());
+    }
+
+    #[test]
+    fn a_full_pool_is_enough() {
+        let mut m = PullMeter::default();
+        assert!(!m.update(255));
+        assert!(m.update(256));
+    }
+
+    #[test]
+    fn entropy_moved_out_of_the_pool_is_enough_without_ever_filling_it() {
+        let mut m = PullMeter::default();
+        // Rising is credit, not a move; each fall from 192 to 128 moves 64 bits.
+        assert!(!m.update(64));
+        assert!(!m.update(192));
+        assert!(!m.update(128));
+        assert!(!m.update(191));
+        assert!(!m.update(190));
+        assert!(!m.update(192));
+        assert!(m.update(128));
     }
 
     #[test]

@@ -143,6 +143,12 @@ fn a_first_identity_waits_for_more_entropy_than_the_poll_says() {
     std::fs::write(&level, "255\n").unwrap();
     c.rng_tick();
     assert!(!state_file(&state).exists());
+    // The fall from 255 to 200 moved 55 bits: not yet what a key needs.
+    c.rng = super::Rng::Gathering { next_check_ms: 0 };
+    std::fs::write(&level, "200\n").unwrap();
+    c.rng_tick();
+    assert!(!state_file(&state).exists());
+    // Reaching the mark needs another 73 moved, here by the pool filling instead.
 
     c.rng = super::Rng::Gathering { next_check_ms: 0 };
     std::fs::write(&level, "256\n").unwrap();
@@ -186,4 +192,25 @@ fn a_dial_waits_through_the_gathering_too() {
     c.rng_tick();
     assert_eq!(c.conn_fds().len(), 1);
     drop::<(TcpStream, _)>(peer.accept().unwrap());
+}
+
+#[test]
+fn a_first_identity_comes_when_the_pool_keeps_being_drained() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    let level = d.path().join("entropy_avail");
+    let mut c = glass(&state, &pool.path);
+    c.entropy_avail = level.clone();
+    std::fs::write(&level, "192\n").unwrap();
+    pool.seed();
+    c.on_rng_event();
+    for (n, bits) in ["128", "191", "128", "190", "127"].iter().enumerate() {
+        assert!(!state_file(&state).exists(), "too early at step {n}");
+        c.rng = super::Rng::Gathering { next_check_ms: 0 };
+        std::fs::write(&level, format!("{bits}\n")).unwrap();
+        c.rng_tick();
+    }
+    assert!(state_file(&state).exists());
+    assert_eq!(c.listener_fds().len(), 1);
 }

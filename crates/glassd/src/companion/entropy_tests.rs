@@ -187,3 +187,34 @@ fn a_dial_waits_through_the_gathering_too() {
     assert_eq!(c.conn_fds().len(), 1);
     drop::<(TcpStream, _)>(peer.accept().unwrap());
 }
+
+#[test]
+fn a_seed_makes_a_first_identity_not_wait_for_the_level() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    let level = d.path().join("entropy_avail");
+    std::fs::write(&level, "64\n").unwrap();
+    let mut c = glass(&state, &pool.path);
+    c.entropy_avail = level;
+    c.seed_used = true;
+    pool.seed();
+    c.on_rng_event();
+    assert!(state_file(&state).exists());
+    assert_eq!(c.listener_fds().len(), 1);
+    // The next boot has a seed of its own.
+    assert!(state.join(super::entropy::SEED_FILE).exists());
+}
+
+#[test]
+fn no_seed_is_saved_from_a_pool_that_passed_no_test() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    drop(Store::create(Store::path_in(&state)).unwrap());
+    let mut c = glass(&state, &pool.path);
+    pool.seed();
+    c.on_rng_event();
+    assert_eq!(c.listener_fds().len(), 1);
+    assert!(!state.join(super::entropy::SEED_FILE).exists());
+}

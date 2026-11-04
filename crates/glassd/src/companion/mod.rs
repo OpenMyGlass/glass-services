@@ -162,6 +162,10 @@ pub struct Companion {
     rng: Rng,
     /// Where the input pool's level is read.
     entropy_avail: PathBuf,
+    /// Where the seed for the next boot goes.
+    seed_path: PathBuf,
+    /// A trusted seed went in at this start: a first identity need not wait for the level.
+    seed_used: bool,
     /// A dial asked for before the pool was seeded.
     pending_dial: Option<String>,
     tcp_port: Option<u16>,
@@ -208,6 +212,8 @@ impl Companion {
     ) -> Result<Companion, CompanionError> {
         let store_path = Store::path_in(state_dir);
         let store = Store::load(&store_path)?;
+        let seed_path = state_dir.join(entropy::SEED_FILE);
+        let seed_used = entropy::use_seed(&seed_path, Path::new(entropy::URANDOM_DEVICE));
         match &store {
             Some(s) => log_bond(s),
             // A state directory that cannot exist disables the link now, not a minute from now.
@@ -225,6 +231,8 @@ impl Companion {
             store_path,
             rng: Rng::Failed,
             entropy_avail: entropy::ENTROPY_AVAIL.into(),
+            seed_path: seed_path.clone(),
+            seed_used,
             pending_dial: None,
             tcp_port,
             bt,
@@ -328,10 +336,11 @@ impl Companion {
 
     /// Brings the link up, unless a first identity needs more entropy.
     fn pool_seeded_step(&mut self) {
+        let created = self.store.is_none();
         if self.store.is_none() {
             // A kernel that does not say cannot be waited on; Model B always mounts /proc.
             let bits = entropy::entropy_avail(&self.entropy_avail);
-            if bits.is_some_and(|b| b < entropy::MIN_BITS_FOR_IDENTITY) {
+            if !self.seed_used && bits.is_some_and(|b| b < entropy::MIN_BITS_FOR_IDENTITY) {
                 if !matches!(self.rng, Rng::Gathering { .. }) {
                     info!(
                         "companion: waiting for {} bits of entropy before generating the identity",
@@ -343,7 +352,7 @@ impl Companion {
                 };
                 return;
             }
-            if bits.is_none() {
+            if !self.seed_used && bits.is_none() {
                 warn!("companion: cannot read the entropy level; generating the identity anyway");
             }
             self.rng = Rng::Failed;
@@ -359,8 +368,20 @@ impl Companion {
                 }
             }
         }
+        self.save_next_seed(created);
         self.listeners = Listeners::bind(self.tcp_port, self.bt);
         self.rng = Rng::Ready;
+    }
+
+    /// Leaves a seed for the next boot, when the pool has passed one of the tests: a seed from a
+    /// weak pool would be trusted next time. `created`: the entropy gate just opened.
+    fn save_next_seed(&self, created: bool) {
+        if !(self.seed_used || created) {
+            return;
+        }
+        if let Err(e) = entropy::save_seed(&self.seed_path) {
+            warn!("companion: cannot save the random seed ({e})");
+        }
     }
 
     /// The dial asked for while waiting for the pool.

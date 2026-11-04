@@ -23,8 +23,8 @@ protox = "0.10"
 # schema cannot drift, and the note queue and its state machine with it. Pinned to a rev.
 # omg-core builds without an async runtime by default, and must stay that way here: never enable
 # its async-link feature in a normal dependency. See crates/glassd/src/companion.
-omg-protocol = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "8befaf9749ca70d0fb2d4468ce67a7bb38d4012b" }
-omg-core = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "8befaf9749ca70d0fb2d4468ce67a7bb38d4012b" }
+omg-protocol = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "523d7e515011fc29d6805ee22eae4be36f239f90" }
+omg-core = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "523d7e515011fc29d6805ee22eae4be36f239f90" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
 getrandom = "0.2"
 base64 = "0.22"

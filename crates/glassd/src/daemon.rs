@@ -288,6 +288,7 @@ fn companion_settings(s: &Settings) -> omg_protocol::Settings {
         power_saver: s.power_saver,
         deep_sleep: s.deep_sleep_enabled,
         deep_sleep_idle_s: s.deep_sleep_idle_ms.map(|ms| ms / 1000),
+        off_head_power_off_min: s.off_head_power_off_min,
         wink: s.wink_enabled,
         screen_timeout_s: s.screen_timeout_ms.map(|ms| ms / 1000),
         nudge: s.nudge_sleep_enabled,
@@ -308,6 +309,7 @@ fn settings_from_companion(s: &omg_protocol::Settings) -> Settings {
         power_saver: s.power_saver,
         deep_sleep_enabled: s.deep_sleep,
         deep_sleep_idle_ms: s.deep_sleep_idle_s.map(|v| v.saturating_mul(1000)),
+        off_head_power_off_min: s.off_head_power_off_min,
         wink_enabled: s.wink,
         screen_timeout_ms: s.screen_timeout_s.map(|v| v.saturating_mul(1000)),
         nudge_sleep_enabled: s.nudge,
@@ -2597,6 +2599,7 @@ mod tests {
         s.screen_timeout_ms = Some(30_000);
         s.nudge_sleep_enabled = Some(true);
         s.locale = Some(Locale::It as i32);
+        s.off_head_power_off_min = Some(60);
         let back = settings_from_companion(&companion_settings(&s));
         let mut merged = settings_rules::defaults();
         settings_rules::merge(&mut merged, &back);

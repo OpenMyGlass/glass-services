@@ -504,7 +504,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 [[package]]
 name = "omg-core"
 version = "0.1.0"
-source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=8befaf9749ca70d0fb2d4468ce67a7bb38d4012b#8befaf9749ca70d0fb2d4468ce67a7bb38d4012b"
+source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=523d7e515011fc29d6805ee22eae4be36f239f90#523d7e515011fc29d6805ee22eae4be36f239f90"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -520,7 +520,7 @@ dependencies = [
 [[package]]
 name = "omg-protocol"
 version = "0.1.0"
-source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=8befaf9749ca70d0fb2d4468ce67a7bb38d4012b#8befaf9749ca70d0fb2d4468ce67a7bb38d4012b"
+source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=523d7e515011fc29d6805ee22eae4be36f239f90#523d7e515011fc29d6805ee22eae4be36f239f90"
 dependencies = [
  "base64",
  "postcard",

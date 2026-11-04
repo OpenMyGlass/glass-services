@@ -2035,14 +2035,14 @@ impl Daemon {
         }
     }
 
-    /// One key event of a button. The camera button wakes the screen on key down (not off
-    /// the head); the frames are published; a short power press toggles a manual off-head.
+    /// One key event of a button. The camera button wakes the screen on key down (off the head
+    /// only for the quick timeout); the frames are published; a short power press toggles a manual off-head.
     fn on_key(&mut self, id: ButtonId, value: i32, at_us: u64) {
         let screen_off = self.policy.is_off();
         let (down, frames) = self.tracker(id).key(value, at_us, screen_off);
         if down
             && id == ButtonId::Camera
-            && let Some(ch) = self.policy.wake(now(), "button", false)
+            && let Some(ch) = self.policy.wake_key(now(), "button")
         {
             self.apply_change(ch);
         }

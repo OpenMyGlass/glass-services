@@ -90,7 +90,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 
 - `Button{BUTTON_ID_CAMERA, action, screen_off}`: `BUTTON_ACTION_PRESS` on release after a short press, `BUTTON_ACTION_LONG_PRESS` once when the hold time passes (500 ms, our value: Android's long-press time), then `BUTTON_ACTION_RELEASE`. `screen_off` is the screen state when the button went down, for every frame of that press. On Glass a press takes a picture and a long press records video; that is the app's decision. The camera button wakes the screen when it goes down and, unlike the touchpad, the waking press is delivered, with `screen_off: true`, so a camera app can start at once.
 - `Button{BUTTON_ID_POWER, ...}` is reported for information. `glassd` itself handles a short press (manual off-head, see Wearing). On route 1, the Android glue keeps Android's own power-key handling out of the short press (a keylayout change for the `twl6030_pwrbutton` device, milestone 3) and leaves the long press to Android (shut-down menu); on route 2, `glassd` handles the long press by asking the init system to power off (milestone 5).
-- The camera button still works while the Glass is off the head, as on stock Glass: the press is delivered (`screen_off: true`), but it does not wake the screen.
+- The camera button still works while the Glass is off the head. The press is delivered (`screen_off: true`), and it lights the screen for the quick timeout (3 s), for a glance at a Glass held in the hand; stock Glass kept the screen off. Touches and keep-on requests stay refused.
 - Broadcast to all subscribers.
 
 ## Head gestures (`TOPIC_HEAD`, milestone 2)

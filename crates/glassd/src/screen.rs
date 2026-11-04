@@ -202,6 +202,21 @@ impl ScreenPolicy {
         }
     }
 
+    /// The camera button: unlike [`Self::wake`] it also lights the screen off the head, for a
+    /// glance at a Glass held in the hand. Off the head that lasts the quick timeout, so a press
+    /// in a bag costs little, and the kept-on requests stay refused.
+    pub fn wake_key(&mut self, now: Now, reason: &'static str) -> Option<Change> {
+        if self.on_head {
+            return self.wake(now, reason, false);
+        }
+        if self.screen == Screen::On {
+            self.last_activity_us = now.mono_us;
+            return None;
+        }
+        self.quick = true;
+        self.set(now, Screen::On, reason)
+    }
+
     /// A screen-off tap or swipe.
     pub fn wake_gesture(&mut self, now: Now, reason: &'static str) -> Option<Change> {
         self.wake(now, reason, false)
@@ -538,6 +553,30 @@ mod tests {
         // The refused hold does not exist after the don: quick timeout applies.
         p.set_on_head(Now::at(3 * S), true);
         assert_eq!(p.next_deadline(), Some(6 * S));
+    }
+
+    #[test]
+    fn off_head_the_camera_key_lights_the_screen_for_the_quick_timeout() {
+        let mut p = policy();
+        p.set_on_head(Now::at(S), false);
+        let c = p.wake_key(Now::at(2 * S), "button").unwrap();
+        assert_eq!((c.screen, c.reason), (Screen::On, "button"));
+        assert_eq!(p.next_deadline(), Some(5 * S));
+        // A second press extends it, and touches and kept-on requests are still refused.
+        assert_eq!(p.wake_key(Now::at(4 * S), "button"), None);
+        assert_eq!(p.next_deadline(), Some(7 * S));
+        assert_eq!(p.touch_down(Now::at(4 * S)).0, TouchStart::Ignore);
+        assert_eq!(p.request(Now::at(4 * S), 1, Action::KeepOn, 0), None);
+        let c = p.on_timeout(Now::at(7 * S)).unwrap();
+        assert_eq!(c.screen, Screen::Off);
+    }
+
+    #[test]
+    fn on_the_head_the_camera_key_gives_the_normal_timeout() {
+        let mut p = policy();
+        p.sleep(Now::at(S), "request");
+        p.wake_key(Now::at(2 * S), "button").unwrap();
+        assert!(p.next_deadline().unwrap() > 5 * S);
     }
 
     #[test]

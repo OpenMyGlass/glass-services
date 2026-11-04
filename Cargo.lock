@@ -490,7 +490,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 [[package]]
 name = "omg-protocol"
 version = "0.1.0"
-source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=7b69ea3d468c9ed2692a4317a018d57a4ad352b2#7b69ea3d468c9ed2692a4317a018d57a4ad352b2"
+source = "git+https://github.com/OpenMyGlass/OpenMyGlass?rev=ceb692220e51ad888eed5f8554d1e00ad3e13d0f#ceb692220e51ad888eed5f8554d1e00ad3e13d0f"
 dependencies = [
  "base64",
  "postcard",

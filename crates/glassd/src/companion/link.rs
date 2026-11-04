@@ -93,6 +93,10 @@ pub enum Out {
     Unpair,
     /// Apply this locale to the launcher i18n. The `LocaleChanged` ack is already queued.
     ApplyLocale(Locale),
+    /// The companion asked for the settings: answer with [`Link::send_settings`].
+    SettingsGet,
+    /// The companion changed these settings.
+    SettingsSet(omg_protocol::Settings),
     /// Show this notification on the launcher timeline.
     Notification(Notification),
     /// Remove the timeline card with this key.
@@ -266,6 +270,15 @@ impl Link {
         self.device.locale = locale;
         if self.is_running() {
             vec![Out::Send(Frame::LocaleChanged(LocaleChanged { locale }))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Sends the current settings to the companion (an answer, or a change on the Glass).
+    pub fn send_settings(&mut self, settings: omg_protocol::Settings) -> Vec<Out> {
+        if self.is_running() {
+            vec![Out::Send(Frame::Settings(settings))]
         } else {
             Vec::new()
         }
@@ -515,6 +528,8 @@ impl Link {
                     locale: set.locale,
                 })));
             }
+            Frame::SettingsGet => out.push(Out::SettingsGet),
+            Frame::SettingsSet(s) => out.push(Out::SettingsSet(s)),
             Frame::NotificationPosted(n) => out.push(Out::Notification(n.notification)),
             Frame::NotificationRemoved(r) => out.push(Out::RemoveNotification(r.key)),
             Frame::SetRadio(SetRadio { radio, on }) => out.push(Out::SetRadio { radio, on }),

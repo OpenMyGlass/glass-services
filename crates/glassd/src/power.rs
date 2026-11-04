@@ -18,6 +18,7 @@
 //! that wakes glassd's poll loop; glassd then re-takes the lock. Everything is best effort: a
 //! missing path is logged, never fatal (on Android the framework owns power and this is inert).
 
+use crate::rtc::RtcAlarm;
 use crate::{info, warn};
 use glass_api::proto::Screen;
 use std::io;
@@ -66,7 +67,16 @@ pub struct PowerPaths {
     pub wakeup: Vec<PathBuf>,
     /// The cpufreq helper to run (`docs/model-b-energy.md` §4); found on `PATH`.
     pub cpu_tune: String,
+    /// The RTC whose alarm wakes the system; opened by the real back end only.
+    pub rtc: PathBuf,
 }
+
+/// How long after leaving the head the system suspends. The screen is already off; this only
+/// rides out a brief false reading.
+pub const OFF_HEAD_SETTLE_MS: u32 = 5_000;
+/// How long a wake off the head stays up: enough to read the sensor and any pending key. Each
+/// wake costs power, and off the head one comes every 10 s.
+pub const WAKE_HOLD_MS: u32 = 300;
 
 /// `/sys/power/state`.
 pub const DEFAULT_STATE: &str = "/sys/power/state";
@@ -98,6 +108,7 @@ impl Default for PowerPaths {
             runtime_pm: Vec::new(),
             wakeup: Vec::new(),
             cpu_tune: DEFAULT_CPU_TUNE.into(),
+            rtc: "/dev/rtc0".into(),
         }
     }
 }
@@ -144,6 +155,10 @@ pub struct PowerPolicy {
     screen_off: bool,
     /// When the screen last went off (`CLOCK_MONOTONIC` µs); the suspend window counts from here.
     off_since_us: Option<u64>,
+    /// Off the head: suspend without waiting for `deep_sleep`, after a shorter window.
+    off_head: bool,
+    /// Just woken off the head: the window is [`WAKE_HOLD_MS`] until the next suspend.
+    woken: bool,
     state: PowerState,
 }
 
@@ -163,6 +178,8 @@ impl PowerPolicy {
             idle_ms,
             screen_off: false,
             off_since_us: None,
+            off_head: false,
+            woken: false,
             state: PowerState::Active,
         }
     }
@@ -203,6 +220,16 @@ impl PowerPolicy {
         }
     }
 
+    /// The wear changed. Leaving the head starts the window again even if the screen was already
+    /// off, so a suspend never follows at once.
+    pub fn set_off_head(&mut self, now_us: u64, off: bool) {
+        self.off_head = off;
+        self.woken = false;
+        if off && self.state == PowerState::Idle {
+            self.off_since_us = Some(now_us);
+        }
+    }
+
     /// The screen state changed. `off` is whether the panel is now off (`SCREEN_OFF`); dim counts
     /// as on. Returns `true` when the next deadline may have changed.
     pub fn screen_changed(&mut self, now_us: u64, off: bool) -> bool {
@@ -210,6 +237,7 @@ impl PowerPolicy {
             return false;
         }
         self.screen_off = off;
+        self.woken = false;
         if off {
             self.off_since_us = Some(now_us);
             self.state = if self.power_saver {
@@ -224,9 +252,22 @@ impl PowerPolicy {
         true
     }
 
-    /// Whether a suspend may be attempted (policy on, deep sleep on, screen off).
+    /// Whether a suspend may be attempted (policy on, screen off, and deep sleep on or off the
+    /// head).
     fn suspend_allowed(&self) -> bool {
-        self.power_saver && self.deep_sleep && self.screen_off
+        self.power_saver && self.screen_off && (self.deep_sleep || self.off_head)
+    }
+
+    fn window_ms(&self) -> u32 {
+        if !self.off_head {
+            self.idle_ms
+        } else if self.woken {
+            WAKE_HOLD_MS
+        } else if self.deep_sleep {
+            self.idle_ms.min(OFF_HEAD_SETTLE_MS)
+        } else {
+            OFF_HEAD_SETTLE_MS
+        }
     }
 
     /// When [`PowerPolicy::on_timeout`] next has work (`CLOCK_MONOTONIC` µs): the end of the
@@ -236,7 +277,7 @@ impl PowerPolicy {
             && self.suspend_allowed()
             && let Some(off) = self.off_since_us
         {
-            return Some(off + u64::from(self.idle_ms) * 1000);
+            return Some(off + u64::from(self.window_ms()) * 1000);
         }
         None
     }
@@ -258,6 +299,7 @@ impl PowerPolicy {
         if self.state != PowerState::Suspended {
             return;
         }
+        self.woken = true;
         if self.screen_off && self.power_saver {
             self.off_since_us = Some(now_us);
             self.state = PowerState::Idle;
@@ -279,6 +321,10 @@ pub enum Op<'a> {
     /// Request suspend-to-RAM: write `mem` to `/sys/power/state`. The recording back end records
     /// this and returns at once; it never writes the real file.
     Suspend { state: &'a Path },
+    /// Set the RTC wake alarm `seconds` from now, or clear it.
+    Alarm { seconds: Option<u32> },
+    /// Sync the disks and power off.
+    PowerOff,
     /// Run `program args...` on `PATH` (the cpufreq helper).
     Run {
         program: &'a str,
@@ -304,6 +350,11 @@ pub struct Power {
     active_brightness: Option<u32>,
     /// The brightness last written, so it is written only on a change.
     brightness_now: Option<u32>,
+    /// Whether `mem` is in `/sys/power/state`. It stays there across a resume until `on` is
+    /// written: the kernel would suspend again at the next release of the wakelock, and early
+    /// suspend stays in force.
+    mem_requested: bool,
+    rtc: Option<RtcAlarm>,
 }
 
 impl std::fmt::Debug for Power {
@@ -343,6 +394,18 @@ fn run_system(op: &Op) -> io::Result<String> {
             f.write_all(b"mem\n")?;
             Ok(String::new())
         }
+        // Handled in `Power::op`, which owns the RTC.
+        Op::Alarm { .. } => Err(io::ErrorKind::Unsupported.into()),
+        Op::PowerOff => {
+            // SAFETY: no pointers; on success this does not return.
+            unsafe {
+                libc::sync();
+                if libc::reboot(libc::RB_POWER_OFF) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(String::new())
+        }
         Op::Run { program, args } => {
             let ok = std::process::Command::new(program)
                 .args(args)
@@ -356,7 +419,16 @@ fn run_system(op: &Op) -> io::Result<String> {
 impl Power {
     /// The real back end driving `paths`.
     pub fn system(paths: PowerPaths) -> Power {
-        Power::with_runner(paths, Box::new(run_system))
+        let rtc = match RtcAlarm::open(&paths.rtc) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("power: no wake alarm at {} ({e})", paths.rtc.display());
+                None
+            }
+        };
+        let mut power = Power::with_runner(paths, Box::new(run_system));
+        power.rtc = rtc;
+        power
     }
 
     /// A back end that only records its operations (never touches the host); for `--mock` and
@@ -385,11 +457,23 @@ impl Power {
             cpu: None,
             active_brightness: None,
             brightness_now: None,
+            mem_requested: false,
+            rtc: None,
         }
     }
 
     /// Runs one operation; logs and returns `None` if the file/helper is absent, else its output.
     fn op(&mut self, op: Op) -> Option<String> {
+        if let (Op::Alarm { seconds }, Some(rtc)) = (&op, &self.rtc) {
+            let result = match seconds {
+                Some(s) => rtc.arm(*s),
+                None => rtc.disarm(),
+            };
+            if let Err(e) = &result {
+                warn!("power: {} failed ({e})", describe(&op));
+            }
+            return result.ok().map(|()| String::new());
+        }
         match (self.run)(&op) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -509,6 +593,29 @@ impl Power {
         self.set_cpu_profile(initial);
     }
 
+    /// The wake alarm's descriptor, readable once it fires.
+    pub fn alarm_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.rtc.as_ref().map(RtcAlarm::fd)
+    }
+
+    /// The wake alarm fired.
+    pub fn acknowledge_alarm(&mut self) {
+        if let Some(rtc) = &mut self.rtc {
+            rtc.acknowledge();
+        }
+    }
+
+    /// Sets the wake alarm for the next suspend, or clears it.
+    pub fn set_alarm(&mut self, seconds: Option<u32>) {
+        self.op(Op::Alarm { seconds });
+    }
+
+    /// Syncs the disks and powers off. Only returns if that failed.
+    pub fn power_off(&mut self) {
+        info!("power: powering off");
+        self.op(Op::PowerOff);
+    }
+
     /// Requests a suspend cycle: re-arm the wake sources, release the wakelock, and write `mem`.
     /// Returns once requested (non-blocking); the system suspends when no wakelock is held and a
     /// wake source resumes it. [`Power::resume`] must run when activity next arrives.
@@ -518,12 +625,28 @@ impl Power {
         self.unlock();
         let state = self.paths.state.clone();
         self.op(Op::Suspend { state: &state });
+        self.mem_requested = true;
     }
 
-    /// The system resumed: re-take the wakelock so it does not immediately suspend again.
+    /// The system resumed: re-take the wakelock so it does not immediately suspend again. `mem`
+    /// stays requested, so releasing the lock sleeps again without an early-suspend cycle;
+    /// [`Power::stay_awake`] takes it back.
     pub fn resume(&mut self) {
         info!("power: resumed (re-taking {WAKELOCK})");
         self.lock();
+    }
+
+    /// The system is to stay up: take the wakelock, and take back the `mem` request. Waking the
+    /// screen goes through here.
+    pub fn stay_awake(&mut self) {
+        self.lock();
+        if self.mem_requested {
+            info!("power: suspend cancelled");
+            let state = self.paths.state.clone();
+            if self.write(state, "on") {
+                self.mem_requested = false;
+            }
+        }
     }
 
     pub fn holds_wakelock(&self) -> bool {
@@ -537,6 +660,9 @@ fn describe(op: &Op) -> String {
         Op::Write { path, value } => format!("write {}={value}", path.display()),
         Op::Read { path } => format!("read {}", path.display()),
         Op::Suspend { state } => format!("suspend mem -> {}", state.display()),
+        Op::Alarm { seconds: Some(s) } => format!("alarm in {s} s"),
+        Op::Alarm { seconds: None } => "alarm clear".to_string(),
+        Op::PowerOff => "power off".to_string(),
         Op::Run { program, args } => format!("run {program} {}", args.join(" ")),
     }
 }
@@ -547,6 +673,79 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const S: u64 = 1_000_000;
+
+    #[test]
+    fn off_the_head_suspends_soon_without_deep_sleep() {
+        let mut p = PowerPolicy::new(true, false, 60_000);
+        p.screen_changed(0, true);
+        assert_eq!(p.next_deadline(), None);
+        // The screen had been off for 100 s: the window counts from leaving the head.
+        p.set_off_head(100 * S, true);
+        assert_eq!(p.next_deadline(), Some(105 * S));
+        assert_eq!(p.on_timeout(105 * S), Some(PowerAction::Suspend));
+    }
+
+    #[test]
+    fn a_wake_off_the_head_is_short_and_a_wake_on_it_is_not() {
+        let mut p = PowerPolicy::new(true, false, 60_000);
+        p.screen_changed(0, true);
+        p.set_off_head(0, true);
+        p.on_timeout(5 * S);
+        p.resumed(100 * S);
+        assert_eq!(p.next_deadline(), Some(100 * S + 300_000));
+        assert_eq!(p.on_timeout(100 * S + 300_000), Some(PowerAction::Suspend));
+        p.resumed(110 * S);
+        // Back on the head with the screen still off: deep sleep is off, so no more suspends.
+        p.set_off_head(110 * S, false);
+        assert_eq!(p.next_deadline(), None);
+    }
+
+    #[test]
+    fn leaving_the_head_with_the_screen_on_waits_for_the_screen() {
+        let mut p = PowerPolicy::new(true, false, 60_000);
+        p.set_off_head(0, true);
+        assert_eq!(p.next_deadline(), None);
+        p.screen_changed(10 * S, true);
+        assert_eq!(p.next_deadline(), Some(15 * S));
+    }
+
+    #[test]
+    fn power_saver_off_never_suspends_off_the_head() {
+        let mut p = PowerPolicy::new(false, false, 60_000);
+        p.screen_changed(0, true);
+        p.set_off_head(0, true);
+        assert_eq!(p.next_deadline(), None);
+    }
+
+    #[test]
+    fn stay_awake_takes_back_the_mem_request_once() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut power = Power::recording(PowerPaths::default(), log.clone());
+        power.stay_awake();
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l: &String| l.contains("=on"))
+        );
+        power.suspend();
+        power.resume();
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l: &String| l.contains("=on"))
+        );
+        power.stay_awake();
+        power.stay_awake();
+        let on = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("=on"))
+            .count();
+        assert_eq!(on, 1);
+    }
 
     fn policy() -> PowerPolicy {
         // Policy on, deep sleep on, 60 s idle window.
@@ -706,6 +905,7 @@ mod tests {
             runtime_pm: Vec::new(),
             wakeup: Vec::new(),
             cpu_tune: "true".into(), // a harmless helper that exists on CI
+            rtc: "/nonexistent".into(),
         };
         let mut power = Power::system(paths);
         power.start(CpuProfile::Eco);

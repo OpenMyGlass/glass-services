@@ -66,6 +66,9 @@ pub mod settings_rules {
     /// Idle after screen-off before the energy policy suspends to RAM (`deep_sleep_idle_ms`).
     pub const DEEP_SLEEP_IDLE_MIN_MS: u32 = 5_000;
     pub const DEEP_SLEEP_IDLE_MAX_MS: u32 = 1_800_000;
+    /// `off_head_power_off_min`: 0 means never.
+    pub const OFF_HEAD_POWER_OFF_MAX_MIN: u32 = 720;
+    pub const OFF_HEAD_POWER_OFF_DEFAULT_MIN: u32 = 30;
     /// `audio_volume` in percent. The default is about 0 dB; the launcher maps it to gains.
     pub const AUDIO_VOLUME_MAX: u32 = 100;
     pub const AUDIO_VOLUME_DEFAULT: u32 = 87;
@@ -118,6 +121,7 @@ pub mod settings_rules {
             power_saver: Some(true),
             deep_sleep_enabled: Some(false),
             deep_sleep_idle_ms: Some(60_000),
+            off_head_power_off_min: Some(OFF_HEAD_POWER_OFF_DEFAULT_MIN),
             audio_volume: Some(AUDIO_VOLUME_DEFAULT),
             time_24h: Some(true),
             timezone_id: Some(TIMEZONE_DEFAULT),
@@ -177,6 +181,9 @@ pub mod settings_rules {
         if let Some(v) = change.deep_sleep_idle_ms {
             current.deep_sleep_idle_ms =
                 Some(v.clamp(DEEP_SLEEP_IDLE_MIN_MS, DEEP_SLEEP_IDLE_MAX_MS));
+        }
+        if let Some(v) = change.off_head_power_off_min {
+            current.off_head_power_off_min = Some(v.min(OFF_HEAD_POWER_OFF_MAX_MIN));
         }
         // Only a known, supported locale is accepted; LOCALE_UNSPECIFIED and any unknown value
         // leave the current one untouched (so a client can clear-less update without resetting

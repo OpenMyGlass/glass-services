@@ -6,6 +6,7 @@ use crate::buttons::{ButtonTracker, LONG_PRESS_MS};
 use crate::companion::{self, Companion};
 use crate::display::{Display, TouchpadSleep};
 use crate::mockcmd::{self, Command, CompanionCommand};
+use crate::offhead::OffHeadTimer;
 use crate::peers::PeerPolicy;
 use crate::power::{Power, PowerAction, PowerPaths, PowerPolicy};
 use crate::queue::OutQueue;
@@ -35,6 +36,15 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// How far `BOOTTIME` must pull ahead of `MONOTONIC` to count as a resume; the two are read
+/// apart, so a small difference means nothing.
+const RESUME_MIN_US: u64 = 100_000;
+
+/// The time spent suspended since boot.
+fn suspend_offset(t: Now) -> u64 {
+    t.boot_us.saturating_sub(t.mono_us)
+}
 
 /// How often `don_doff` is read while on-head detection is armed.
 const DON_DOFF_RECHECK_MS: u64 = 2000;
@@ -207,6 +217,10 @@ pub struct Daemon {
     radio: Option<Radio>,
     /// The idle -> suspend decision (always present; inert when the back end is absent).
     power_policy: PowerPolicy,
+    /// How long off the head, for the wake alarm and the power-off.
+    off_head: OffHeadTimer,
+    /// `BOOTTIME - MONOTONIC` when the last suspend was requested, to recognise a resume.
+    suspend_offset_us: Option<u64>,
     /// The energy-policy side-effect back end (`None`: not managing power, e.g. Android/mock-off).
     /// Named `power_io` to avoid clashing with the `power` power-button tracker.
     power_io: Option<Power>,
@@ -676,6 +690,7 @@ impl Daemon {
         };
         // The policy is inert without a back end: force power_saver off so it never arms a
         // suspend it cannot carry out (Android / --power off).
+        let off_head = OffHeadTimer::new(settings.off_head_power_off_min.unwrap_or(30));
         let power_policy = PowerPolicy::new(
             settings.power_saver.unwrap_or(true) && power.is_some(),
             settings.deep_sleep_enabled.unwrap_or(false),
@@ -812,6 +827,8 @@ impl Daemon {
             store,
             radio,
             power_policy,
+            off_head,
+            suspend_offset_us: None,
             power_io: power,
             imu,
             head: HeadService::default(),
@@ -876,6 +893,14 @@ impl Daemon {
             self.power_io
                 .as_ref()
                 .and_then(|_| self.power_policy.next_deadline()),
+            // Awake only: asleep, the alarm covers it. BOOTTIME to the monotonic base.
+            self.power_io
+                .as_ref()
+                .and(self.off_head.power_off_at())
+                .map(|at| {
+                    let t = now();
+                    t.mono_us + at.saturating_sub(t.boot_us)
+                }),
             self.hub.next_deadline(),
             self.battery_deadline,
             self.companion.as_ref().and_then(|c| {
@@ -921,6 +946,7 @@ impl Daemon {
             DonDoff,
             WinkAttr,
             Imu,
+            Alarm,
             Client(ClientId),
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
@@ -951,6 +977,9 @@ impl Daemon {
         if let Some(h) = &self.glasshub {
             add(h.don_doff_fd(), glass_hub::sysfs::POLL_EVENTS, Src::DonDoff);
             add(h.wink_fd(), glass_hub::sysfs::POLL_EVENTS, Src::WinkAttr);
+        }
+        if let Some(fd) = self.power_io.as_ref().and_then(Power::alarm_fd) {
+            add(fd, libc::POLLIN, Src::Alarm);
         }
         if let Some(m) = &self.mock
             && !m.eof
@@ -989,11 +1018,21 @@ impl Daemon {
                 Err(e)
             };
         }
-        // Reaching here past `poll` while a suspend was armed means the system is awake again (a
-        // wake source resumed it, or a timer fired): re-take the wakelock and re-drive the panel
-        // before handling whatever woke us.
+        // `poll` also returns before the kernel has suspended (a timer, a client), and that must
+        // not undo the request. A resume shows as BOOTTIME pulling ahead of MONOTONIC; with a
+        // cable the kernel never suspends and the alarm is what tells.
         if self.power_policy.is_suspended() {
-            self.resume_from_suspend();
+            let t = now();
+            let slept = self
+                .suspend_offset_us
+                .is_some_and(|o| suspend_offset(t) > o + RESUME_MIN_US);
+            let alarm = fds
+                .iter()
+                .zip(&srcs)
+                .any(|(p, s)| matches!(s, Src::Alarm) && p.revents != 0);
+            if slept || alarm {
+                self.resume_from_suspend(t);
+            }
         }
         for (pfd, src) in fds.iter().zip(srcs) {
             if pfd.revents == 0 {
@@ -1010,6 +1049,11 @@ impl Daemon {
                 }
                 Src::WinkAttr => self.read_wink(),
                 Src::Imu => self.read_imu(),
+                Src::Alarm => {
+                    if let Some(power) = &mut self.power_io {
+                        power.acknowledge_alarm();
+                    }
+                }
                 Src::Client(id) => {
                     if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                         self.read_client(id);
@@ -1081,9 +1125,24 @@ impl Daemon {
             && let Some(PowerAction::Suspend) = self.power_policy.on_timeout(t.mono_us)
             && let Some(power) = &mut self.power_io
         {
+            power.set_alarm(self.off_head.next_alarm_s(t.boot_us));
             power.suspend();
+            self.suspend_offset_us = Some(suspend_offset(t));
+        }
+        if self.power_io.is_some() && self.off_head.power_off_due(t.boot_us) {
+            self.power_off_if_unplugged(t);
         }
         self.run_mock_commands();
+    }
+
+    /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
+    /// desk is not found off: the wait starts again. So it does if powering off failed.
+    fn power_off_if_unplugged(&mut self, t: Now) {
+        let charging = companion::battery::read(&self.power_supply).is_some_and(|(_, c)| c);
+        if !charging && let Some(power) = &mut self.power_io {
+            power.power_off();
+        }
+        self.off_head.activity(t.boot_us);
     }
 
     /// Reads the battery and pushes it to the companion when it changed.
@@ -1323,6 +1382,9 @@ impl Daemon {
     fn drive_power(&mut self, screen: Screen) {
         let off = screen == Screen::Off;
         self.power_policy.screen_changed(now().mono_us, off);
+        if !off && let Some(power) = &mut self.power_io {
+            power.stay_awake();
+        }
         let profile = self.power_policy.cpu_profile();
         // With the policy off, keep the panel at full brightness whatever the screen state.
         let bright = if self.power_policy.power_saver() {
@@ -1336,17 +1398,28 @@ impl Daemon {
         }
     }
 
-    /// The system resumed after a suspend: re-arm the policy, re-take the wakelock, and force the
-    /// display to be re-driven on the next wake (so the panel bring-up is never skipped).
-    fn resume_from_suspend(&mut self) {
-        self.power_policy.resumed(now().mono_us);
+    /// The system resumed after a suspend: re-arm the policy, re-take the wakelock, force the
+    /// display to be re-driven on the next wake (so the panel bring-up is never skipped), and
+    /// read the on-head sensor, whose reading is what most of these wakes are for.
+    fn resume_from_suspend(&mut self, t: Now) {
+        let slept = self
+            .suspend_offset_us
+            .take()
+            .map_or(0, |o| suspend_offset(t).saturating_sub(o));
+        info!("power: resumed after {} ms asleep", slept / 1000);
+        self.power_policy.resumed(t.mono_us);
         if let Some(power) = &mut self.power_io {
             power.resume();
         }
         self.display.invalidate();
+        self.read_don_doff();
     }
 
     fn touch_outputs(&mut self, outs: &[Output], t: Now) {
+        if !outs.is_empty() {
+            let u = self.wear.user_input(t.mono_us);
+            self.wear_update(u);
+        }
         for o in outs {
             for step in self.gate.handle(o, &mut self.policy, t) {
                 match step {
@@ -1943,6 +2016,7 @@ impl Daemon {
         };
         let Some(d) = dev else { return };
         self.events.clear();
+        self.off_head.activity(now().boot_us);
         if let Err(e) = d.read_events(&mut self.events) {
             warn!("{id:?} button read failed ({e}); button disabled");
             *dev = None;
@@ -1979,6 +2053,10 @@ impl Daemon {
     }
 
     fn button_frames(&mut self, id: ButtonId, frames: Vec<Button>) {
+        if !frames.is_empty() {
+            let u = self.wear.user_input(now().mono_us);
+            self.wear_update(u);
+        }
         for b in frames {
             info!("button {id:?} {:?}", ButtonAction::try_from(b.action));
             let press = b.action == ButtonAction::Press as i32;
@@ -2004,6 +2082,11 @@ impl Daemon {
             self.publish(service_frame::Body::WearState(u.state));
             if u.wear_changed {
                 let t = now();
+                self.power_policy.set_off_head(t.mono_us, !on);
+                self.off_head.set_off_head(t.boot_us, !on);
+                if on && let Some(power) = &mut self.power_io {
+                    power.set_alarm(None);
+                }
                 self.touch_sleep.set(!on);
                 if let Some(ch) = self.policy.set_on_head(t, on) {
                     self.apply_change(ch);
@@ -2166,6 +2249,8 @@ impl Daemon {
             s.deep_sleep_enabled.unwrap_or(false),
             s.deep_sleep_idle_ms.unwrap_or(60_000),
         );
+        self.off_head
+            .set_power_off_min(s.off_head_power_off_min.unwrap_or(30));
         self.drive_power(self.policy.screen());
     }
 

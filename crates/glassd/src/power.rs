@@ -396,6 +396,10 @@ fn run_system(op: &Op) -> io::Result<String> {
         }
         // Handled in `Power::op`, which owns the RTC.
         Op::Alarm { .. } => Err(io::ErrorKind::Unsupported.into()),
+        // Bionic has no reboot(2) wrapper, and on Android the framework owns the power-off.
+        #[cfg(target_os = "android")]
+        Op::PowerOff => Err(io::ErrorKind::Unsupported.into()),
+        #[cfg(not(target_os = "android"))]
         Op::PowerOff => {
             // SAFETY: no pointers; on success this does not return.
             unsafe {

@@ -41,7 +41,8 @@ use glass_api::proto::{Wear, WearSource, WearState};
 pub const FORCED_ON_MS: u64 = 30_000;
 
 /// With an untrusted off-head reading, how long without user input before the Glass is assumed
-/// off the head. Same as the default screen timeout: the screen is off by then anyway.
+/// off the head. Same as the default screen timeout. With a longer timeout, or a client holding
+/// the screen on, a stuck sensor can turn the screen off in use; a key press brings it back.
 pub const NEVER_WORN_IDLE_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

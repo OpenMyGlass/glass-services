@@ -1138,8 +1138,8 @@ impl Daemon {
     /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
     /// desk is not found off: the wait starts again. So it does if powering off failed.
     fn power_off_if_unplugged(&mut self, t: Now) {
-        let charging = companion::battery::read(&self.power_supply).is_some_and(|(_, c)| c);
-        if !charging && let Some(power) = &mut self.power_io {
+        let cable = companion::battery::cable_connected(&self.power_supply);
+        if !cable && let Some(power) = &mut self.power_io {
             power.power_off();
         }
         self.off_head.activity(t.boot_us);
@@ -2050,15 +2050,19 @@ impl Daemon {
     }
 
     fn button_frames(&mut self, id: ButtonId, frames: Vec<Button>) {
+        // A press that takes back an assumed off-head has done its job: on the power key it must
+        // not also force the Glass off the head.
+        let mut took_back = false;
         if !frames.is_empty() {
             let u = self.wear.user_input(now().mono_us);
+            took_back = u.is_some();
             self.wear_update(u);
         }
         for b in frames {
             info!("button {id:?} {:?}", ButtonAction::try_from(b.action));
             let press = b.action == ButtonAction::Press as i32;
             self.publish(service_frame::Body::Button(b));
-            if id == ButtonId::Power && press {
+            if id == ButtonId::Power && press && !took_back {
                 let u = self.wear.power_key(now().mono_us);
                 self.wear_update(u);
             }
@@ -2077,12 +2081,14 @@ impl Daemon {
                 WearSource::try_from(u.state.source)
             );
             self.publish(service_frame::Body::WearState(u.state));
+            self.off_head.set_watching(!self.wear.hub_paused());
             if u.wear_changed {
                 let t = now();
                 self.power_policy.set_off_head(t.mono_us, !on);
                 self.off_head.set_off_head(t.boot_us, !on);
-                if on && let Some(power) = &mut self.power_io {
-                    power.set_alarm(None);
+                // Now, not only at the next request: a suspend may already be pending.
+                if let Some(power) = &mut self.power_io {
+                    power.set_alarm(self.off_head.next_alarm_s(t.boot_us));
                 }
                 self.touch_sleep.set(!on);
                 if let Some(ch) = self.policy.set_on_head(t, on) {

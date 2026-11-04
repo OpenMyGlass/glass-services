@@ -233,7 +233,7 @@ impl PowerPolicy {
     /// The screen state changed. `off` is whether the panel is now off (`SCREEN_OFF`); dim counts
     /// as on. Returns `true` when the next deadline may have changed.
     pub fn screen_changed(&mut self, now_us: u64, off: bool) -> bool {
-        if off == self.screen_off && self.state != PowerState::Suspended {
+        if off == self.screen_off {
             return false;
         }
         self.screen_off = off;

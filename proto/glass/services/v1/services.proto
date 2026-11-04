@@ -33,6 +33,9 @@ message ClientFrame {
     Transcript provider_transcript = 16;          // a relayed request's transcript; request_id = the link id
     // The owner picked an action on, or dismissed, a companion notification card (on the Glass):
     CompanionNotificationAction companion_notification_action = 17; // milestone 3
+    // Notes taken on the Glass, synced to the companion when it is there (docs/api.md "Notes"):
+    NoteAdd note_add = 18;
+    NoteSpeak note_speak = 19;
   }
 }
 
@@ -52,6 +55,7 @@ enum Topic {
   TOPIC_BUTTON = 7;                          // Button
   TOPIC_LOCATION = 8;                        // Location, LocationStatus (milestone 4)
   TOPIC_COMPANION = 9;                       // CompanionState (milestone 3)
+  TOPIC_NOTES = 10;                          // NoteEvent
 }
 
 message Subscribe {
@@ -133,6 +137,7 @@ message ServiceFrame {
     // Companion notifications relayed from the phone to the timeline (TOPIC_COMPANION):
     CompanionNotification companion_notification = 21;                 // milestone 3
     CompanionNotificationRemoved companion_notification_removed = 22;  // milestone 3
+    NoteEvent note_event = 23;
   }
 }
 
@@ -426,4 +431,58 @@ message CompanionNotificationAction {        // client -> glassd: the owner's ch
   string key = 1;
   uint32 action_index = 2;                   // the action to invoke (when dismiss is false)
   bool dismiss = 3;                          // true: dismiss the card instead of invoking an action
+}
+
+// ---- notes: taken on the Glass, held in glassd's queue until the companion has a verified copy ----
+
+message NoteAttachment {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_VOICE = 1;                          // the audio of a voice note; the companion transcribes it
+    KIND_PHOTO = 2;
+    KIND_VIDEO = 3;
+  }
+  Kind kind = 1;
+  string mime = 2;                           // e.g. "audio/wav"
+  string path = 3;                           // absolute path of a regular file; glassd copies it and leaves it alone
+  optional uint32 duration_ms = 4;           // for audio and video, when known
+}
+
+message NoteAdd {
+  uint32 request_id = 1;                     // chosen by the client; comes back in the NoteEvent
+  optional string text = 2;
+  Locale locale = 3;                         // language of the note; unspecified = the current UI language
+  repeated NoteAttachment attachments = 4;
+}
+
+// Ask the companion to read a note aloud. Speech is made on the companion, never on the Glass; with
+// no companion, the answer is KIND_SPEECH_FINISHED with an error.
+message NoteSpeak {
+  uint32 request_id = 1;                     // chosen by the client; comes back in the NoteEvents
+  string note_id = 2;                        // 32 lowercase hex digits
+  optional string text = 3;                  // what to say; absent = the note's own text as the companion holds it
+  Locale locale = 4;                         // unspecified = the current UI language
+}
+
+message NoteEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ADDED = 1;                          // the note is sealed in the queue: request_id, note_id
+    KIND_ADD_FAILED = 2;                     // nothing was queued: request_id, detail
+    KIND_SYNCED = 3;                         // the companion verified the note; the Glass's copy is gone unless configured to stay
+    KIND_DEFERRED = 4;                       // the companion paused this note; it stays queued. detail says why
+    KIND_BLOCKED = 5;                        // kept, but not offered again until someone acts. detail says why; tell the owner
+    KIND_TRANSCRIPT = 6;                     // detail is the text. Only while the note is still on the Glass
+    KIND_SPEECH_AUDIO = 7;                   // request_id; sample_rate and audio: PCM 16-bit little-endian mono, pieces in order
+    KIND_SPEECH_FINISHED = 8;                // request_id; detail is the error, or empty
+    KIND_QUEUE = 9;                          // pending_notes and pending_bytes changed
+  }
+  Kind kind = 1;
+  uint32 request_id = 2;
+  string note_id = 3;
+  string detail = 4;
+  uint32 sample_rate = 5;
+  bytes audio = 6;
+  uint32 pending_notes = 7;
+  uint64 pending_bytes = 8;
 }

@@ -760,8 +760,11 @@ impl Daemon {
             }
             c.extend(["dictation", "companion"]);
             // glassd holds the phone link itself (not an external provider).
-            if companion.is_some() {
+            if let Some(link) = &companion {
                 c.push("companion-link");
+                if link.notes_available() {
+                    c.push("notes");
+                }
             }
             c
         };
@@ -875,6 +878,11 @@ impl Daemon {
                 .and_then(|_| self.power_policy.next_deadline()),
             self.hub.next_deadline(),
             self.battery_deadline,
+            self.companion.as_ref().and_then(|c| {
+                // Wall clock to the monotonic base, and never a busy loop.
+                let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
+                Some(now().mono_us + wait_ms.max(companion::notes::MIN_WAIT_MS) * 1000)
+            }),
         ]
         .into_iter()
         .flatten()
@@ -1062,6 +1070,12 @@ impl Daemon {
         if self.battery_deadline.is_some_and(|d| t.mono_us >= d) {
             self.poll_battery(t);
         }
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.notes_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
         // Energy policy: the deep-idle window may have elapsed (screen off long enough).
         if self.power_io.is_some()
             && let Some(PowerAction::Suspend) = self.power_policy.on_timeout(t.mono_us)
@@ -1265,6 +1279,20 @@ impl Daemon {
                     let events = match &mut self.companion {
                         Some(c) => c.notification_action(key, choice),
                         None => Vec::new(),
+                    };
+                    self.companion_events(events);
+                }
+                Effect::NoteAdd(add) => {
+                    let events = match &mut self.companion {
+                        Some(c) => c.note_add(add),
+                        None => companion::notes::refused_add(&add),
+                    };
+                    self.companion_events(events);
+                }
+                Effect::NoteSpeak(speak) => {
+                    let events = match &mut self.companion {
+                        Some(c) => c.note_speak(speak),
+                        None => companion::notes::refused_speak(&speak),
                     };
                     self.companion_events(events);
                 }
@@ -1689,6 +1717,7 @@ impl Daemon {
                 }
                 // settings_changed pushes the result back to the companion.
                 E::SettingsSet(s) => self.apply_settings_change(settings_from_companion(&s)),
+                E::Note(event) => self.publish(service_frame::Body::NoteEvent(event)),
                 E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
                     to_proto_notification(n),
                 )),

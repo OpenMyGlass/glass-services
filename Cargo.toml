@@ -20,9 +20,11 @@ prost = "0.14"
 prost-build = "0.14"
 protox = "0.10"
 # The companion-link wire protocol, shared verbatim with the OpenMyGlass companion so the
-# schema cannot drift. Pinned to a rev; this is the one dependency glassd takes on the
-# companion workspace (pure data + serde, no async, no I/O). See crates/glassd/src/companion.
-omg-protocol = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "ceb692220e51ad888eed5f8554d1e00ad3e13d0f" }
+# schema cannot drift, and the note queue and its state machine with it. Pinned to a rev.
+# omg-core builds without an async runtime by default, and must stay that way here: never enable
+# its async-link feature in a normal dependency. See crates/glassd/src/companion.
+omg-protocol = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "daebebf33827af950139f31ef13b9888e5c77c12" }
+omg-core = { git = "https://github.com/OpenMyGlass/OpenMyGlass", rev = "daebebf33827af950139f31ef13b9888e5c77c12" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
 getrandom = "0.2"
 base64 = "0.22"

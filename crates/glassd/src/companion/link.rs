@@ -97,6 +97,8 @@ pub enum Out {
     SettingsGet,
     /// The companion changed these settings.
     SettingsSet(omg_protocol::Settings),
+    /// A frame of note sync, for [`super::notes::Notes`].
+    Note(Frame),
     /// Show this notification on the launcher timeline.
     Notification(Notification),
     /// Remove the timeline card with this key.
@@ -170,6 +172,11 @@ impl Link {
             peer_name: None,
             peer_capabilities: Vec::new(),
         }
+    }
+
+    /// Adds a capability to our `Hello`. Call before [`Link::start`].
+    pub fn advertise(&mut self, capability: &str) {
+        self.capabilities.push(capability.to_string());
     }
 
     /// Permits or forbids a first pairing with an unbonded peer (the setup window).
@@ -542,6 +549,7 @@ impl Link {
                 self.close(out, "companion unpaired");
             }
             Frame::Bye(Bye { reason }) => self.close(out, &format!("companion bye: {reason}")),
+            f if omg_core::notes::is_note_frame(&f) => out.push(Out::Note(f)),
             // Ping/Pong the other way, and the many SCAFFOLD frames, are ignored for now.
             _ => {}
         }

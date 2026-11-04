@@ -2016,7 +2016,6 @@ impl Daemon {
         };
         let Some(d) = dev else { return };
         self.events.clear();
-        self.off_head.activity(now().boot_us);
         if let Err(e) = d.read_events(&mut self.events) {
             warn!("{id:?} button read failed ({e}); button disabled");
             *dev = None;
@@ -2027,12 +2026,10 @@ impl Daemon {
             ButtonId::Power => KEY_POWER,
             _ => KEY_CAMERA,
         };
-        let keys: Vec<(i32, u64)> = self
-            .events
-            .iter()
-            .filter(|e| e.type_ == EV_KEY && e.code == code)
-            .map(|e| (e.value, e.time_us))
-            .collect();
+        let keys = key_events(&self.events, code);
+        if !keys.is_empty() {
+            self.off_head.activity(now().boot_us);
+        }
         for (value, at) in keys {
             self.on_key(id, value, at);
         }
@@ -2396,8 +2393,32 @@ impl Drop for Daemon {
     }
 }
 
+/// The state changes of `code` among `events`, as (value, time). Readable does not mean pressed:
+/// the kernel's `input_reset_device` sends a lone `SYN_REPORT` on every resume.
+fn key_events(events: &[glass_evdev::Event], code: u16) -> Vec<(i32, u64)> {
+    events
+        .iter()
+        .filter(|e| e.type_ == EV_KEY && e.code == code)
+        .map(|e| (e.value, e.time_us))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sync_of_a_resume_is_not_a_key_press() {
+        let event = |type_, code, value| glass_evdev::Event {
+            time_us: 7,
+            type_,
+            code,
+            value,
+        };
+        assert_eq!(key_events(&[event(0, 0, 1)], KEY_CAMERA), vec![]);
+        let press = [event(EV_KEY, KEY_CAMERA, 1), event(0, 0, 0)];
+        assert_eq!(key_events(&press, KEY_CAMERA), vec![(1, 7)]);
+        assert_eq!(key_events(&press, KEY_POWER), vec![]);
+    }
+
     use super::*;
 
     fn dir(name: &str) -> PathBuf {

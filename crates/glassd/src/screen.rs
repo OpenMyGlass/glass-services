@@ -157,6 +157,10 @@ impl ScreenPolicy {
 
     /// User activity: restarts the timer and ends the quick timeout; restores a dim screen.
     pub fn activity(&mut self, now: Now) -> Option<Change> {
+        // Off the head the screen is only ever on for a key's glance, which must stay short.
+        if !self.on_head {
+            return None;
+        }
         match self.screen {
             Screen::Off | Screen::Unknown => None,
             Screen::On => {
@@ -269,6 +273,7 @@ impl ScreenPolicy {
     ) -> Option<Change> {
         match action {
             Action::Unspecified => None,
+            Action::Wake if !self.on_head => None,
             Action::Wake => {
                 self.quick = false;
                 self.wake(now, "request", false)
@@ -567,6 +572,10 @@ mod tests {
         assert_eq!(p.next_deadline(), Some(7 * S));
         assert_eq!(p.touch_down(Now::at(4 * S)).0, TouchStart::Ignore);
         assert_eq!(p.request(Now::at(4 * S), 1, Action::KeepOn, 0), None);
+        // No client can stretch it either.
+        assert_eq!(p.request(Now::at(5 * S), 1, Action::UserActivity, 0), None);
+        assert_eq!(p.request(Now::at(5 * S), 1, Action::Wake, 0), None);
+        assert_eq!(p.next_deadline(), Some(7 * S));
         let c = p.on_timeout(Now::at(7 * S)).unwrap();
         assert_eq!(c.screen, Screen::Off);
     }

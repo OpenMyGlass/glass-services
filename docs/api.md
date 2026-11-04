@@ -110,6 +110,7 @@ The touchpad is on the right temple. Directions are named as on Glass (GDK `SWIP
 
 - `WearState{wear, source}`:
   - `WEAR_SOURCE_SENSOR`: the glasshub on-head detection, when `on_head_detection_enabled` is true (the default).
+    A Glass not worn since boot: after 120 s with the sensor at 0 and no user input it counts as off the head, so it can sleep; a touch or a key takes that back.
   - `WEAR_SOURCE_FORCED`: detection off, so the Glass is assumed on the head (`WEAR_ON_HEAD`); also during the 30 s after boot.
   - `WEAR_SOURCE_POWER_KEY`: a short power-key press toggles a manual off-head; the next press gives a timed on-head (30 s, then back to the sensor if detection is on).
   - `WEAR_SOURCE_HINGE`: closing the hinge forces off-head; opening it gives a timed on-head. The Linux input code of the hinge switch is not confirmed yet (device needed), so this source may be missing (`hinge` capability).

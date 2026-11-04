@@ -26,6 +26,10 @@
 //! setting). Stock Glass has the same effect in another form: its sensor state is UNKNOWN
 //! until the first DON/DOFF *event*, and a stuck sensor never produces one.
 //!
+//! A Glass that was never worn since boot would then never count as off the head, and never
+//! sleep. So after [`NEVER_WORN_IDLE_MS`] with the sensor at 0 and no user input it is assumed
+//! off the head. A key press takes that back, so a stuck sensor cannot lock the owner out.
+//!
 //! The source of a manual mode is what caused it. A [`WearState`] is reported when the wear
 //! or its source changes; [`Update::wear_changed`] says whether the wear itself changed (the
 //! off-head and don actions run only then).
@@ -35,6 +39,10 @@ use glass_api::proto::{Wear, WearSource, WearState};
 /// The forced on-head period after boot, and after a power-key or hinge on-head
 /// (wake-policy.md §1, `force_donned_timeout_ms`).
 pub const FORCED_ON_MS: u64 = 30_000;
+
+/// With an untrusted off-head reading, how long without user input before the Glass is assumed
+/// off the head. Same as the default screen timeout: the screen is off by then anyway.
+pub const NEVER_WORN_IDLE_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -60,6 +68,11 @@ pub struct WearMachine {
     sensor: Option<bool>,
     /// The sensor has reported on the head at least once: its off-head readings count.
     sensor_trusted: bool,
+    /// An off-head reading was kept out because the sensor is not trusted yet.
+    untrusted_off: bool,
+    /// Off the head by [`NEVER_WORN_IDLE_MS`], not because the sensor is trusted.
+    assumed_off: bool,
+    last_input_us: u64,
     reported: WearState,
 }
 
@@ -84,6 +97,9 @@ impl WearMachine {
             detection,
             sensor: None,
             sensor_trusted: false,
+            untrusted_off: false,
+            assumed_off: false,
+            last_input_us: now_us,
             reported: state(true, WearSource::Forced, now_us),
         }
     }
@@ -110,8 +126,27 @@ impl WearMachine {
     pub fn next_deadline(&self) -> Option<u64> {
         match self.mode {
             Mode::TimedOn { until_us } => Some(until_us),
+            Mode::Defer if self.never_worn_pending() => {
+                Some(self.last_input_us + NEVER_WORN_IDLE_MS * 1000)
+            }
             _ => None,
         }
+    }
+
+    fn never_worn_pending(&self) -> bool {
+        self.detection && self.untrusted_off && !self.sensor_trusted && !self.assumed_off
+    }
+
+    /// The owner touched the Glass or pressed a key: it is in use. Restarts the never-worn wait,
+    /// and takes back an assumed off-head.
+    pub fn user_input(&mut self, now_us: u64) -> Option<Update> {
+        self.last_input_us = now_us;
+        if !self.assumed_off {
+            return None;
+        }
+        self.assumed_off = false;
+        self.sensor = Some(true);
+        self.report(now_us)
     }
 
     fn set_mode(&mut self, mode: Mode, cause: WearSource, now_us: u64) -> Option<Update> {
@@ -140,6 +175,14 @@ impl WearMachine {
 
     /// The timed on-head ends.
     pub fn on_timeout(&mut self, now_us: u64) -> Option<Update> {
+        if self.mode == Mode::Defer
+            && self.never_worn_pending()
+            && now_us >= self.last_input_us + NEVER_WORN_IDLE_MS * 1000
+        {
+            self.assumed_off = true;
+            self.sensor = Some(false);
+            return self.report(now_us);
+        }
         match self.mode {
             Mode::TimedOn { until_us } if now_us >= until_us => {
                 if self.detection {
@@ -158,7 +201,9 @@ impl WearMachine {
     pub fn sensor(&mut self, now_us: u64, on: bool) -> Option<Update> {
         if on {
             self.sensor_trusted = true;
+            self.assumed_off = false;
         } else if !self.sensor_trusted {
+            self.untrusted_off = true;
             return None;
         }
         self.sensor = Some(on);
@@ -258,6 +303,40 @@ mod tests {
             Some((Wear::OnHead, WearSource::Sensor, true))
         );
         assert_eq!(m.sensor(41 * S, true), None);
+    }
+
+    #[test]
+    fn a_never_worn_glass_is_assumed_off_the_head_after_idle_and_a_key_takes_it_back() {
+        let idle = NEVER_WORN_IDLE_MS * 1000;
+        let mut m = WearMachine::new(0, true);
+        assert_eq!(m.sensor(S, false), None);
+        assert_eq!(m.on_timeout(30 * S), None);
+        assert!(m.on_head());
+        // Input restarts the wait.
+        assert_eq!(m.user_input(60 * S), None);
+        assert_eq!(m.next_deadline(), Some(60 * S + idle));
+        assert_eq!(m.on_timeout(60 * S + idle - 1), None);
+        assert_eq!(
+            ws(m.on_timeout(60 * S + idle)),
+            Some((Wear::OffHead, WearSource::Sensor, true))
+        );
+        assert_eq!(m.next_deadline(), None);
+        assert!(!m.sensor_trusted());
+        // A key takes it back, and the wait starts again.
+        let t = 300 * S;
+        assert_eq!(
+            ws(m.user_input(t)),
+            Some((Wear::OnHead, WearSource::Sensor, true))
+        );
+        assert_eq!(m.next_deadline(), Some(t + idle));
+        // Worn after an assumed off-head: an ordinary don, and the sensor is trusted.
+        assert_eq!(ws(m.on_timeout(t + idle)).map(|u| u.0), Some(Wear::OffHead));
+        assert_eq!(
+            ws(m.sensor(t + idle + S, true)),
+            Some((Wear::OnHead, WearSource::Sensor, true))
+        );
+        assert!(m.sensor_trusted());
+        assert_eq!(m.next_deadline(), None);
     }
 
     #[test]

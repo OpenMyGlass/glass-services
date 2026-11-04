@@ -29,6 +29,8 @@ use std::process::Command;
 pub const DEFAULT_WIFI_IFACE: &str = "wlan0";
 /// Default Bluetooth HCI device (BCM4330 over the HCI UART).
 pub const DEFAULT_BT_HCI: &str = "hci0";
+/// The UART the Bluetooth chip is wired to.
+const DEFAULT_BT_UART: &str = "/dev/ttyO1";
 
 /// What one system command produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub struct Radio {
     run: Runner,
     wifi_iface: String,
     bt_hci: String,
+    /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
+    bt_uart: Option<String>,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -75,7 +79,9 @@ fn run_system(program: &str, args: &[&str]) -> io::Result<Outcome> {
 impl Radio {
     /// A radio that runs the real system tools, controlling `wifi_iface` (e.g. `wlan0`).
     pub fn system(wifi_iface: impl Into<String>) -> Radio {
-        Radio::with_runner(wifi_iface, Box::new(run_system))
+        let mut r = Radio::with_runner(wifi_iface, Box::new(run_system));
+        r.bt_uart = Some(DEFAULT_BT_UART.into());
+        r
     }
 
     /// A radio whose commands are only recorded, never run (for `--mock` and tests). Every
@@ -107,6 +113,7 @@ impl Radio {
             run,
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
+            bt_uart: None,
             wifi_on: None,
             bt_on: None,
         }
@@ -166,11 +173,37 @@ impl Radio {
             if !self.step("hciconfig", &[&hci, "down"]) {
                 self.step("bluetoothctl", &["power", "off"]);
             }
-            self.step("rfkill", &["block", "bluetooth"])
+            let r = self.step("rfkill", &["block", "bluetooth"]);
+            self.kick_bt_uart();
+            r
         };
         self.bt_on = Some(on);
         info!("radio: Bluetooth {}", if on { "on" } else { "off" });
         ok
+    }
+
+    /// Writes one byte to the Bluetooth UART, once per run.
+    ///
+    /// Powering the chip off changes CTS, which wakes the port. A port that has never transmitted
+    /// then idles with `CM_L4PER_UART2_CLKCTRL` IDLEST stuck at 1 (seen 3 -> 1 on a Glass, 3
+    /// boots), and that keeps the CORE power domain out of deep sleep. After one transmitted byte
+    /// it went back to 3 and stayed there through later block/unblock cycles. The chip is off,
+    /// so nothing receives the byte.
+    fn kick_bt_uart(&mut self) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(path) = self.bt_uart.take() else {
+            return;
+        };
+        let r = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&path)
+            .and_then(|mut f| f.write_all(&[0]));
+        match r {
+            Ok(()) => info!("radio: one byte sent on {path} so that the idle port can sleep"),
+            Err(e) => warn!("radio: cannot write to {path} ({e}): deep sleep may be blocked"),
+        }
     }
 
     /// Brings both radios to the wanted state, writing only what changed since the last call.

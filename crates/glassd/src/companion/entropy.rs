@@ -15,6 +15,13 @@
 //! Polling reads nothing, so it costs no entropy. Readiness also lasts on 3.4: `/dev/urandom`
 //! leaves at least 128 bits in the input pool, above the 64 that make `/dev/random` readable, and
 //! nothing in the image reads `/dev/random` itself.
+//!
+//! Readable is not enough for a long-term key, though. On 3.4 interrupts credit the nonblocking
+//! pool first, but input and disk events credit the input pool directly, so it can reach 64 bits
+//! with `/dev/urandom` barely seeded, and `/dev/urandom` pulls from it only at 192 bits or more.
+//! So a first identity also waits for [`MIN_BITS_FOR_IDENTITY`]: the 32-byte read that makes the
+//! key then pulls at least 128 credited bits, whatever the order. Later boots reuse the stored
+//! identity and skip this.
 
 use std::fs::File;
 use std::io;
@@ -25,6 +32,16 @@ use std::time::Instant;
 
 /// What the `getrandom` crate polls before it trusts `/dev/urandom`.
 pub const RANDOM_DEVICE: &str = "/dev/random";
+
+/// The input pool's credited bits. Unlike `/dev/random` it cannot be polled for a higher level.
+pub const ENTROPY_AVAIL: &str = "/proc/sys/kernel/random/entropy_avail";
+/// The input pool's level at which a first identity may be generated. See the module doc.
+pub const MIN_BITS_FOR_IDENTITY: u32 = 256;
+
+/// The credited bits now; `None` if the kernel does not say.
+pub fn entropy_avail(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
 
 /// A wait for the random pool, for a place in a `poll` set (`POLLIN`).
 pub struct PoolWait {
@@ -134,6 +151,15 @@ mod tests {
         assert!(!wait.seeded().unwrap());
         pool.seed();
         assert!(wait.seeded().unwrap());
+    }
+
+    #[test]
+    fn reads_the_pool_level() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("entropy_avail");
+        assert_eq!(entropy_avail(&path), None);
+        std::fs::write(&path, "191\n").unwrap();
+        assert_eq!(entropy_avail(&path), Some(191));
     }
 
     #[test]

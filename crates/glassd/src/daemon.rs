@@ -913,6 +913,10 @@ impl Daemon {
                 let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
                 Some(now().mono_us + wait_ms.max(companion::notes::MIN_WAIT_MS) * 1000)
             }),
+            self.companion.as_ref().and_then(|c| {
+                let wait_ms = c.rng_next_deadline()?.saturating_sub(companion::now_ms());
+                Some(now().mono_us + wait_ms * 1000)
+            }),
         ]
         .into_iter()
         .flatten()
@@ -1134,6 +1138,12 @@ impl Daemon {
             .companion
             .as_mut()
             .map(|c| c.notes_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.rng_tick())
             .unwrap_or_default();
         self.companion_events(events);
         // Energy policy: the deep-idle window may have elapsed (screen off long enough).

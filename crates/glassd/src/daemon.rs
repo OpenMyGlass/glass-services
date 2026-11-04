@@ -259,6 +259,47 @@ fn sync_attr(
 /// off, keeping the per-radio wishes so they are restored when it is turned off.
 /// Maps the companion's locale to the services `Locale` enum (both cover the same it/en/fr/es
 /// set; see `omg_protocol::Locale` and the `Locale` proto enum).
+/// The settings as the companion sees them. Radios have their own frames.
+fn companion_settings(s: &Settings) -> omg_protocol::Settings {
+    omg_protocol::Settings {
+        brightness: None,
+        head_wake: s.head_wake_enabled,
+        head_wake_angle_deg: s.head_wake_angle_deg.map(|a| a.round() as u8),
+        on_head_detection: s.on_head_detection_enabled,
+        audio_volume: s.audio_volume.map(|v| v.min(100) as u8),
+        time_24h: s.time_24h,
+        timezone_id: s.timezone_id,
+        power_saver: s.power_saver,
+        deep_sleep: s.deep_sleep_enabled,
+        deep_sleep_idle_s: s.deep_sleep_idle_ms.map(|ms| ms / 1000),
+        wink: s.wink_enabled,
+        screen_timeout_s: s.screen_timeout_ms.map(|ms| ms / 1000),
+        nudge: s.nudge_sleep_enabled,
+        locale: s.locale.map(|l| companion_locale(Some(l))),
+        radios: None,
+    }
+}
+
+/// A change from the companion, as glassd settings. `settings_rules::merge` clamps it.
+fn settings_from_companion(s: &omg_protocol::Settings) -> Settings {
+    Settings {
+        head_wake_enabled: s.head_wake,
+        head_wake_angle_deg: s.head_wake_angle_deg.map(f32::from),
+        on_head_detection_enabled: s.on_head_detection,
+        audio_volume: s.audio_volume.map(u32::from),
+        time_24h: s.time_24h,
+        timezone_id: s.timezone_id,
+        power_saver: s.power_saver,
+        deep_sleep_enabled: s.deep_sleep,
+        deep_sleep_idle_ms: s.deep_sleep_idle_s.map(|v| v.saturating_mul(1000)),
+        wink_enabled: s.wink,
+        screen_timeout_ms: s.screen_timeout_s.map(|v| v.saturating_mul(1000)),
+        nudge_sleep_enabled: s.nudge,
+        locale: s.locale.map(|l| proto_locale(l) as i32),
+        ..Default::default()
+    }
+}
+
 fn proto_locale(l: omg_protocol::Locale) -> Locale {
     match l {
         omg_protocol::Locale::It => Locale::It,
@@ -1638,6 +1679,16 @@ impl Daemon {
                         ..Default::default()
                     });
                 }
+                E::SettingsGet => {
+                    let s = companion_settings(&self.settings());
+                    let events = match &mut self.companion {
+                        Some(c) => c.send_settings(s),
+                        None => Vec::new(),
+                    };
+                    self.companion_events(events);
+                }
+                // settings_changed pushes the result back to the companion.
+                E::SettingsSet(s) => self.apply_settings_change(settings_from_companion(&s)),
                 E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
                     to_proto_notification(n),
                 )),
@@ -2053,6 +2104,11 @@ impl Daemon {
             };
             self.companion_events(events);
         }
+        let events = match &mut self.companion {
+            Some(c) => c.send_settings(companion_settings(s)),
+            None => Vec::new(),
+        };
+        self.companion_events(events);
         if let Some(st) = &self.store
             && let Err(e) = st.save(s)
         {
@@ -2301,6 +2357,35 @@ mod tests {
         s.on_head_detection_enabled = Some(on);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
+    }
+
+    #[test]
+    fn every_setting_round_trips_through_the_companion_mirror() {
+        let mut s = settings_rules::defaults();
+        s.head_wake_enabled = Some(true);
+        s.head_wake_angle_deg = Some(25.0);
+        s.on_head_detection_enabled = Some(false);
+        s.audio_volume = Some(40);
+        s.time_24h = Some(false);
+        s.timezone_id = Some(5);
+        s.power_saver = Some(false);
+        s.deep_sleep_enabled = Some(true);
+        s.deep_sleep_idle_ms = Some(90_000);
+        s.wink_enabled = Some(true);
+        s.screen_timeout_ms = Some(30_000);
+        s.nudge_sleep_enabled = Some(true);
+        s.locale = Some(Locale::It as i32);
+        let back = settings_from_companion(&companion_settings(&s));
+        let mut merged = settings_rules::defaults();
+        settings_rules::merge(&mut merged, &back);
+        assert_eq!(merged, s);
+        // Untouched fields stay untouched.
+        let only = settings_from_companion(&omg_protocol::Settings {
+            audio_volume: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(only.audio_volume, Some(10));
+        assert_eq!(only.time_24h, None);
     }
 
     #[test]

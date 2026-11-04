@@ -99,6 +99,10 @@ pub enum Event {
     Disconnected,
     /// Apply this locale to the launcher i18n (then it is acknowledged on the link).
     ApplyLocale(Locale),
+    /// The companion asked for the settings.
+    SettingsGet,
+    /// The companion changed these settings.
+    SettingsSet(omg_protocol::Settings),
     /// Show this notification on the launcher timeline.
     Notification(Notification),
     /// Remove the timeline card with this key.
@@ -365,6 +369,11 @@ impl Companion {
         self.on_active(move |l| l.locale_changed(locale))
     }
 
+    /// Sends the settings on the live link (an answer, or a change on the Glass).
+    pub fn send_settings(&mut self, settings: omg_protocol::Settings) -> Vec<Event> {
+        self.on_active(move |l| l.send_settings(settings.clone()))
+    }
+
     /// The owner picked a notification action (or dismissed it) on the Glass: relay it.
     pub fn notification_action(&mut self, key: String, choice: NotificationChoice) -> Vec<Event> {
         self.on_active(move |l| l.notification_action(key.clone(), choice))
@@ -438,6 +447,8 @@ impl Companion {
                     }
                 }
                 Out::ApplyLocale(l) => events.push(Event::ApplyLocale(l)),
+                Out::SettingsGet => events.push(Event::SettingsGet),
+                Out::SettingsSet(s) => events.push(Event::SettingsSet(s)),
                 Out::Notification(n) => events.push(Event::Notification(n)),
                 Out::RemoveNotification(k) => events.push(Event::RemoveNotification(k)),
                 Out::SetRadio { radio, on } => events.push(Event::SetRadio { radio, on }),

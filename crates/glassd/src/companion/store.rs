@@ -45,33 +45,48 @@ pub struct Store {
 
 impl Store {
     /// Loads the store from `path`, or creates a fresh identity and persists it if the file
-    /// does not exist.
+    /// does not exist. Creating blocks on an unseeded random pool: see [`Store::create`].
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Store, CompanionError> {
-        let path = path.as_ref().to_path_buf();
-        if path.exists() {
-            let data = std::fs::read_to_string(&path)?;
-            let sf: StateFile = serde_json::from_str(&data)
-                .map_err(|e| CompanionError::Store(format!("parse {}: {e}", path.display())))?;
-            let identity = Identity::from_secret_b64(&sf.identity_secret)?;
-            Ok(Store {
-                path,
-                identity,
-                paired: sf.paired_peer,
-            })
-        } else {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            let store = Store {
-                path,
-                identity: Identity::generate(),
-                paired: None,
-            };
-            store.save()?;
-            Ok(store)
+        match Store::load(path.as_ref())? {
+            Some(store) => Ok(store),
+            None => Store::create(path),
         }
+    }
+
+    /// Loads the store from `path`; `None` if the file does not exist. Needs no randomness.
+    pub fn load(path: impl AsRef<Path>) -> Result<Option<Store>, CompanionError> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let sf: StateFile = serde_json::from_str(&data)
+            .map_err(|e| CompanionError::Store(format!("parse {}: {e}", path.display())))?;
+        let identity = Identity::from_secret_b64(&sf.identity_secret)?;
+        Ok(Some(Store {
+            path,
+            identity,
+            paired: sf.paired_peer,
+        }))
+    }
+
+    /// Creates a fresh identity and persists it at `path`. This generates the long-term secret,
+    /// so it blocks until the random pool is seeded: on the daemon's thread, call it only once
+    /// [`super::entropy::PoolWait`] says so.
+    pub fn create(path: impl AsRef<Path>) -> Result<Store, CompanionError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = Store {
+            path,
+            identity: Identity::generate(),
+            paired: None,
+        };
+        store.save()?;
+        Ok(store)
     }
 
     /// The directory file name used inside a state directory.

@@ -154,6 +154,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         companion: !cfg!(target_os = "android"),
         companion_tcp_port: Some(glassd::companion::transport::DEFAULT_TCP_PORT),
         companion_bt: cfg!(feature = "linux-bt"),
+        companion_rng_device: glassd::companion::entropy::RANDOM_DEVICE.into(),
         power_supply: glassd::companion::battery::DEFAULT_ROOT.into(),
         // On Android (route 1) the framework owns power; on plain Linux (Model B) glassd runs
         // the energy policy.

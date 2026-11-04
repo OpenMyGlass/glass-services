@@ -296,9 +296,10 @@ impl Notes {
         Ok(frames)
     }
 
-    /// When [`tick`](Notes::tick) next has something to do.
-    pub fn next_deadline(&self, now: u64) -> Option<u64> {
-        let sealing = (self.in_flight > 0).then_some(now + MIN_WAIT_MS);
+    /// When [`tick`](Notes::tick) next has something to do. `seals_can_end` is false while seals
+    /// are all blocked on the random pool, when checking on them would only burn the battery.
+    pub fn next_deadline(&self, now: u64, seals_can_end: bool) -> Option<u64> {
+        let sealing = (seals_can_end && self.in_flight > 0).then_some(now + MIN_WAIT_MS);
         [sealing, self.machine.machine().next_deadline()]
             .into_iter()
             .flatten()

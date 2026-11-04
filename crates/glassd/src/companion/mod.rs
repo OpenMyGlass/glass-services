@@ -15,6 +15,7 @@
 
 pub mod battery;
 pub mod bootstrap;
+pub mod entropy;
 pub mod identity;
 pub mod link;
 pub mod notes;
@@ -32,6 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use omg_protocol::{Locale, Notification, NotificationChoice, Radio, RadioState, WifiReason};
 
 use crate::{info, warn};
+use entropy::PoolWait;
 use link::{DeviceState, Link, Out};
 use store::Store;
 use transport::{BoxStream, Listeners, Transport};
@@ -134,9 +136,27 @@ struct Conn {
     closing: bool,
 }
 
+/// Whether the link may use randomness yet (see [`entropy`]). The handshake needs it for a
+/// challenge nonce even with a stored identity, so no listener is bound before [`Rng::Ready`].
+enum Rng {
+    /// The pool is not seeded: the daemon polls this and calls [`Companion::on_rng_event`].
+    Waiting(PoolWait),
+    /// Seeded: the `getrandom` crate will not block any more.
+    Ready,
+    /// No randomness to be had, or the identity could not be stored: the link stays down.
+    Failed,
+}
+
 /// The companion-link service: listeners, the persistent bond, and the live connections.
 pub struct Companion {
-    store: Store,
+    /// `None` until a first identity has been generated.
+    store: Option<Store>,
+    store_path: PathBuf,
+    rng: Rng,
+    /// A dial asked for before the pool was seeded.
+    pending_dial: Option<String>,
+    tcp_port: Option<u16>,
+    bt: bool,
     device: DeviceState,
     listeners: Listeners,
     conns: BTreeMap<ConnId, Conn>,
@@ -150,22 +170,40 @@ pub struct Companion {
 }
 
 impl Companion {
-    /// Loads (or creates) the bond under `state_dir` and binds the listeners. `tcp_port` is the
-    /// TCP accept port (`None` disables TCP); `bt` enables the RFCOMM server (needs the
-    /// `linux-bt` feature to do anything).
+    /// Loads the bond under `state_dir` and binds the listeners. `tcp_port` is the TCP accept
+    /// port (`None` disables TCP); `bt` enables the RFCOMM server (needs the `linux-bt` feature
+    /// to do anything). Never waits for the random pool: if it is not seeded yet, generating a
+    /// first identity and binding the listeners wait for [`Companion::rng_fd`].
     pub fn new(
         state_dir: &Path,
         device: DeviceState,
         tcp_port: Option<u16>,
         bt: bool,
     ) -> Result<Companion, CompanionError> {
-        let store = Store::load_or_create(Store::path_in(state_dir))?;
-        if let Some(p) = store.paired() {
-            info!("companion: bonded to {:?}", p.peer_name);
-        } else {
-            info!("companion: not yet paired");
+        Companion::with_rng_device(
+            state_dir,
+            device,
+            tcp_port,
+            bt,
+            Path::new(entropy::RANDOM_DEVICE),
+        )
+    }
+
+    /// [`Companion::new`], waiting on `rng_device` instead of `/dev/random`.
+    pub fn with_rng_device(
+        state_dir: &Path,
+        device: DeviceState,
+        tcp_port: Option<u16>,
+        bt: bool,
+        rng_device: &Path,
+    ) -> Result<Companion, CompanionError> {
+        let store_path = Store::path_in(state_dir);
+        let store = Store::load(&store_path)?;
+        match &store {
+            Some(s) => log_bond(s),
+            // A state directory that cannot exist disables the link now, not a minute from now.
+            None => std::fs::create_dir_all(state_dir)?,
         }
-        let listeners = Listeners::bind(tcp_port, bt);
         let notes = match notes::Notes::open(&state_dir.join("notes")) {
             Ok(n) => Some(n),
             Err(e) => {
@@ -173,27 +211,124 @@ impl Companion {
                 None
             }
         };
-        Ok(Companion {
+        let mut companion = Companion {
             store,
+            store_path,
+            rng: Rng::Failed,
+            pending_dial: None,
+            tcp_port,
+            bt,
             device,
-            listeners,
+            listeners: Listeners::bind(None, false),
             conns: BTreeMap::new(),
             active: None,
             next_id: 1,
             pairing_enabled: true,
             notes,
             notes_link: false,
+        };
+        match PoolWait::open(rng_device) {
+            Ok(wait) => match wait.seeded() {
+                Ok(true) => companion.pool_seeded(),
+                Ok(false) => {
+                    info!(
+                        "companion: waiting for the kernel's random pool; the link comes up then"
+                    );
+                    companion.rng = Rng::Waiting(wait);
+                }
+                Err(e) => warn!("companion: link disabled: {} ({e})", rng_device.display()),
+            },
+            // No device to wait on. A kernel with getrandom(2) does not need one; on an older
+            // one the crate fails at once for the same reason, and pool_seeded says so.
+            Err(e) => {
+                info!("companion: cannot open {} ({e})", rng_device.display());
+                companion.pool_seeded();
+            }
+        }
+        Ok(companion)
+    }
+
+    /// The descriptor to `poll` for `POLLIN` while the link waits for the random pool; then
+    /// call [`Companion::on_rng_event`].
+    pub fn rng_fd(&self) -> Option<RawFd> {
+        match &self.rng {
+            Rng::Waiting(wait) => Some(wait.fd()),
+            _ => None,
+        }
+    }
+
+    /// The descriptor from [`Companion::rng_fd`] has an event. Returns the events of a dial that
+    /// was waiting for the pool.
+    pub fn on_rng_event(&mut self) -> Vec<Event> {
+        let Rng::Waiting(wait) = &self.rng else {
+            return Vec::new();
+        };
+        match wait.seeded() {
+            Ok(true) => {
+                info!(
+                    "companion: random pool seeded after {} ms",
+                    wait.waited_ms()
+                );
+                self.pool_seeded();
+                return self.dial_pending();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("companion: link disabled: random device failed ({e})");
+                self.rng = Rng::Failed;
+            }
+        }
+        Vec::new()
+    }
+
+    /// What had to wait for the pool: a first identity, and the listeners.
+    fn pool_seeded(&mut self) {
+        self.rng = Rng::Failed;
+        // After this the crate has /dev/urandom open and never blocks a caller again.
+        if let Err(e) = getrandom::getrandom(&mut [0u8; 1]) {
+            warn!("companion: link disabled: no randomness ({e})");
+            return;
+        }
+        if self.store.is_none() {
+            match Store::create(&self.store_path) {
+                Ok(s) => {
+                    info!("companion: generated a new identity");
+                    log_bond(&s);
+                    self.store = Some(s);
+                }
+                Err(e) => {
+                    warn!("companion: link disabled ({e})");
+                    return;
+                }
+            }
+        }
+        self.listeners = Listeners::bind(self.tcp_port, self.bt);
+        self.rng = Rng::Ready;
+    }
+
+    /// The dial asked for while waiting for the pool.
+    fn dial_pending(&mut self) -> Vec<Event> {
+        let Some(addr) = self.pending_dial.take() else {
+            return Vec::new();
+        };
+        self.connect_tcp(&addr).unwrap_or_else(|e| {
+            warn!("companion: cannot dial {addr} ({e})");
+            Vec::new()
         })
     }
 
     /// Whether a companion is bonded (persisted).
     pub fn paired(&self) -> bool {
-        self.store.paired().is_some()
+        self.bond().is_some()
     }
 
     /// The bonded companion's name, if any.
     pub fn paired_name(&self) -> Option<&str> {
-        self.store.paired().map(|p| p.peer_name.as_str())
+        self.bond().map(|p| p.peer_name.as_str())
+    }
+
+    fn bond(&self) -> Option<&store::PairingRecord> {
+        self.store.as_ref().and_then(Store::paired)
     }
 
     /// The transport of the live link, if a companion is connected.
@@ -219,7 +354,10 @@ impl Companion {
 
     /// Forgets the bonded companion and drops the live link.
     pub fn unpair(&mut self) -> Vec<Event> {
-        if let Err(e) = self.store.clear_paired() {
+        // No store yet means no identity, and so no bond to forget.
+        if let Some(store) = &mut self.store
+            && let Err(e) = store.clear_paired()
+        {
             warn!("companion: cannot clear the bond ({e})");
         }
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
@@ -260,7 +398,17 @@ impl Companion {
     }
 
     /// Dials a companion over TCP (the QR bootstrap connect path), then starts the handshake.
+    /// The handshake needs randomness, so before the pool is seeded the dial waits for it.
     pub fn connect_tcp(&mut self, addr: &str) -> io::Result<Vec<Event>> {
+        match self.rng {
+            Rng::Waiting(_) => {
+                info!("companion: will dial {addr} once the random pool is seeded");
+                self.pending_dial = Some(addr.to_owned());
+                return Ok(Vec::new());
+            }
+            Rng::Failed => return Err(io::Error::other("the link is disabled")),
+            Rng::Ready => {}
+        }
         let stream = TcpStream::connect(addr)?;
         stream.set_nonblocking(true)?;
         let _ = stream.set_nodelay(true);
@@ -275,13 +423,15 @@ impl Companion {
     }
 
     fn add_conn(&mut self, stream: BoxStream, transport: Transport, events: &mut Vec<Event>) {
+        // Not reachable: a connection needs Rng::Ready, and that needs a store.
+        let Some(store) = &self.store else {
+            return;
+        };
+        let identity = store.identity().clone();
+        let bond = store.paired().cloned();
         let id = self.next_id;
         self.next_id += 1;
-        let mut link = Link::new(
-            self.store.identity().clone(),
-            self.store.paired().cloned(),
-            self.device.clone(),
-        );
+        let mut link = Link::new(identity, bond, self.device.clone());
         link.set_pairing_enabled(self.pairing_enabled);
         if self.notes.is_some() {
             link.advertise(omg_protocol::capability::NOTES_SYNC);
@@ -429,7 +579,11 @@ impl Companion {
 
     /// When note sync next needs [`notes_tick`](Companion::notes_tick), in wall-clock ms.
     pub fn notes_next_deadline(&self) -> Option<u64> {
-        self.notes.as_ref().and_then(|n| n.next_deadline(now_ms()))
+        // A seal cannot end before the pool is seeded, so there is no point in checking on it.
+        let seals_can_end = !matches!(self.rng, Rng::Waiting(_));
+        self.notes
+            .as_ref()
+            .and_then(|n| n.next_deadline(now_ms(), seals_can_end))
     }
 
     /// Time passed, or a seal finished on its thread.
@@ -547,14 +701,20 @@ impl Companion {
                     });
                 }
                 Out::Persist(rec) => {
-                    if let Err(e) = self.store.set_paired(rec.clone()) {
+                    let saved = match &mut self.store {
+                        Some(store) => store.set_paired(rec.clone()),
+                        None => Err(CompanionError::Store("no store".into())),
+                    };
+                    if let Err(e) = saved {
                         warn!("companion: cannot persist the bond ({e})");
                     } else {
                         info!("companion: paired with {:?}", rec.peer_name);
                     }
                 }
                 Out::Unpair => {
-                    if let Err(e) = self.store.clear_paired() {
+                    if let Some(store) = &mut self.store
+                        && let Err(e) = store.clear_paired()
+                    {
                         warn!("companion: cannot clear the bond ({e})");
                     }
                 }
@@ -633,6 +793,13 @@ impl Companion {
     }
 }
 
+fn log_bond(store: &Store) {
+    match store.paired() {
+        Some(p) => info!("companion: bonded to {:?}", p.peer_name),
+        None => info!("companion: not yet paired"),
+    }
+}
+
 /// The companion state directory file (for the daemon to locate the bond).
 pub fn state_file(dir: &Path) -> PathBuf {
     Store::path_in(dir)
@@ -640,5 +807,7 @@ pub fn state_file(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod entropy_tests;
 #[cfg(test)]
 mod notes_e2e;

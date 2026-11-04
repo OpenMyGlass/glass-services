@@ -123,6 +123,8 @@ pub struct Options {
     pub companion_tcp_port: Option<u16>,
     /// Advertise and accept the Bluetooth RFCOMM companion link (needs the `linux-bt` feature).
     pub companion_bt: bool,
+    /// Where the companion link learns that the random pool is seeded (`/dev/random`).
+    pub companion_rng_device: PathBuf,
     /// Where to read the battery for the companion `BatteryStatus`/`Status`.
     pub power_supply: PathBuf,
     /// Run the Model B energy policy (idle -> blank/brightness/cpufreq/runtime-PM and, when
@@ -713,11 +715,12 @@ impl Daemon {
                 device.battery_percent = Some(percent);
                 device.charging = Some(charging);
             }
-            match Companion::new(
+            match Companion::with_rng_device(
                 &state_dir,
                 device,
                 opts.companion_tcp_port,
                 opts.companion_bt,
+                &opts.companion_rng_device,
             ) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -948,6 +951,7 @@ impl Daemon {
             Imu,
             Alarm,
             Client(ClientId),
+            CompanionRng,
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
         }
@@ -997,6 +1001,9 @@ impl Daemon {
             add(c.stream.as_raw_fd(), ev, Src::Client(id));
         }
         if let Some(comp) = &self.companion {
+            if let Some(fd) = comp.rng_fd() {
+                add(fd, libc::POLLIN, Src::CompanionRng);
+            }
             for (fd, transport) in comp.listener_fds() {
                 add(fd, libc::POLLIN, Src::CompanionListener(transport));
             }
@@ -1058,6 +1065,13 @@ impl Daemon {
                     if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                         self.read_client(id);
                     }
+                }
+                Src::CompanionRng => {
+                    let events = match &mut self.companion {
+                        Some(c) => c.on_rng_event(),
+                        None => Vec::new(),
+                    };
+                    self.companion_events(events);
                 }
                 Src::CompanionListener(transport) => {
                     let events = match &mut self.companion {
@@ -2479,6 +2493,7 @@ mod tests {
             companion: false,
             companion_tcp_port: None,
             companion_bt: false,
+            companion_rng_device: crate::companion::entropy::RANDOM_DEVICE.into(),
             power_supply: crate::companion::battery::DEFAULT_ROOT.into(),
             energy: false,
             power_paths: PowerPaths::default(),
@@ -2498,6 +2513,72 @@ mod tests {
         s.on_head_detection_enabled = Some(on);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
+    }
+
+    /// The boot this exists for: the random pool is not seeded and no identity is stored.
+    #[test]
+    fn an_unseeded_random_pool_holds_up_the_link_not_the_daemon() {
+        use crate::companion::entropy::testing::FakePool;
+        let d = dir("unseeded");
+        let state = d.join("state");
+        let mut pool = FakePool::new(&d);
+        let socket = d.join("glassd.sock");
+        let opts = Options {
+            socket: socket.clone(),
+            mock: false,
+            device: Some(d.join("no-touchpad")),
+            device_name: TOUCHPAD_NAME.into(),
+            invert_x: false,
+            invert_y: false,
+            tap_slop: None,
+            swipe_min_travel: None,
+            scroll_min_step: None,
+            screen_off_input: ScreenOffInput::Touches,
+            glasshub: None,
+            gaze_params: None,
+            camera: Source::Off,
+            power: Source::Off,
+            touchpad_sysfs: None,
+            state_dir: Some(state.clone()),
+            iio: None,
+            iio_dev: None,
+            peers: PeerPolicy::open(),
+            grab_touchpad: false,
+            radio: false,
+            wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
+            companion: true,
+            companion_tcp_port: Some(0),
+            companion_bt: false,
+            companion_rng_device: pool.path.clone(),
+            power_supply: d.join("no-power-supply"),
+            energy: false,
+            power_paths: PowerPaths::default(),
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let identity = companion::state_file(&state);
+        assert!(!identity.exists(), "a key from an unseeded pool");
+        assert!(daemon.companion.as_ref().unwrap().listener_fds().is_empty());
+
+        // A client is served meanwhile: the handshake runs on this same thread.
+        let client = std::thread::spawn(move || {
+            glass_api::Client::connect_with_timeout(&socket, "test", Duration::from_secs(10))
+                .unwrap()
+                .welcome()
+                .capabilities
+                .clone()
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        let caps = client.join().unwrap();
+        assert!(caps.iter().any(|c| c == "companion-link"), "{caps:?}");
+        assert!(caps.iter().any(|c| c == "notes"), "{caps:?}");
+        assert!(!identity.exists());
+
+        pool.seed();
+        daemon.step().unwrap();
+        assert!(identity.exists());
+        assert_eq!(daemon.companion.as_ref().unwrap().listener_fds().len(), 1);
     }
 
     #[test]

@@ -316,7 +316,9 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
             }
             Effect::SettingsChanged(_)
             | Effect::Head { .. }
-            | Effect::CompanionNotificationAction { .. } => {}
+            | Effect::CompanionNotificationAction { .. }
+            | Effect::NoteAdd(_)
+            | Effect::NoteSpeak(_) => {}
         }
     }
 }

@@ -8,8 +8,8 @@
 use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
     ClientFrame, CompanionState, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus,
-    ScreenState, Scroll, ServiceError, ServiceFrame, Settings, Topic, WearState, Welcome,
-    client_frame, location_status, screen_request, service_frame,
+    NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings, Topic,
+    WearState, Welcome, client_frame, location_status, screen_request, service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -49,6 +49,10 @@ pub enum Effect {
         /// Action to invoke, or `None` to dismiss.
         action_index: Option<u32>,
     },
+    /// A client added a note. The owner of the hub queues it and publishes a `NoteEvent`.
+    NoteAdd(NoteAdd),
+    /// A client asked the companion to read a note aloud.
+    NoteSpeak(NoteSpeak),
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -256,6 +260,7 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::DictationState(_) | B::Transcript(_) => Topic::Dictation,
         B::Button(_) => Topic::Button,
         B::Location(_) | B::LocationStatus(_) => Topic::Location,
+        B::NoteEvent(_) => Topic::Notes,
         B::CompanionState(_) | B::CompanionNotification(_) | B::CompanionNotificationRemoved(_) => {
             Topic::Companion
         }
@@ -645,6 +650,8 @@ impl Hub {
                     action_index: (!a.dismiss).then_some(a.action_index),
                 });
             }
+            Some(B::NoteAdd(note)) => fx.push(Effect::NoteAdd(note)),
+            Some(B::NoteSpeak(speak)) => fx.push(Effect::NoteSpeak(speak)),
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {

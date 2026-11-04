@@ -209,6 +209,18 @@ On Model B (plain Linux) there is no separate Glass app, so **`glassd` is the pr
 - **Notifications:** a phone notification becomes `ServiceFrame.companion_notification` (`CompanionNotification`) on `TOPIC_COMPANION`, and `companion_notification_removed` when dismissed. A client reports the owner's choice with `ClientFrame.companion_notification_action` (`CompanionNotificationAction{key, action_index, dismiss}`), which `glassd` relays to the phone as a `NotificationAction`.
 - **QR bootstrap:** `glassd` decodes an `OMG1:` Wi-Fi QR (`WifiBootstrap::decode`), brings Wi-Fi up with the `radio` control and joins, then dials the companion at the QR's address. The camera scan is a later phase; the mock command `companion-qr <OMG1:...>` feeds a decoded payload in.
 
+## Notes (`TOPIC_NOTES`, capability `notes`)
+
+A note is text, a voice recording, and photos or a video, taken on the Glass. `glassd` keeps it in a queue under `<state-dir>/notes` until the companion holds a verified copy. With no companion the note simply waits and syncs on the next link. The queue, its crash safety and the sync protocol are `omg-core`'s, shared with the companion; [`docs/companion-notes-sync.md`](https://github.com/OpenMyGlass/OpenMyGlass/blob/main/docs/companion-notes-sync.md) in OpenMyGlass describes them. The `notes` capability exists on Model B, where `glassd` holds the phone link.
+
+- `NoteAdd{request_id, text, locale, attachments}` adds a note. Each attachment names a regular file by absolute path; a symlink is refused. `glassd` copies and hashes the files on its own thread, so a client can delete its files after `KIND_ADDED`. The limits are in the OpenMyGlass document.
+- The answer comes on `TOPIC_NOTES`, to every subscriber, as a `NoteEvent` carrying the `request_id`: `KIND_ADDED` with the `note_id`, or `KIND_ADD_FAILED` with the reason. So subscribe before adding.
+- `KIND_SYNCED` means the companion verified every file and the whole note. Only then is the Glass's copy deleted. The default is to delete, set by `DeletePolicy` in `omg-core`.
+- `KIND_DEFERRED` means the companion paused the note, for instance because a video is too big for Bluetooth; it stays queued. `KIND_BLOCKED` means it will not be offered again and the owner must be told. Its files are kept.
+- `KIND_QUEUE` reports `pending_notes` and `pending_bytes` when they change.
+- `NoteSpeak{request_id, note_id, text, locale}` asks the companion to read a note aloud. **Speech-to-text and text-to-speech always run on the companion, never on the Glass.** The audio returns as `KIND_SPEECH_AUDIO` pieces (PCM 16-bit little-endian mono, in order) and then `KIND_SPEECH_FINISHED`, with the error in `detail` if any. It is not queued: without a link the answer is immediate. A new request replaces the one in flight. The client plays the audio; `glassd` does not.
+- `KIND_TRANSCRIPT` carries the text of a voice recording, and only arrives while the note is still on the Glass. With the default delete policy a note usually leaves before its transcription ends, and the text then lives on the companion alone.
+
 ## Dictation (`TOPIC_DICTATION`, milestone 3)
 
 Speech is not transcribed on Glass: it goes to the phone, which transcribes it offline, through the companion link provider and the bridge messages `DictationStart`, `AudioChunk`, `DictationEnd`, `Transcript`, `ReplyConfirm`, `ReplyResult`.

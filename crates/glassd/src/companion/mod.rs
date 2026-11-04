@@ -17,6 +17,7 @@ pub mod battery;
 pub mod bootstrap;
 pub mod identity;
 pub mod link;
+pub mod notes;
 pub mod store;
 pub mod transport;
 pub mod wire;
@@ -120,6 +121,8 @@ pub enum Event {
     WifiBringUp(WifiReason),
     /// The companion asked to drop Wi-Fi again.
     WifiTearDown,
+    /// Something happened with a note: for `TOPIC_NOTES`.
+    Note(glass_api::proto::NoteEvent),
 }
 
 struct Conn {
@@ -140,6 +143,10 @@ pub struct Companion {
     active: Option<ConnId>,
     next_id: ConnId,
     pairing_enabled: bool,
+    /// The note queue. `None` if it could not be opened: the link works, without notes.
+    notes: Option<notes::Notes>,
+    /// The live companion advertised note sync.
+    notes_link: bool,
 }
 
 impl Companion {
@@ -159,6 +166,13 @@ impl Companion {
             info!("companion: not yet paired");
         }
         let listeners = Listeners::bind(tcp_port, bt);
+        let notes = match notes::Notes::open(&state_dir.join("notes")) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                warn!("notes: disabled ({e})");
+                None
+            }
+        };
         Ok(Companion {
             store,
             device,
@@ -167,6 +181,8 @@ impl Companion {
             active: None,
             next_id: 1,
             pairing_enabled: true,
+            notes,
+            notes_link: false,
         })
     }
 
@@ -267,6 +283,9 @@ impl Companion {
             self.device.clone(),
         );
         link.set_pairing_enabled(self.pairing_enabled);
+        if self.notes.is_some() {
+            link.advertise(omg_protocol::capability::NOTES_SYNC);
+        }
         let outs = link.start();
         self.conns.insert(
             id,
@@ -379,6 +398,90 @@ impl Companion {
         self.on_active(move |l| l.notification_action(key.clone(), choice))
     }
 
+    /// Whether notes can be taken here.
+    pub fn notes_available(&self) -> bool {
+        self.notes.is_some()
+    }
+
+    /// A client added a note. It stays on the Glass until a companion has a verified copy, with
+    /// or without a link right now.
+    pub fn note_add(&mut self, add: glass_api::proto::NoteAdd) -> Vec<Event> {
+        let locale = self.device.locale;
+        let mut events = Vec::new();
+        if let Some(n) = &mut self.notes {
+            let refused = n.add(add, locale);
+            events.extend(refused.into_iter().map(Event::Note));
+            events.extend(n.take_events().into_iter().map(Event::Note));
+        }
+        events
+    }
+
+    /// A client asked the companion to read a note aloud.
+    pub fn note_speak(&mut self, speak: glass_api::proto::NoteSpeak) -> Vec<Event> {
+        let locale = self.device.locale;
+        let Some(n) = &mut self.notes else {
+            return Vec::new();
+        };
+        let linked = self.notes_link;
+        let result = n.speak(speak, locale, linked, now_ms());
+        self.note_frames(result)
+    }
+
+    /// When note sync next needs [`notes_tick`](Companion::notes_tick), in wall-clock ms.
+    pub fn notes_next_deadline(&self) -> Option<u64> {
+        self.notes.as_ref().and_then(|n| n.next_deadline(now_ms()))
+    }
+
+    /// Time passed, or a seal finished on its thread.
+    pub fn notes_tick(&mut self) -> Vec<Event> {
+        let Some(n) = &mut self.notes else {
+            return Vec::new();
+        };
+        let result = n.tick(now_ms());
+        self.note_frames(result)
+    }
+
+    /// Queues what the note machine produced on the live link and reports its events. A store
+    /// failure counts as a lost link, as the driver asks: the state on disk is what counts, and
+    /// the next link starts from it.
+    fn note_frames(
+        &mut self,
+        result: Result<Vec<omg_protocol::Frame>, omg_core::CoreError>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        let active = self.active;
+        match result {
+            Ok(frames) => {
+                if let Some(id) = active {
+                    self.queue_frames(id, frames);
+                    self.flush(id, &mut events);
+                }
+            }
+            Err(e) => {
+                warn!("notes: {e}");
+                if let Some(id) = active {
+                    self.drop_conn(id, "note store failed", &mut events);
+                }
+            }
+        }
+        if let Some(n) = &mut self.notes {
+            events.extend(n.take_events().into_iter().map(Event::Note));
+        }
+        events
+    }
+
+    fn queue_frames(&mut self, id: ConnId, frames: Vec<omg_protocol::Frame>) {
+        let Some(c) = self.conns.get_mut(&id) else {
+            return;
+        };
+        for frame in frames {
+            match wire::frame_bytes(&frame) {
+                Ok(bytes) => c.out.extend_from_slice(&bytes),
+                Err(e) => warn!("companion {id}: cannot encode {}: {e}", frame.wire_name()),
+            }
+        }
+    }
+
     /// Decodes a Wi-Fi QR bootstrap (`OMG1:`) so the daemon can join and connect (item 6). The
     /// camera-side scan is a later phase; this is the decode entry point.
     pub fn decode_bootstrap(
@@ -428,6 +531,15 @@ impl Companion {
                     }
                     self.active = Some(id);
                     info!("companion: {name:?} connected over {}", transport.as_str());
+                    self.notes_link = capabilities
+                        .iter()
+                        .any(|c| c == omg_protocol::capability::NOTES_SYNC);
+                    if self.notes_link
+                        && let Some(n) = &mut self.notes
+                    {
+                        let result = n.link_up(notes::profile_for(transport), now_ms());
+                        events.extend(self.note_frames(result));
+                    }
                     events.push(Event::Connected {
                         name,
                         capabilities,
@@ -449,6 +561,19 @@ impl Companion {
                 Out::ApplyLocale(l) => events.push(Event::ApplyLocale(l)),
                 Out::SettingsGet => events.push(Event::SettingsGet),
                 Out::SettingsSet(s) => events.push(Event::SettingsSet(s)),
+                Out::Note(frame) => {
+                    let backlog = self.conns.get(&id).map_or(0, |c| c.out.len());
+                    if notes::over_backlog(&frame, backlog) {
+                        continue;
+                    }
+                    if self.active == Some(id)
+                        && self.notes_link
+                        && let Some(n) = &mut self.notes
+                    {
+                        let result = n.on_frame(frame, now_ms());
+                        events.extend(self.note_frames(result));
+                    }
+                }
                 Out::Notification(n) => events.push(Event::Notification(n)),
                 Out::RemoveNotification(k) => events.push(Event::RemoveNotification(k)),
                 Out::SetRadio { radio, on } => events.push(Event::SetRadio { radio, on }),
@@ -498,6 +623,11 @@ impl Companion {
         }
         if self.active == Some(id) {
             self.active = None;
+            self.notes_link = false;
+            if let Some(n) = &mut self.notes {
+                n.link_down();
+                events.extend(n.take_events().into_iter().map(Event::Note));
+            }
             events.push(Event::Disconnected);
         }
     }
@@ -510,3 +640,5 @@ pub fn state_file(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod notes_e2e;

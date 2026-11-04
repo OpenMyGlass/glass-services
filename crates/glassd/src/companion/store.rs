@@ -9,15 +9,20 @@
 //! Mirrors `omg-core`'s `store` module (atomic temp-write + rename), so both ends persist the
 //! same `PairingRecord` shape.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::identity::Identity;
 use super::{CompanionError, now_ms};
+use crate::warn;
 
 /// File name inside the state directory.
 pub const FILE_NAME: &str = "companion.json";
+/// Owner read and write only: the file holds the identity secret.
+const SECRET_MODE: u32 = 0o600;
 
 /// The bonded companion. Its public key is the trust anchor checked on every reconnect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +64,7 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
+        tighten_older_files(&path);
         let data = std::fs::read_to_string(&path)?;
         let sf: StateFile = serde_json::from_str(&data)
             .map_err(|e| CompanionError::Store(format!("parse {}: {e}", path.display())))?;
@@ -123,11 +129,48 @@ impl Store {
         };
         let json = serde_json::to_string_pretty(&sf)
             .map_err(|e| CompanionError::Store(format!("serialize: {e}")))?;
-        // Write to a temp file then rename, so a crash never truncates the identity.
+        // Write to a temp file then rename, so a crash never truncates the identity, and sync,
+        // so neither does losing power. A leftover temp file would keep its old mode.
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, json)?;
+        remove_if_there(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_MODE)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &self.path)?;
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
+    }
+}
+
+fn remove_if_there(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Older versions left the state file readable by everyone, and a crash could leave its temp
+/// file. Failing here is no reason to lose the link, since the file can still be read: a state
+/// directory gone read-only would refuse this and nothing else.
+fn tighten_older_files(path: &Path) {
+    let mode = std::fs::Permissions::from_mode(SECRET_MODE);
+    if let Err(e) = std::fs::set_permissions(path, mode) {
+        warn!("companion: cannot restrict {} ({e})", path.display());
+    }
+    if let Err(e) = remove_if_there(&path.with_extension("tmp")) {
+        warn!(
+            "companion: cannot remove the temp file of {} ({e})",
+            path.display()
+        );
     }
 }
 
@@ -149,6 +192,25 @@ mod tests {
             std::env::temp_dir().join(format!("glassd-companion-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn the_secret_is_readable_only_by_the_owner() {
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = dir("mode");
+        let path = d.join(FILE_NAME);
+        let tmp = path.with_extension("tmp");
+        drop(Store::load_or_create(&path).unwrap());
+        assert_eq!(mode(&path), SECRET_MODE);
+        assert!(!tmp.exists());
+        // What an older version left: both are dealt with by a load, with no save needed.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&tmp, "stale").unwrap();
+        let mut s = Store::load(&path).unwrap().unwrap();
+        assert_eq!(mode(&path), SECRET_MODE);
+        assert!(!tmp.exists());
+        s.clear_paired().unwrap();
+        assert_eq!(mode(&path), SECRET_MODE);
     }
 
     #[test]

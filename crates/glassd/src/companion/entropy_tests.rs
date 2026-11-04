@@ -35,9 +35,6 @@ fn no_identity_and_no_listener_before_the_pool_is_seeded() {
 
     // Forgetting a bond that cannot exist yet is harmless.
     assert!(c.unpair().is_empty());
-    // A dial would run the handshake on the daemon's thread: refused, without dialing.
-    assert!(c.connect_tcp("192.0.2.1:7").is_err());
-
     pool.seed();
     c.on_rng_event();
     assert!(c.rng_fd().is_none());
@@ -90,10 +87,11 @@ fn a_connection_runs_once_the_link_is_up() {
     let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = peer.local_addr().unwrap().to_string();
     let mut c = glass(&d.path().join("state"), &pool.path);
-    assert!(c.connect_tcp(&addr).is_err());
+    // A dial would run the handshake on the daemon's thread: it waits for the pool.
+    assert!(c.connect_tcp(&addr).unwrap().is_empty());
+    assert!(c.conn_fds().is_empty());
     pool.seed();
     c.on_rng_event();
-    c.connect_tcp(&addr).unwrap();
     assert_eq!(c.conn_fds().len(), 1);
     drop::<(TcpStream, _)>(peer.accept().unwrap());
 }

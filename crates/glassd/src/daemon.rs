@@ -1067,9 +1067,11 @@ impl Daemon {
                     }
                 }
                 Src::CompanionRng => {
-                    if let Some(c) = &mut self.companion {
-                        c.on_rng_event();
-                    }
+                    let events = match &mut self.companion {
+                        Some(c) => c.on_rng_event(),
+                        None => Vec::new(),
+                    };
+                    self.companion_events(events);
                 }
                 Src::CompanionListener(transport) => {
                     let events = match &mut self.companion {

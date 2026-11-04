@@ -153,6 +153,8 @@ pub struct Companion {
     store: Option<Store>,
     store_path: PathBuf,
     rng: Rng,
+    /// A dial asked for before the pool was seeded.
+    pending_dial: Option<String>,
     tcp_port: Option<u16>,
     bt: bool,
     device: DeviceState,
@@ -213,6 +215,7 @@ impl Companion {
             store,
             store_path,
             rng: Rng::Failed,
+            pending_dial: None,
             tcp_port,
             bt,
             device,
@@ -254,10 +257,11 @@ impl Companion {
         }
     }
 
-    /// The descriptor from [`Companion::rng_fd`] has an event.
-    pub fn on_rng_event(&mut self) {
+    /// The descriptor from [`Companion::rng_fd`] has an event. Returns the events of a dial that
+    /// was waiting for the pool.
+    pub fn on_rng_event(&mut self) -> Vec<Event> {
         let Rng::Waiting(wait) = &self.rng else {
-            return;
+            return Vec::new();
         };
         match wait.seeded() {
             Ok(true) => {
@@ -266,6 +270,7 @@ impl Companion {
                     wait.waited_ms()
                 );
                 self.pool_seeded();
+                return self.dial_pending();
             }
             Ok(false) => {}
             Err(e) => {
@@ -273,6 +278,7 @@ impl Companion {
                 self.rng = Rng::Failed;
             }
         }
+        Vec::new()
     }
 
     /// What had to wait for the pool: a first identity, and the listeners.
@@ -298,6 +304,17 @@ impl Companion {
         }
         self.listeners = Listeners::bind(self.tcp_port, self.bt);
         self.rng = Rng::Ready;
+    }
+
+    /// The dial asked for while waiting for the pool.
+    fn dial_pending(&mut self) -> Vec<Event> {
+        let Some(addr) = self.pending_dial.take() else {
+            return Vec::new();
+        };
+        self.connect_tcp(&addr).unwrap_or_else(|e| {
+            warn!("companion: cannot dial {addr} ({e})");
+            Vec::new()
+        })
     }
 
     /// Whether a companion is bonded (persisted).
@@ -381,9 +398,16 @@ impl Companion {
     }
 
     /// Dials a companion over TCP (the QR bootstrap connect path), then starts the handshake.
+    /// The handshake needs randomness, so before the pool is seeded the dial waits for it.
     pub fn connect_tcp(&mut self, addr: &str) -> io::Result<Vec<Event>> {
-        if !matches!(self.rng, Rng::Ready) {
-            return Err(io::Error::other("the link is not up yet"));
+        match self.rng {
+            Rng::Waiting(_) => {
+                info!("companion: will dial {addr} once the random pool is seeded");
+                self.pending_dial = Some(addr.to_owned());
+                return Ok(Vec::new());
+            }
+            Rng::Failed => return Err(io::Error::other("the link is disabled")),
+            Rng::Ready => {}
         }
         let stream = TcpStream::connect(addr)?;
         stream.set_nonblocking(true)?;
@@ -555,7 +579,11 @@ impl Companion {
 
     /// When note sync next needs [`notes_tick`](Companion::notes_tick), in wall-clock ms.
     pub fn notes_next_deadline(&self) -> Option<u64> {
-        self.notes.as_ref().and_then(|n| n.next_deadline(now_ms()))
+        // A seal cannot end before the pool is seeded, so there is no point in checking on it.
+        let seals_can_end = !matches!(self.rng, Rng::Waiting(_));
+        self.notes
+            .as_ref()
+            .and_then(|n| n.next_deadline(now_ms(), seals_can_end))
     }
 
     /// Time passed, or a seal finished on its thread.

@@ -136,11 +136,18 @@ struct Conn {
     closing: bool,
 }
 
+/// How often the entropy level is checked while a first identity waits for it. The level grows by
+/// a few bits a second, so this needs no precision, and it only runs on a first boot.
+const ENTROPY_CHECK_MS: u64 = 2_000;
+
 /// Whether the link may use randomness yet (see [`entropy`]). The handshake needs it for a
 /// challenge nonce even with a stored identity, so no listener is bound before [`Rng::Ready`].
 enum Rng {
     /// The pool is not seeded: the daemon polls this and calls [`Companion::on_rng_event`].
     Waiting(PoolWait),
+    /// Seeded, but a first identity needs more entropy than that: checked at this wall-clock
+    /// time, on a timer, because `/dev/random` stays readable and polling it would spin.
+    Gathering { next_check_ms: u64 },
     /// Seeded: the `getrandom` crate will not block any more.
     Ready,
     /// No randomness to be had, or the identity could not be stored: the link stays down.
@@ -153,6 +160,8 @@ pub struct Companion {
     store: Option<Store>,
     store_path: PathBuf,
     rng: Rng,
+    /// Where the input pool's level is read.
+    entropy_avail: PathBuf,
     /// A dial asked for before the pool was seeded.
     pending_dial: Option<String>,
     tcp_port: Option<u16>,
@@ -215,6 +224,7 @@ impl Companion {
             store,
             store_path,
             rng: Rng::Failed,
+            entropy_avail: entropy::ENTROPY_AVAIL.into(),
             pending_dial: None,
             tcp_port,
             bt,
@@ -281,6 +291,30 @@ impl Companion {
         Vec::new()
     }
 
+    /// When [`Companion::rng_tick`] should next run (wall clock, ms).
+    pub fn rng_next_deadline(&self) -> Option<u64> {
+        match self.rng {
+            Rng::Gathering { next_check_ms } => Some(next_check_ms),
+            _ => None,
+        }
+    }
+
+    /// Checks again whether a first identity may be generated. Returns the events of a dial
+    /// that was waiting for it.
+    pub fn rng_tick(&mut self) -> Vec<Event> {
+        let Rng::Gathering { next_check_ms } = self.rng else {
+            return Vec::new();
+        };
+        if now_ms() < next_check_ms {
+            return Vec::new();
+        }
+        self.pool_seeded_step();
+        if matches!(self.rng, Rng::Ready) {
+            return self.dial_pending();
+        }
+        Vec::new()
+    }
+
     /// What had to wait for the pool: a first identity, and the listeners.
     fn pool_seeded(&mut self) {
         self.rng = Rng::Failed;
@@ -289,7 +323,30 @@ impl Companion {
             warn!("companion: link disabled: no randomness ({e})");
             return;
         }
+        self.pool_seeded_step();
+    }
+
+    /// Brings the link up, unless a first identity needs more entropy.
+    fn pool_seeded_step(&mut self) {
         if self.store.is_none() {
+            // A kernel that does not say cannot be waited on; Model B always mounts /proc.
+            let bits = entropy::entropy_avail(&self.entropy_avail);
+            if bits.is_some_and(|b| b < entropy::MIN_BITS_FOR_IDENTITY) {
+                if !matches!(self.rng, Rng::Gathering { .. }) {
+                    info!(
+                        "companion: waiting for {} bits of entropy before generating the identity",
+                        entropy::MIN_BITS_FOR_IDENTITY
+                    );
+                }
+                self.rng = Rng::Gathering {
+                    next_check_ms: now_ms() + ENTROPY_CHECK_MS,
+                };
+                return;
+            }
+            if bits.is_none() {
+                warn!("companion: cannot read the entropy level; generating the identity anyway");
+            }
+            self.rng = Rng::Failed;
             match Store::create(&self.store_path) {
                 Ok(s) => {
                     info!("companion: generated a new identity");
@@ -401,7 +458,7 @@ impl Companion {
     /// The handshake needs randomness, so before the pool is seeded the dial waits for it.
     pub fn connect_tcp(&mut self, addr: &str) -> io::Result<Vec<Event>> {
         match self.rng {
-            Rng::Waiting(_) => {
+            Rng::Waiting(_) | Rng::Gathering { .. } => {
                 info!("companion: will dial {addr} once the random pool is seeded");
                 self.pending_dial = Some(addr.to_owned());
                 return Ok(Vec::new());

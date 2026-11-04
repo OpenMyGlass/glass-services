@@ -117,3 +117,73 @@ fn no_random_device_on_a_kernel_with_the_syscall_still_comes_up() {
     assert!(c.rng_fd().is_none());
     assert_eq!(c.listener_fds().len(), 1);
 }
+
+#[test]
+fn a_first_identity_waits_for_more_entropy_than_the_poll_says() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    let level = d.path().join("entropy_avail");
+    let mut c = glass(&state, &pool.path);
+    c.entropy_avail = level.clone();
+    std::fs::write(&level, "64\n").unwrap();
+
+    pool.seed();
+    c.on_rng_event();
+    assert!(!state_file(&state).exists(), "a key from a thin pool");
+    assert!(c.listener_fds().is_empty());
+    // /dev/random stays readable, so the daemon must not poll it now.
+    assert!(c.rng_fd().is_none());
+    assert!(c.rng_next_deadline().is_some());
+
+    // Not yet due, and then due with a level still too low.
+    assert!(c.rng_tick().is_empty());
+    assert!(!state_file(&state).exists());
+    c.rng = super::Rng::Gathering { next_check_ms: 0 };
+    std::fs::write(&level, "255\n").unwrap();
+    c.rng_tick();
+    assert!(!state_file(&state).exists());
+
+    c.rng = super::Rng::Gathering { next_check_ms: 0 };
+    std::fs::write(&level, "256\n").unwrap();
+    c.rng_tick();
+    assert!(state_file(&state).exists());
+    assert_eq!(c.listener_fds().len(), 1);
+    assert_eq!(c.rng_next_deadline(), None);
+}
+
+#[test]
+fn a_stored_identity_does_not_wait_for_more_entropy() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    drop(Store::create(Store::path_in(&state)).unwrap());
+    let level = d.path().join("entropy_avail");
+    std::fs::write(&level, "64\n").unwrap();
+    let mut c = glass(&state, &pool.path);
+    c.entropy_avail = level;
+    pool.seed();
+    c.on_rng_event();
+    assert_eq!(c.listener_fds().len(), 1);
+}
+
+#[test]
+fn a_dial_waits_through_the_gathering_too() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = peer.local_addr().unwrap().to_string();
+    let level = d.path().join("entropy_avail");
+    std::fs::write(&level, "64\n").unwrap();
+    let mut c = glass(&d.path().join("state"), &pool.path);
+    c.entropy_avail = level.clone();
+    pool.seed();
+    c.on_rng_event();
+    assert!(c.connect_tcp(&addr).unwrap().is_empty());
+    assert!(c.conn_fds().is_empty());
+    std::fs::write(&level, "300\n").unwrap();
+    c.rng = super::Rng::Gathering { next_check_ms: 0 };
+    c.rng_tick();
+    assert_eq!(c.conn_fds().len(), 1);
+    drop::<(TcpStream, _)>(peer.accept().unwrap());
+}

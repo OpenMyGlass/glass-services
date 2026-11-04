@@ -401,7 +401,7 @@ fn set_settings(c: &mut Client, s: Settings) -> Settings {
 }
 
 #[test]
-fn off_head_camera_is_delivered_without_waking() {
+fn off_head_camera_is_delivered_and_lights_the_screen_briefly() {
     let mut m = Mock::start("offhead");
     let mut c = m.client(&[Topic::Screen, Topic::Button, Topic::Wear]);
     // A short power press forces off the head.
@@ -411,16 +411,19 @@ fn off_head_camera_is_delivered_without_waking() {
     let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
     assert_eq!(screen(&f), Some((Screen::Off, "off-head".into())));
     m.send("camera");
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::On, "button".into())));
     let f = c
-        .recv_until(T, |f| {
-            screen(f).is_some() || matches!(f.body, Some(Body::Button(_)))
-        })
+        .recv_until(T, |f| matches!(f.body, Some(Body::Button(_))))
         .unwrap()
         .unwrap();
     let Some(Body::Button(b)) = f.body else {
         panic!("{f:?}")
     };
     assert!(b.screen_off);
+    // It goes off by itself after the quick timeout.
+    let f = c.recv_until(T, |f| screen(f).is_some()).unwrap().unwrap();
+    assert_eq!(screen(&f), Some((Screen::Off, "timeout".into())));
     // A wake request is refused off the head too.
     c.send(glass_api::proto::client_frame::Body::Screen(
         glass_api::proto::ScreenRequest {

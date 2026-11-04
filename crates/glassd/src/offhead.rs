@@ -23,6 +23,8 @@ pub struct OffHeadTimer {
     since_us: Option<u64>,
     /// Minutes before powering off; 0 = never.
     power_off_min: u32,
+    /// Whether the sensor's reading can change the wear; forced off the head it cannot.
+    watching: bool,
 }
 
 impl OffHeadTimer {
@@ -30,11 +32,17 @@ impl OffHeadTimer {
         OffHeadTimer {
             since_us: None,
             power_off_min,
+            watching: true,
         }
     }
 
     pub fn set_power_off_min(&mut self, minutes: u32) {
         self.power_off_min = minutes;
+    }
+
+    /// Whether reading the sensor can change anything. If not, the alarms are saved.
+    pub fn set_watching(&mut self, watching: bool) {
+        self.watching = watching;
     }
 
     /// The wear changed.
@@ -62,7 +70,8 @@ impl OffHeadTimer {
     /// Seconds until the next alarm should wake the system; `None` when nothing needs one.
     pub fn next_alarm_s(&self, boot_us: u64) -> Option<u32> {
         let since = self.since_us?;
-        let watch = (boot_us.saturating_sub(since) < WATCH_WINDOW_US).then_some(WATCH_PERIOD_S);
+        let watch = (self.watching && boot_us.saturating_sub(since) < WATCH_WINDOW_US)
+            .then_some(WATCH_PERIOD_S);
         let off = self.power_off_at().map(|at| {
             let left = at.saturating_sub(boot_us).div_ceil(1_000_000);
             u32::try_from(left).unwrap_or(u32::MAX)
@@ -106,6 +115,16 @@ mod tests {
         assert!(t.power_off_due(1_800 * S));
         // A late wake does not ask for an alarm in the past.
         assert_eq!(t.next_alarm_s(1_900 * S), Some(MIN_ALARM_S));
+    }
+
+    #[test]
+    fn forced_off_the_head_only_the_power_off_needs_an_alarm() {
+        let mut t = OffHeadTimer::new(30);
+        t.set_off_head(0, true);
+        t.set_watching(false);
+        assert_eq!(t.next_alarm_s(0), Some(30 * 60));
+        t.set_power_off_min(0);
+        assert_eq!(t.next_alarm_s(0), None);
     }
 
     #[test]

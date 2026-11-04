@@ -34,6 +34,22 @@ pub fn read(root: &Path) -> Option<(u8, bool)> {
     None
 }
 
+/// Whether a cable is connected: a supply other than the battery reports `online`. The battery's
+/// `status` cannot tell, since on the fuel gauge it follows the charge and the current, not the
+/// cable: a Glass just unplugged at full charge still reads `Full`. If no supply reports `online`
+/// the answer is unknown, and this says yes: that is the case where nothing drastic should follow.
+pub fn cable_connected(root: &Path) -> bool {
+    let online: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| read_trim(&dir.join("type")).as_deref() != Some("Battery"))
+        .filter_map(|dir| read_trim(&dir.join("online")))
+        .collect();
+    online.is_empty() || online.iter().any(|o| o == "1")
+}
+
 fn read_trim(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -44,6 +60,20 @@ fn read_trim(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_cable_is_the_online_of_a_supply_not_the_battery_status() {
+        let root = dir("cable");
+        std::fs::create_dir_all(&root).unwrap();
+        supply(&root, "bq27520-0", "Battery", &[("status", "Full")]);
+        // Nothing reports it: unknown counts as connected.
+        assert!(cable_connected(&root));
+        supply(&root, "twl6030_usb", "USB", &[("online", "0")]);
+        assert!(!cable_connected(&root));
+        supply(&root, "twl6030_usb", "USB", &[("online", "1")]);
+        assert!(cable_connected(&root));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("glassd-battery-{}-{name}", std::process::id()));

@@ -1138,8 +1138,8 @@ impl Daemon {
     /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
     /// desk is not found off: the wait starts again. So it does if powering off failed.
     fn power_off_if_unplugged(&mut self, t: Now) {
-        let charging = companion::battery::read(&self.power_supply).is_some_and(|(_, c)| c);
-        if !charging && let Some(power) = &mut self.power_io {
+        let cable = companion::battery::cable_connected(&self.power_supply);
+        if !cable && let Some(power) = &mut self.power_io {
             power.power_off();
         }
         self.off_head.activity(t.boot_us);
@@ -2016,7 +2016,6 @@ impl Daemon {
         };
         let Some(d) = dev else { return };
         self.events.clear();
-        self.off_head.activity(now().boot_us);
         if let Err(e) = d.read_events(&mut self.events) {
             warn!("{id:?} button read failed ({e}); button disabled");
             *dev = None;
@@ -2027,25 +2026,23 @@ impl Daemon {
             ButtonId::Power => KEY_POWER,
             _ => KEY_CAMERA,
         };
-        let keys: Vec<(i32, u64)> = self
-            .events
-            .iter()
-            .filter(|e| e.type_ == EV_KEY && e.code == code)
-            .map(|e| (e.value, e.time_us))
-            .collect();
+        let keys = key_events(&self.events, code);
+        if !keys.is_empty() {
+            self.off_head.activity(now().boot_us);
+        }
         for (value, at) in keys {
             self.on_key(id, value, at);
         }
     }
 
-    /// One key event of a button. The camera button wakes the screen on key down (not off
-    /// the head); the frames are published; a short power press toggles a manual off-head.
+    /// One key event of a button. The camera button wakes the screen on key down (off the head
+    /// only for the quick timeout); the frames are published; a short power press toggles a manual off-head.
     fn on_key(&mut self, id: ButtonId, value: i32, at_us: u64) {
         let screen_off = self.policy.is_off();
         let (down, frames) = self.tracker(id).key(value, at_us, screen_off);
         if down
             && id == ButtonId::Camera
-            && let Some(ch) = self.policy.wake(now(), "button", false)
+            && let Some(ch) = self.policy.wake_key(now(), "button")
         {
             self.apply_change(ch);
         }
@@ -2053,15 +2050,19 @@ impl Daemon {
     }
 
     fn button_frames(&mut self, id: ButtonId, frames: Vec<Button>) {
+        // A press that takes back an assumed off-head has done its job: on the power key it must
+        // not also force the Glass off the head.
+        let mut took_back = false;
         if !frames.is_empty() {
             let u = self.wear.user_input(now().mono_us);
+            took_back = u.is_some();
             self.wear_update(u);
         }
         for b in frames {
             info!("button {id:?} {:?}", ButtonAction::try_from(b.action));
             let press = b.action == ButtonAction::Press as i32;
             self.publish(service_frame::Body::Button(b));
-            if id == ButtonId::Power && press {
+            if id == ButtonId::Power && press && !took_back {
                 let u = self.wear.power_key(now().mono_us);
                 self.wear_update(u);
             }
@@ -2080,12 +2081,14 @@ impl Daemon {
                 WearSource::try_from(u.state.source)
             );
             self.publish(service_frame::Body::WearState(u.state));
+            self.off_head.set_watching(!self.wear.hub_paused());
             if u.wear_changed {
                 let t = now();
                 self.power_policy.set_off_head(t.mono_us, !on);
                 self.off_head.set_off_head(t.boot_us, !on);
-                if on && let Some(power) = &mut self.power_io {
-                    power.set_alarm(None);
+                // Now, not only at the next request: a suspend may already be pending.
+                if let Some(power) = &mut self.power_io {
+                    power.set_alarm(self.off_head.next_alarm_s(t.boot_us));
                 }
                 self.touch_sleep.set(!on);
                 if let Some(ch) = self.policy.set_on_head(t, on) {
@@ -2396,8 +2399,32 @@ impl Drop for Daemon {
     }
 }
 
+/// The state changes of `code` among `events`, as (value, time). Readable does not mean pressed:
+/// the kernel's `input_reset_device` sends a lone `SYN_REPORT` on every resume.
+fn key_events(events: &[glass_evdev::Event], code: u16) -> Vec<(i32, u64)> {
+    events
+        .iter()
+        .filter(|e| e.type_ == EV_KEY && e.code == code)
+        .map(|e| (e.value, e.time_us))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sync_of_a_resume_is_not_a_key_press() {
+        let event = |type_, code, value| glass_evdev::Event {
+            time_us: 7,
+            type_,
+            code,
+            value,
+        };
+        assert_eq!(key_events(&[event(0, 0, 1)], KEY_CAMERA), vec![]);
+        let press = [event(EV_KEY, KEY_CAMERA, 1), event(0, 0, 0)];
+        assert_eq!(key_events(&press, KEY_CAMERA), vec![(1, 7)]);
+        assert_eq!(key_events(&press, KEY_POWER), vec![]);
+    }
+
     use super::*;
 
     fn dir(name: &str) -> PathBuf {

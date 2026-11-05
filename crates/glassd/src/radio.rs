@@ -5,9 +5,9 @@
 //! leaves association (Wi-Fi) and pairing (Bluetooth) to the userspace that owns them:
 //!
 //! - **Wi-Fi:** `rfkill unblock wifi` then `ip link set <iface> up` to enable; `ip link set
-//!   <iface> down` then `rfkill block wifi` to disable. Association (wpa_supplicant/iwd +
-//!   udhcpc) is the companion/QR-setup flow and is not started here; [`Radio::wifi_supplicant`]
-//!   reports which supplicant is installed so that flow can use it. The default is Wi-Fi off,
+//!   <iface> down` then `rfkill block wifi` to disable. With a supplicant config (`wifi.conf` in
+//!   the state directory, or from a QR bootstrap) enabling also starts `wpa_supplicant` and
+//!   `udhcpc`, which retry by themselves, and disabling stops them. The default is Wi-Fi off,
 //!   brought up on demand for big transfers or as a fallback.
 //! - **Bluetooth:** `rfkill unblock bluetooth` then bring the HCI controller up (`hciconfig
 //!   <hci> up`, else `bluetoothctl power on`); the reverse to disable. Pairing/bonding is
@@ -29,6 +29,10 @@ use std::process::Command;
 pub const DEFAULT_WIFI_IFACE: &str = "wlan0";
 /// Default Bluetooth HCI device (BCM4330 over the HCI UART).
 pub const DEFAULT_BT_HCI: &str = "hci0";
+/// The supplicant config's name in the state directory. It holds the network's password.
+pub const WIFI_CONF_FILE: &str = "wifi.conf";
+const WPA_PID_FILE: &str = "/var/run/glassd-wpa_supplicant.pid";
+const DHCP_PID_FILE: &str = "/var/run/glassd-udhcpc.pid";
 /// The UART the Bluetooth chip is wired to.
 const DEFAULT_BT_UART: &str = "/dev/ttyO1";
 
@@ -52,6 +56,10 @@ pub struct Radio {
     bt_hci: String,
     /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
     bt_uart: Option<String>,
+    /// The supplicant config to associate with when Wi-Fi is on.
+    wifi_conf: Option<std::path::PathBuf>,
+    /// `wpa_supplicant` and `udhcpc` were started and not stopped yet.
+    associating: bool,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -107,6 +115,12 @@ impl Radio {
         )
     }
 
+    /// Associates with this supplicant config whenever Wi-Fi is on, if the file exists then.
+    pub fn with_wifi_conf(mut self, conf: impl Into<std::path::PathBuf>) -> Radio {
+        self.wifi_conf = Some(conf.into());
+        self
+    }
+
     /// A radio with a custom runner.
     pub fn with_runner(wifi_iface: impl Into<String>, run: Runner) -> Radio {
         Radio {
@@ -114,6 +128,8 @@ impl Radio {
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
             bt_uart: None,
+            wifi_conf: None,
+            associating: false,
             wifi_on: None,
             bt_on: None,
         }
@@ -147,10 +163,11 @@ impl Radio {
         let iface = self.wifi_iface.clone();
         let ok = if on {
             let r = self.step("rfkill", &["unblock", "wifi"]);
-            // Bring the link up; association is left to the supplicant (companion/QR flow).
             self.step("ip", &["link", "set", &iface, "up"]);
+            self.start_association();
             r
         } else {
+            self.stop_association();
             self.step("ip", &["link", "set", &iface, "down"]);
             self.step("rfkill", &["block", "wifi"])
         };
@@ -224,17 +241,62 @@ impl Radio {
     /// supplicant, as [`Radio`] documents. Best effort: a missing tool is logged, not fatal.
     /// Returns whether Wi-Fi was enabled (the rfkill step); association runs regardless.
     pub fn join_wifi(&mut self, conf: &str, conf_path: &std::path::Path) -> bool {
-        let enabled = self.set_wifi(true);
         if let Err(e) = std::fs::write(conf_path, conf) {
             warn!("radio: cannot write {} ({e})", conf_path.display());
         }
-        let iface = self.wifi_iface.clone();
-        let conf_arg = conf_path.to_string_lossy().into_owned();
         // A previous supplicant on this interface would hold the control socket.
-        self.step("wpa_supplicant", &["-B", "-i", &iface, "-c", &conf_arg]);
-        self.step("udhcpc", &["-i", &iface, "-n"]);
+        self.stop_association();
+        self.wifi_conf = Some(conf_path.to_path_buf());
+        self.set_wifi(true)
+    }
+
+    /// Starts the supplicant and the DHCP client on the configured network. Both run on their
+    /// own and retry, so this does not wait for the network: the daemon's loop must not stop.
+    fn start_association(&mut self) {
+        let Some(conf) = self.wifi_conf.clone().filter(|c| c.exists()) else {
+            return;
+        };
+        if self.associating {
+            return;
+        }
+        let iface = self.wifi_iface.clone();
+        let conf_arg = conf.to_string_lossy().into_owned();
+        self.step(
+            "wpa_supplicant",
+            &[
+                "-B",
+                "-i",
+                &iface,
+                "-D",
+                "nl80211,wext",
+                "-c",
+                &conf_arg,
+                "-P",
+                WPA_PID_FILE,
+            ],
+        );
+        // Through a shell, with the output closed: the runner waits for its pipe to close, and
+        // udhcpc stays in the foreground until it has a lease.
+        let dhcp = format!("udhcpc -b -i {iface} -p {DHCP_PID_FILE} >/dev/null 2>&1 &");
+        self.step("sh", &["-c", &dhcp]);
+        self.associating = true;
         info!("radio: joining Wi-Fi on {iface}");
-        enabled
+    }
+
+    fn stop_association(&mut self) {
+        if !std::mem::take(&mut self.associating) {
+            return;
+        }
+        let kill = format!("kill $(cat {WPA_PID_FILE} {DHCP_PID_FILE}) 2>/dev/null");
+        self.step("sh", &["-c", &kill]);
+    }
+
+    /// The Wi-Fi interface's IPv4 address, if it has one.
+    pub fn wifi_ip(&mut self) -> Option<String> {
+        let iface = self.wifi_iface.clone();
+        let out = (self.run)("ip", &["-4", "-o", "addr", "show", &iface]).ok()?;
+        let after = out.stdout.split("inet ").nth(1)?;
+        Some(after.split(['/', ' ']).next()?.to_string()).filter(|ip| !ip.is_empty())
     }
 
     /// The Wi-Fi supplicant installed on the image, if glassd can see one (`wpa_supplicant` or
@@ -260,6 +322,80 @@ impl Radio {
 
 #[cfg(test)]
 mod tests {
+    fn with_log() -> (Radio, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (Radio::recording("wlan0", log.clone()), log)
+    }
+
+    #[test]
+    fn wifi_associates_only_with_a_config_and_stops_with_the_radio() {
+        let d = tempfile::tempdir().unwrap();
+        let conf = d.path().join(WIFI_CONF_FILE);
+        let (r, log) = with_log();
+        let mut r = r.with_wifi_conf(&conf);
+        r.apply(true, false);
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("wpa_supplicant"))
+        );
+        r.apply(false, false);
+
+        std::fs::write(&conf, "network={}").unwrap();
+        log.lock().unwrap().clear();
+        r.apply(true, false);
+        r.apply(true, false);
+        let started = log.lock().unwrap().clone();
+        assert_eq!(
+            started
+                .iter()
+                .filter(|c| c.starts_with("wpa_supplicant"))
+                .count(),
+            1
+        );
+        assert!(
+            started
+                .iter()
+                .any(|c| c.contains("udhcpc -b -i wlan0") && c.ends_with('&'))
+        );
+
+        log.lock().unwrap().clear();
+        r.apply(false, false);
+        let stopped = log.lock().unwrap().clone();
+        let kill = stopped.iter().position(|c| c.contains("kill")).unwrap();
+        let down = stopped
+            .iter()
+            .position(|c| c.contains("link set wlan0 down"))
+            .unwrap();
+        assert!(kill < down);
+    }
+
+    #[test]
+    fn reads_the_address_of_the_interface() {
+        let mut r = Radio::with_runner(
+            "wlan0",
+            Box::new(|_, _| {
+                Ok(Outcome {
+                    ok: true,
+                    stdout: "3: wlan0    inet 192.168.99.40/24 brd 192.168.99.255 scope global"
+                        .into(),
+                })
+            }),
+        );
+        assert_eq!(r.wifi_ip().as_deref(), Some("192.168.99.40"));
+        let mut none = Radio::with_runner(
+            "wlan0",
+            Box::new(|_, _| {
+                Ok(Outcome {
+                    ok: true,
+                    stdout: String::new(),
+                })
+            }),
+        );
+        assert_eq!(none.wifi_ip(), None);
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
 

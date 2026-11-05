@@ -675,7 +675,13 @@ impl Daemon {
                 )
             })
         } else {
-            opts.radio.then(|| Radio::system(opts.wifi_iface.clone()))
+            opts.radio.then(|| {
+                let radio = Radio::system(opts.wifi_iface.clone());
+                match &opts.state_dir {
+                    Some(dir) => radio.with_wifi_conf(dir.join(crate::radio::WIFI_CONF_FILE)),
+                    None => radio,
+                }
+            })
         };
         // The energy-policy back end: recorded with --mock (never touches the host's power
         // sysfs), real otherwise when --power is on. Android leaves power to the framework.
@@ -1880,13 +1886,14 @@ impl Daemon {
         let Some((wifi, bt)) = self.radio.as_ref().map(|r| r.state()) else {
             return;
         };
+        let wifi_ip = self.radio.as_mut().and_then(|r| r.wifi_ip());
         let s = self.settings();
         let radios = omg_protocol::RadioState {
             wifi_on: wifi.unwrap_or(false),
             bt_on: bt.unwrap_or(false),
             airplane_mode: s.airplane_mode.unwrap_or(false),
             wifi_ssid: None,
-            wifi_ip: None,
+            wifi_ip,
         };
         let events = match &mut self.companion {
             Some(c) => c.radio_state_changed(radios),
@@ -2002,6 +2009,11 @@ impl Daemon {
                 boot.psk.as_deref(),
             );
             radio.join_wifi(&conf, Path::new("/var/run/wpa_supplicant_glassd.conf"));
+            // Or the next settings change would turn it off again.
+            self.apply_settings_change(Settings {
+                wifi_enabled: Some(true),
+                ..Default::default()
+            });
         }
         if let Some(addr) = &boot.companion_addr {
             match &mut self.companion {

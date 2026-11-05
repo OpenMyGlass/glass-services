@@ -37,3 +37,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# TEMPORARY, while the session encryption is unmerged in OpenMyGlass: remove this section and set
+# the two revs above to the merge commit, then `cargo update -p omg-protocol -p omg-core`.
+[patch."https://github.com/OpenMyGlass/OpenMyGlass"]
+omg-protocol = { path = "../wip-companion-crypt/rust/crates/omg-protocol" }
+omg-core = { path = "../wip-companion-crypt/rust/crates/omg-core" }

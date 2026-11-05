@@ -291,8 +291,10 @@ impl Engine {
         self.pump();
     }
 
-    /// glassd closed its end. What it sent last goes out first.
+    /// glassd closed its end. What it sent last goes out first. What was on its way to it has
+    /// nowhere to go, and must not keep the UART unread, or the link's end would never be seen.
     pub fn session_closed(&mut self, now_ms: u64) {
+        self.to_session.clear();
         if let Some(c) = &mut self.conn
             && matches!(c.session, Session::Open | Session::Opening)
         {

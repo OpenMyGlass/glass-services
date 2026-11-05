@@ -235,6 +235,22 @@ fn glassd_closing_on_a_stalled_radio_cuts_the_link_in_the_end() {
 }
 
 #[test]
+fn glassd_closing_on_a_full_stream_does_not_leave_the_uart_unread() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    for run in data(TO_SESSION_MAX + 500).chunks(244) {
+        b.radio.phone_write(run);
+    }
+    while b.engine.wants_hci_read() {
+        b.air(10);
+    }
+    b.engine.session_closed(b.now);
+    assert!(b.engine.wants_hci_read());
+    b.settle();
+    assert!(!b.radio.connected());
+}
+
+#[test]
 fn glassd_not_listening_drops_the_phone_and_keeps_advertising() {
     let mut b = Bench::new();
     b.radio.phone_connects();

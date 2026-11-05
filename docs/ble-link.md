@@ -53,7 +53,7 @@ Deep sleep depends on UART2 idling. What changes:
 | Engine dies | | `rfkill block` and the kick at once, then up to 3 tries at 5 s, 30 s, 120 s. A missing firmware gets no try. A chip with nobody at the port must not hold the deep sleep back |
 
 - **The kick** (`kick_bt_uart`) is for a port that has never transmitted. An engine that came up has transmitted, so the kick is dropped then. It must also never land while the engine owns the port, because a stray byte would break its HCI stream, and it runs only after the engine has gone.
-- **Whether CORE OFF still happens with the port open and the chip on is not known**, and that is why `--companion-ble` is off by default (experiment E5). The prototype's measured runs with the sleep mode on were with the cable in, so no deep sleep at all.
+- **Whether CORE OFF still happens with the port open and the chip on is not known**, and that is why `--companion-ble` is off by default (experiment E5). The prototype measured throughput, not power, and no run of it crossed a suspend.
 - **`omg-bled` asks for 285-300 ms, latency 5** after 5 s of quiet, and for 15-30 ms when more than 200 bytes wait. Whether a phone agrees is its choice, and a refusal is not repeated on that link.
 - **A wake** goes HOST_WAKE, UART, `omg-bled`, socket, glassd's `poll`, then `resume_from_suspend` as on a Wi-Fi wake. Not run yet (E6).
 - **While the engine runs, the kernel's Bluetooth stack is not used.** No RFCOMM, A2DP or HFP alongside it, as the owner decided.

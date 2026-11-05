@@ -76,6 +76,23 @@ impl std::fmt::Debug for Radio {
     }
 }
 
+/// Writes a supplicant config, which holds the network's password, readable only by its owner.
+/// The file goes first, because opening an existing one would keep its old mode.
+fn write_private(path: &std::path::Path, content: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(content.as_bytes())
+}
+
 fn run_system(program: &str, args: &[&str]) -> io::Result<Outcome> {
     let out = Command::new(program).args(args).output()?;
     Ok(Outcome {
@@ -241,7 +258,7 @@ impl Radio {
     /// supplicant, as [`Radio`] documents. Best effort: a missing tool is logged, not fatal.
     /// Returns whether Wi-Fi was enabled (the rfkill step); association runs regardless.
     pub fn join_wifi(&mut self, conf: &str, conf_path: &std::path::Path) -> bool {
-        if let Err(e) = std::fs::write(conf_path, conf) {
+        if let Err(e) = write_private(conf_path, conf) {
             warn!("radio: cannot write {} ({e})", conf_path.display());
         }
         // A previous supplicant on this interface would hold the control socket.
@@ -322,6 +339,20 @@ impl Radio {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_joined_network_password_is_private_even_over_an_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let conf = d.path().join("wpa.conf");
+        std::fs::write(&conf, "old").unwrap();
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (mut r, _log) = with_log();
+        r.join_wifi("network={}", &conf);
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), "network={}");
+        let mode = std::fs::metadata(&conf).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     fn with_log() -> (Radio, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         (Radio::recording("wlan0", log.clone()), log)

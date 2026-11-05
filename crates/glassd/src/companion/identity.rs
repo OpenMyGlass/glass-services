@@ -55,6 +55,13 @@ impl Identity {
         B64.encode(self.signing.verifying_key().to_bytes())
     }
 
+    /// The same key as `omg-core` knows it, for what is shared with the companion: the key
+    /// exchange and everything after it (`omg_core::secure`).
+    pub fn to_core(&self) -> omg_core::Identity {
+        // This secret is ours, 32 bytes, base64: nothing about it can fail to parse.
+        omg_core::Identity::from_secret_b64(&self.secret_b64()).expect("our own secret parses")
+    }
+
     /// Signs `AUTH_CONTEXT || nonce` and returns the base64 signature.
     pub fn sign_challenge(&self, nonce: &[u8]) -> String {
         let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + nonce.len());

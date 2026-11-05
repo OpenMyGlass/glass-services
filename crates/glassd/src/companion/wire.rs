@@ -38,7 +38,9 @@ impl fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-/// Encodes one [`Frame`] as `len:u32be || postcard(Frame)` in a new buffer.
+/// Encodes one [`Frame`] as `len:u32be || postcard(Frame)` in a new buffer. For a test or a
+/// handshake only: on a live link frames become bytes through
+/// [`super::link::Link::encode`], which seals them.
 pub fn frame_bytes(frame: &Frame) -> Result<Vec<u8>, WireError> {
     let payload = wire::encode_payload(frame).map_err(|e| WireError::Encode(e.to_string()))?;
     let mut out = Vec::with_capacity(LEN_PREFIX + payload.len());

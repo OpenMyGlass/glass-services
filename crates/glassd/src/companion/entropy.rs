@@ -10,7 +10,7 @@
 //! So the same condition goes into the daemon's `poll` loop: [`PoolWait`] polls the same device
 //! the crate does, and [`crate::companion::Companion`] touches the crate only once it is ready.
 //! Afterwards the crate keeps `/dev/urandom` open and never waits again, and keys, challenge
-//! nonces and note ids come out of it at once.
+//! nonces, session keys and note ids come out of it at once.
 //!
 //! Polling reads nothing, so it costs no entropy. Readiness also lasts on 3.4: `/dev/urandom`
 //! leaves at least 128 bits in the input pool, above the 64 that make `/dev/random` readable, and
@@ -26,6 +26,10 @@
 //! credited bits, whatever the order. On an idle Glass that takes about 8 minutes, and with Wi-Fi
 //! scanning it may never happen, because from 192 bits on the kernel drains the pool (130-182 bits
 //! for 25 minutes on the Glass). Later boots reuse the stored identity and skip this.
+//!
+//! A later boot with no seed file, after a power cut between using one seed and saving the next,
+//! has only the readable `/dev/random` behind it. So `omg_core::secure` mixes the identity's secret
+//! into challenge nonces and session keys, and a thin pool alone cannot make them predictable.
 
 use std::fs::File;
 use std::io::{self, Write};

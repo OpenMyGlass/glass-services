@@ -2003,17 +2003,21 @@ impl Daemon {
             boot.ssid, boot.companion_addr
         );
         if let Some(radio) = &mut self.radio {
-            let conf = companion::bootstrap::wpa_supplicant_conf(
+            match companion::bootstrap::wpa_supplicant_conf(
                 &boot.ssid,
                 boot.auth,
                 boot.psk.as_deref(),
-            );
-            radio.join_wifi(&conf, Path::new("/var/run/wpa_supplicant_glassd.conf"));
-            // Or the next settings change would turn it off again.
-            self.apply_settings_change(Settings {
-                wifi_enabled: Some(true),
-                ..Default::default()
-            });
+            ) {
+                Ok(conf) => {
+                    radio.join_wifi(&conf, Path::new("/var/run/wpa_supplicant_glassd.conf"));
+                    // Or the next settings change would turn it off again.
+                    self.apply_settings_change(Settings {
+                        wifi_enabled: Some(true),
+                        ..Default::default()
+                    });
+                }
+                Err(e) => warn!("companion: QR network refused ({e})"),
+            }
         }
         if let Some(addr) = &boot.companion_addr {
             match &mut self.companion {

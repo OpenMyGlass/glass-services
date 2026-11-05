@@ -1207,6 +1207,7 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
     use glass_api::proto::CompanionState;
     use glassd::companion::identity::{Identity, decode_nonce, random_nonce_b64, verify_challenge};
     use glassd::companion::wire::{FrameDecoder, frame_bytes};
+    use omg_core::secure::{Channel, HandshakeFacts, KeyExchange};
     use omg_protocol::{
         AuthChallenge, AuthResponse, AuthResult, Frame, Hello, Notification, NotificationPosted,
         PROTOCOL_VERSION, PairRequest, PairResult, Role, capability,
@@ -1227,18 +1228,30 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
         verify_ok: bool,
         sent_result: bool,
         peer_result: Option<bool>,
+        peer_nonce: Vec<u8>,
+        our_hello: Option<Hello>,
+        glass_hello: Option<Hello>,
+        exchange: Option<KeyExchange>,
+        channel: Option<Channel>,
     }
 
     impl TcpCompanion {
         fn send(&mut self, f: &Frame) {
-            self.stream.write_all(&frame_bytes(f).unwrap()).unwrap();
+            let bytes = match &mut self.channel {
+                Some(channel) => channel.seal_bytes(f).unwrap(),
+                None => frame_bytes(f).unwrap(),
+            };
+            self.stream.write_all(&bytes).unwrap();
         }
         fn recv(&mut self) -> Frame {
             let mut buf = [0u8; 4096];
             let deadline = Instant::now() + T;
             loop {
                 if let Some(f) = self.dec.next_frame().unwrap() {
-                    return f;
+                    return match &mut self.channel {
+                        Some(channel) => channel.open(f).unwrap(),
+                        None => f,
+                    };
                 }
                 assert!(Instant::now() < deadline, "no frame from glassd");
                 let n = self.stream.read(&mut buf).expect("read");
@@ -1258,6 +1271,24 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
         }
         fn authenticated(&self) -> bool {
             self.sent_result && self.verify_ok && self.peer_result == Some(true)
+        }
+        /// After the mutual auth, once: the key exchange starts.
+        fn maybe_start_exchange(&mut self) {
+            if self.authenticated() && self.exchange.is_none() && self.channel.is_none() {
+                let (exchange, share) = KeyExchange::start(
+                    &self.id.to_core(),
+                    HandshakeFacts {
+                        our_hello: self.our_hello.as_ref().unwrap(),
+                        peer_hello: self.glass_hello.as_ref().unwrap(),
+                        our_nonce: &self.our_nonce,
+                        peer_nonce: &self.peer_nonce,
+                        bonded_peer_pub: self.glass_pub.as_ref().unwrap(),
+                    },
+                )
+                .unwrap();
+                self.exchange = Some(exchange);
+                self.send(&share);
+            }
         }
     }
 
@@ -1327,20 +1358,28 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
         verify_ok: false,
         sent_result: false,
         peer_result: None,
+        peer_nonce: Vec::new(),
+        our_hello: None,
+        glass_hello: None,
+        exchange: None,
+        channel: None,
     };
-    c.send(&Frame::Hello(Hello {
+    let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         role: Role::Companion,
         app_version: "it/0.1".into(),
         device_name: "it-phone".into(),
         identity_pub: c.id.public_b64(),
         capabilities: capability::BACKBONE.iter().map(|s| s.to_string()).collect(),
-    }));
-    while !c.authenticated() {
+    };
+    c.our_hello = Some(hello.clone());
+    c.send(&Frame::Hello(hello));
+    while c.channel.is_none() {
         match c.recv() {
             Frame::Hello(h) => {
                 assert_eq!(h.role, Role::Glass);
-                c.glass_pub = Some(h.identity_pub);
+                c.glass_pub = Some(h.identity_pub.clone());
+                c.glass_hello = Some(h);
                 c.send(&Frame::PairRequest(PairRequest {
                     companion_name: "it-phone".into(),
                     companion_pub: c.id.public_b64(),
@@ -1360,17 +1399,30 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
             Frame::AuthChallenge(ch) => {
                 let nonce = decode_nonce(&ch.nonce).unwrap();
                 let sig = c.id.sign_challenge(&nonce);
+                c.peer_nonce = nonce;
                 c.send(&Frame::AuthResponse(AuthResponse { signature: sig }));
                 c.answered = true;
                 c.maybe_finish();
+                c.maybe_start_exchange();
             }
             Frame::AuthResponse(resp) => {
                 let gp = c.glass_pub.clone().unwrap();
                 c.verify_ok = verify_challenge(&gp, &c.our_nonce, &resp.signature);
                 c.got_resp = true;
                 c.maybe_finish();
+                c.maybe_start_exchange();
             }
-            Frame::AuthResult(r) => c.peer_result = Some(r.ok),
+            Frame::AuthResult(r) => {
+                c.peer_result = Some(r.ok);
+                c.maybe_start_exchange();
+            }
+            Frame::SessionKeyShare(share) => {
+                let proof = c.exchange.as_mut().unwrap().on_share(&share).unwrap();
+                c.send(&proof);
+            }
+            Frame::SessionKeyProof(proof) => {
+                c.channel = Some(c.exchange.take().unwrap().on_proof(&proof).unwrap());
+            }
             _ => {}
         }
     }

@@ -707,7 +707,7 @@ impl Companion {
             return;
         };
         for frame in frames {
-            match wire::frame_bytes(&frame) {
+            match c.link.encode(&frame) {
                 Ok(bytes) => c.out.extend_from_slice(&bytes),
                 Err(e) => warn!("companion {id}: cannot encode {}: {e}", frame.wire_name()),
             }
@@ -741,14 +741,16 @@ impl Companion {
     fn drive(&mut self, id: ConnId, outs: Vec<Out>, events: &mut Vec<Event>) {
         for out in outs {
             match out {
-                Out::Send(frame) => match wire::frame_bytes(&frame) {
-                    Ok(bytes) => {
-                        if let Some(c) = self.conns.get_mut(&id) {
-                            c.out.extend_from_slice(&bytes);
+                Out::Send(frame) => {
+                    if let Some(c) = self.conns.get_mut(&id) {
+                        match c.link.encode(&frame) {
+                            Ok(bytes) => c.out.extend_from_slice(&bytes),
+                            Err(e) => {
+                                warn!("companion {id}: cannot encode {}: {e}", frame.wire_name())
+                            }
                         }
                     }
-                    Err(e) => warn!("companion {id}: cannot encode {}: {e}", frame.wire_name()),
-                },
+                }
                 Out::Connected { name, capabilities } => {
                     let transport = self
                         .conns
@@ -818,7 +820,11 @@ impl Companion {
                 Out::SetAirplane(on) => events.push(Event::SetAirplane(on)),
                 Out::WifiBringUp(r) => events.push(Event::WifiBringUp(r)),
                 Out::WifiTearDown => events.push(Event::WifiTearDown),
-                Out::Close(reason) => self.drop_conn(id, &reason, events),
+                Out::Close(reason) => {
+                    // What the link queued first is the reason it closes: an Error frame.
+                    self.flush(id, events);
+                    self.drop_conn(id, &reason, events);
+                }
             }
         }
         // Best-effort immediate flush; the rest waits for POLLOUT.
@@ -883,6 +889,8 @@ pub fn state_file(dir: &Path) -> PathBuf {
     Store::path_in(dir)
 }
 
+#[cfg(test)]
+mod crypto_e2e;
 #[cfg(test)]
 mod e2e;
 #[cfg(test)]

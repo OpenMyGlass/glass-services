@@ -11,7 +11,7 @@ use glass_api::proto::{
 };
 use omg_core::notes::{CompanionNotes, LinkProfile, RetryPolicy, SpeechJob, SpeechOutcome};
 use omg_core::{CompanionLink, Identity, LinkOut, PairingMode, PairingRecord};
-use omg_protocol::{Frame, FrameDecoder, capability, frame_bytes};
+use omg_protocol::{Frame, FrameDecoder, capability};
 
 use super::link::DeviceState;
 use super::{Companion, ConnId, Event};
@@ -24,6 +24,8 @@ fn glass(dir: &Path) -> Companion {
 struct Phone {
     socket: TcpStream,
     decoder: FrameDecoder,
+    /// Every byte the Glass sent: what a relay would see.
+    wire: Vec<u8>,
     link: CompanionLink,
     notes: CompanionNotes,
     bond: Option<PairingRecord>,
@@ -53,6 +55,7 @@ impl Phone {
         let mut phone = Phone {
             socket,
             decoder: FrameDecoder::new(),
+            wire: Vec::new(),
             link,
             notes: CompanionNotes::open(dir, RetryPolicy::default()).unwrap(),
             bond,
@@ -67,7 +70,7 @@ impl Phone {
     }
 
     fn send(&mut self, frame: &Frame) {
-        let bytes = frame_bytes(frame).unwrap();
+        let bytes = self.link.encode(frame).unwrap();
         let mut written = 0;
         // Nonblocking, but the kernel buffers hold all these small test frames.
         while written < bytes.len() {
@@ -117,7 +120,10 @@ impl Phone {
         loop {
             match self.socket.read(&mut buf) {
                 Ok(0) => return,
-                Ok(n) => self.decoder.push(&buf[..n]),
+                Ok(n) => {
+                    self.wire.extend_from_slice(&buf[..n]);
+                    self.decoder.push(&buf[..n]);
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => return,
             }
@@ -344,6 +350,14 @@ fn a_note_taken_offline_syncs_on_the_next_link_and_only_then_leaves_the_glass() 
     let synced = phone.notes.machine().notes().next().unwrap().clone();
     assert!(synced.complete);
     assert_eq!(synced.manifest.text.as_deref(), Some("appunto"));
+    // The note crossed encrypted: its text and the files are not on the wire.
+    assert!(!phone.wire.windows(7).any(|w| w == b"appunto"));
+    assert!(
+        !phone
+            .wire
+            .windows(64)
+            .any(|w| photo.windows(64).next() == Some(w))
+    );
     assert_eq!(synced.manifest.locale, omg_protocol::Locale::It);
     for (i, original) in [&voice, &photo, &video].into_iter().enumerate() {
         let path = phone.notes.attachment_path(&synced.manifest.id, i as u16);

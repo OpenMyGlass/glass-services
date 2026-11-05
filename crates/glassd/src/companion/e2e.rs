@@ -6,7 +6,8 @@
 //! The Glass side is the real [`Link`] state machine. The companion side is an independent
 //! reimplementation of `omg-core`'s companion role (`session.rs`), so a bug in one side cannot
 //! hide behind a matching bug in the other. Frames are pumped directly (the byte framing is
-//! covered by [`super::wire`]).
+//! covered by [`super::wire`]); the keys are the shared `omg_core::secure`, on purpose: there is
+//! one implementation. `crypto_e2e.rs` holds the attacks.
 
 use omg_protocol::{
     AuthChallenge, AuthResponse, AuthResult, BatteryStatus, ErrorCode, ErrorMsg, Frame,
@@ -14,6 +15,9 @@ use omg_protocol::{
     NotificationChoice, NotificationPosted, PROTOCOL_VERSION, PairRequest, PairResult, Ping, Role,
     SetLocale, StatusRequest, capability,
 };
+
+use omg_core::secure::{Channel, HandshakeFacts, KeyExchange};
+use omg_protocol::FrameDecoder;
 
 use super::identity::{Identity, decode_nonce, random_nonce_b64, verify_challenge};
 use super::link::{DeviceState, Link, Out};
@@ -33,6 +37,8 @@ enum CPhase {
     AwaitingHello,
     AwaitingPairAccept(String),
     Auth,
+    KeyShare(Box<KeyExchange>),
+    KeyProof(Box<KeyExchange>),
     Running,
     Done,
 }
@@ -46,6 +52,10 @@ struct TestCompanion {
     phase: CPhase,
     allow_new: bool,
     our_nonce: Vec<u8>,
+    peer_nonce: Vec<u8>,
+    our_hello: Option<Hello>,
+    glass_hello: Option<Hello>,
+    channel: Option<Channel>,
     answered: bool,
     got_resp: bool,
     verify_ok: bool,
@@ -69,6 +79,10 @@ impl TestCompanion {
             phase: CPhase::Start,
             allow_new,
             our_nonce: Vec::new(),
+            peer_nonce: Vec::new(),
+            our_hello: None,
+            glass_hello: None,
+            channel: None,
             answered: false,
             got_resp: false,
             verify_ok: false,
@@ -85,14 +99,16 @@ impl TestCompanion {
 
     fn start(&mut self) -> Vec<Frame> {
         self.phase = CPhase::AwaitingHello;
-        vec![Frame::Hello(Hello {
+        let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             role: Role::Companion,
             app_version: "omg-test/0.1".into(),
             device_name: self.name.clone(),
             identity_pub: self.id.public_b64(),
             capabilities: capability::BACKBONE.iter().map(|s| s.to_string()).collect(),
-        })]
+        };
+        self.our_hello = Some(hello.clone());
+        vec![Frame::Hello(hello)]
     }
 
     fn enter_auth(&mut self) -> Vec<Frame> {
@@ -111,27 +127,62 @@ impl TestCompanion {
             ok: self.verify_ok,
             message: String::new(),
         })];
-        if self.verify_ok && self.peer_result == Some(true) {
-            self.authenticated = true;
-            self.phase = CPhase::Running;
-        }
         out.extend(self.finalize());
         out
     }
 
     fn finalize(&mut self) -> Vec<Frame> {
-        if self.sent_result && self.verify_ok && self.peer_result == Some(true) {
-            self.authenticated = true;
-            self.phase = CPhase::Running;
+        if !(matches!(self.phase, CPhase::Auth)
+            && self.sent_result
+            && self.verify_ok
+            && self.peer_result == Some(true))
+        {
+            return Vec::new();
         }
-        Vec::new()
+        let (exchange, share) = KeyExchange::start(
+            &self.id.to_core(),
+            HandshakeFacts {
+                our_hello: self.our_hello.as_ref().unwrap(),
+                peer_hello: self.glass_hello.as_ref().unwrap(),
+                our_nonce: &self.our_nonce,
+                peer_nonce: &self.peer_nonce,
+                bonded_peer_pub: &self.bonded.as_ref().unwrap().peer_pub,
+            },
+        )
+        .unwrap();
+        self.phase = CPhase::KeyShare(Box::new(exchange));
+        vec![share]
     }
 
     fn on_frame(&mut self, f: Frame) -> Vec<Frame> {
+        if let Frame::Sealed(_) = f {
+            let inner = self.channel.as_mut().unwrap().open(f).unwrap();
+            return self.on_frame(inner);
+        }
+        if let (CPhase::KeyShare(_), Frame::SessionKeyShare(share)) = (&self.phase, &f) {
+            let CPhase::KeyShare(mut exchange) = std::mem::replace(&mut self.phase, CPhase::Done)
+            else {
+                unreachable!();
+            };
+            let proof = exchange.on_share(share).unwrap();
+            self.phase = CPhase::KeyProof(exchange);
+            return vec![proof];
+        }
+        if let (CPhase::KeyProof(_), Frame::SessionKeyProof(proof)) = (&self.phase, &f) {
+            let CPhase::KeyProof(exchange) = std::mem::replace(&mut self.phase, CPhase::Done)
+            else {
+                unreachable!();
+            };
+            self.channel = Some(exchange.on_proof(proof).unwrap());
+            self.authenticated = true;
+            self.phase = CPhase::Running;
+            return Vec::new();
+        }
         match (&self.phase, f) {
             (CPhase::AwaitingHello, Frame::Hello(h)) => {
                 assert_eq!(h.protocol_version, PROTOCOL_VERSION);
                 self.glass_pub = Some(h.identity_pub.clone());
+                self.glass_hello = Some(h.clone());
                 if let Some(b) = &self.bonded
                     && b.peer_pub == h.identity_pub
                 {
@@ -161,6 +212,7 @@ impl TestCompanion {
             (CPhase::Auth, Frame::AuthChallenge(ch)) => {
                 let nonce = decode_nonce(&ch.nonce).unwrap();
                 let sig = self.id.sign_challenge(&nonce);
+                self.peer_nonce = nonce;
                 self.answered = true;
                 let mut out = vec![Frame::AuthResponse(AuthResponse { signature: sig })];
                 out.extend(self.maybe_finish());
@@ -211,15 +263,30 @@ struct Harness {
 }
 
 impl Harness {
+    /// What the Glass's outputs look like on the wire.
     fn glass_frames(&mut self, outs: Vec<Out>) -> Vec<Frame> {
         let mut frames = Vec::new();
         for o in outs {
             match o {
-                Out::Send(f) => frames.push(f),
+                Out::Send(f) => {
+                    let mut decoder = FrameDecoder::new();
+                    decoder.push(&self.glass.encode(&f).unwrap());
+                    frames.push(decoder.next_frame().unwrap().unwrap());
+                }
                 other => self.events.push(other),
             }
         }
         frames
+    }
+
+    /// The companion sends `frame` on the encrypted link; returns the Glass's answers, opened.
+    fn companion_says(&mut self, frame: Frame) -> Vec<Frame> {
+        let sealed = self.comp.channel.as_mut().unwrap().seal(&frame).unwrap();
+        let outs = self.glass.on_frame(sealed);
+        let wire = self.glass_frames(outs);
+        wire.into_iter()
+            .map(|f| self.comp.channel.as_mut().unwrap().open(f).unwrap())
+            .collect()
     }
 
     /// Delivers queued frames both ways until the link is quiescent.
@@ -282,18 +349,14 @@ fn full_backbone_pairs_then_serves_the_backbone() {
     assert_eq!(h.comp.batteries.first().map(|b| b.percent), Some(73));
 
     // Heartbeat: Ping -> Pong.
-    let outs = h.glass.on_frame(Frame::Ping(Ping {
+    let frames = h.companion_says(Frame::Ping(Ping {
         token: 99,
         unix_ms: 1,
     }));
-    let frames = h.glass_frames(outs);
     assert!(matches!(frames.as_slice(), [Frame::Pong(p)] if p.token == 99));
 
     // Status round-trip.
-    let outs = h
-        .glass
-        .on_frame(Frame::StatusRequest(StatusRequest::default()));
-    let f = h.glass_frames(outs);
+    let f = h.companion_says(Frame::StatusRequest(StatusRequest::default()));
     for fr in f {
         h.comp.on_frame(fr);
     }
@@ -302,10 +365,7 @@ fn full_backbone_pairs_then_serves_the_backbone() {
     assert_eq!(st.screen_width_px, Some(640));
 
     // Locale push: SetLocale -> ApplyLocale + LocaleChanged.
-    let outs = h
-        .glass
-        .on_frame(Frame::SetLocale(SetLocale { locale: Locale::Fr }));
-    let f = h.glass_frames(outs);
+    let f = h.companion_says(Frame::SetLocale(SetLocale { locale: Locale::Fr }));
     for fr in f {
         h.comp.on_frame(fr);
     }
@@ -317,25 +377,22 @@ fn full_backbone_pairs_then_serves_the_backbone() {
     );
 
     // Notification posted -> surfaced; the owner's action is relayed back.
-    let outs = h
-        .glass
-        .on_frame(Frame::NotificationPosted(NotificationPosted {
-            notification: Notification {
-                key: "msg-1".into(),
-                app_name: "Signal".into(),
-                title: "Giorgio".into(),
-                text: "ci vediamo alle 18".into(),
-                posted_at_ms: 1,
-                icon_sha256: None,
-                actions: vec![NotificationActionInfo {
-                    index: 0,
-                    title: "Reply".into(),
-                    reply: true,
-                }],
-                wake: true,
-            },
-        }));
-    let _ = h.glass_frames(outs);
+    let _ = h.companion_says(Frame::NotificationPosted(NotificationPosted {
+        notification: Notification {
+            key: "msg-1".into(),
+            app_name: "Signal".into(),
+            title: "Giorgio".into(),
+            text: "ci vediamo alle 18".into(),
+            posted_at_ms: 1,
+            icon_sha256: None,
+            actions: vec![NotificationActionInfo {
+                index: 0,
+                title: "Reply".into(),
+                reply: true,
+            }],
+            wake: true,
+        },
+    }));
     let surfaced = h
         .events
         .iter()
@@ -386,10 +443,9 @@ fn reconnect_reuses_the_bond_and_authenticates() {
     assert_eq!(h.glass.peer_name(), Some("giorgio-pc"));
 
     // A ping still works after a bare reconnect.
-    let outs = h.glass.on_frame(Frame::Ping(Ping {
+    let frames = h.companion_says(Frame::Ping(Ping {
         token: 7,
         unix_ms: 0,
     }));
-    let frames = h.glass_frames(outs);
     assert!(matches!(frames.as_slice(), [Frame::Pong(p)] if p.token == 7));
 }

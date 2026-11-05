@@ -123,6 +123,9 @@ pub struct Options {
     pub companion_tcp_port: Option<u16>,
     /// Advertise and accept the Bluetooth RFCOMM companion link (needs the `linux-bt` feature).
     pub companion_bt: bool,
+    /// Run `omg-bled` and take the phone link over BLE (`None`: no BLE). Needs `radio` and
+    /// `companion`.
+    pub ble: Option<BleOptions>,
     /// Where the companion link learns that the random pool is seeded (`/dev/random`).
     pub companion_rng_device: PathBuf,
     /// Where to read the battery for the companion `BatteryStatus`/`Status`.
@@ -270,6 +273,51 @@ fn sync_attr(
         }
     }
 }
+
+/// How to run the BLE engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BleOptions {
+    /// The `omg-bled` program.
+    pub engine: PathBuf,
+    /// The Bluetooth firmware patch on the image. A vendor file: it is not in any repository.
+    pub firmware: PathBuf,
+    /// The Unix socket the engine connects to for each phone session.
+    pub socket: PathBuf,
+}
+
+/// BLE, if it was asked for and can run: glassd must hold the radios and the link, and the engine
+/// must be on the image. Otherwise Bluetooth stays as it is without it.
+fn usable_ble(opts: &Options) -> Option<BleOptions> {
+    let ble = opts.ble.as_ref()?;
+    if !opts.radio || !opts.companion {
+        warn!("companion: BLE needs --radio on and --companion on");
+        return None;
+    }
+    if !ble.engine.exists() {
+        warn!("companion: no BLE engine at {}", ble.engine.display());
+        return None;
+    }
+    Some(ble.clone())
+}
+
+fn ble_command(ble: &BleOptions, opts: &Options) -> Vec<std::ffi::OsString> {
+    let state_dir = opts
+        .state_dir
+        .clone()
+        .unwrap_or_else(crate::settings_store::default_state_dir);
+    vec![
+        ble.engine.clone().into(),
+        "--socket".into(),
+        ble.socket.clone().into(),
+        "--state-dir".into(),
+        state_dir.into(),
+        "--firmware".into(),
+        ble.firmware.clone().into(),
+    ]
+}
+
+/// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
+const CAP_COMPANION_BLE: &str = "companion-ble";
 
 /// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
 /// off, keeping the per-radio wishes so they are restored when it is turned off.
@@ -641,7 +689,9 @@ impl Daemon {
             cfg.scroll_min_step = v;
         }
         let store = opts.state_dir.as_ref().map(SettingsStore::new);
-        let settings = match &store {
+        let ble = usable_ble(opts);
+        let first_run = store.as_ref().is_some_and(|st| !st.path().exists());
+        let mut settings = match &store {
             Some(st) => st.load().unwrap_or_else(|e| {
                 warn!(
                     "cannot read {}: {e}; using the defaults",
@@ -651,6 +701,11 @@ impl Daemon {
             }),
             None => settings_rules::defaults(),
         };
+        // On BLE the phone reaches the Glass through Bluetooth, so that is what a new Glass does,
+        // on an image that asks for it. After that it is the owner's setting like any other.
+        if ble.is_some() && first_run {
+            settings.bluetooth_enabled = Some(true);
+        }
         let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(120_000));
         let (glasshub, camera_dev, power_dev, imu) = if opts.mock {
             (None, None, None, None)
@@ -677,8 +732,12 @@ impl Daemon {
         } else {
             opts.radio.then(|| {
                 let radio = Radio::system(opts.wifi_iface.clone());
-                match &opts.state_dir {
+                let radio = match &opts.state_dir {
                     Some(dir) => radio.with_wifi_conf(dir.join(crate::radio::WIFI_CONF_FILE)),
+                    None => radio,
+                };
+                match &ble {
+                    Some(b) => radio.with_ble_engine(ble_command(b, opts)),
                     None => radio,
                 }
             })
@@ -730,7 +789,12 @@ impl Daemon {
                 opts.companion_bt,
                 &opts.companion_rng_device,
             ) {
-                Ok(c) => Some(c),
+                Ok(mut c) => {
+                    if let Some(b) = &ble {
+                        c.set_ble_socket(b.socket.clone());
+                    }
+                    Some(c)
+                }
                 Err(e) => {
                     warn!("companion: disabled ({e})");
                     None
@@ -923,6 +987,16 @@ impl Daemon {
                 let wait_ms = c.rng_next_deadline()?.saturating_sub(companion::now_ms());
                 Some(now().mono_us + wait_ms * 1000)
             }),
+            self.companion.as_ref().and_then(|c| {
+                let wait_ms = c
+                    .handshake_next_deadline()?
+                    .saturating_sub(companion::now_ms());
+                Some(now().mono_us + wait_ms * 1000)
+            }),
+            self.radio
+                .as_ref()
+                .and_then(Radio::ble_next_deadline)
+                .map(|ms| ms * 1000),
         ]
         .into_iter()
         .flatten()
@@ -966,6 +1040,7 @@ impl Daemon {
             CompanionRng,
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
+            BleEngine,
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -1026,6 +1101,9 @@ impl Daemon {
                 }
                 add(fd, ev, Src::CompanionConn(id));
             }
+        }
+        if let Some(fd) = self.radio.as_ref().and_then(Radio::ble_fd) {
+            add(fd, libc::POLLIN, Src::BleEngine);
         }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
@@ -1104,9 +1182,29 @@ impl Daemon {
                     }
                     self.companion_events(events);
                 }
+                Src::BleEngine => {
+                    if let Some(radio) = &mut self.radio {
+                        radio.on_ble_event(now().mono_us / 1000);
+                    }
+                    self.sync_ble_capability();
+                }
             }
         }
         Ok(())
+    }
+
+    /// The capability says what the engine does now. A client reads it in its `Welcome`.
+    fn sync_ble_capability(&mut self) {
+        let running = self.radio.as_ref().is_some_and(Radio::ble_running);
+        let shown = self
+            .hub
+            .capabilities()
+            .iter()
+            .any(|c| c == CAP_COMPANION_BLE);
+        if running != shown {
+            self.hub.set_capability(CAP_COMPANION_BLE, running);
+            info!("companion: BLE {}", if running { "up" } else { "down" });
+        }
     }
 
     fn timers(&mut self, t: Now) {
@@ -1152,6 +1250,15 @@ impl Daemon {
             .map(|c| c.rng_tick())
             .unwrap_or_default();
         self.companion_events(events);
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.handshake_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
+        if let Some(radio) = &mut self.radio {
+            radio.ble_tick(t.mono_us / 1000);
+        }
         // Energy policy: the deep-idle window may have elapsed (screen off long enough).
         if self.power_io.is_some()
             && let Some(PowerAction::Suspend) = self.power_policy.on_timeout(t.mono_us)
@@ -2281,6 +2388,7 @@ impl Daemon {
         };
         let (wifi, bluetooth) = effective_radio(s);
         radio.apply(wifi, bluetooth);
+        self.sync_ble_capability();
     }
 
     /// Applies the energy-policy settings: update the idle -> suspend decision and re-apply the
@@ -2521,6 +2629,7 @@ mod tests {
             companion: false,
             companion_tcp_port: None,
             companion_bt: false,
+            ble: None,
             companion_rng_device: crate::companion::entropy::RANDOM_DEVICE.into(),
             power_supply: crate::companion::battery::DEFAULT_ROOT.into(),
             energy: false,
@@ -2541,6 +2650,130 @@ mod tests {
         s.on_head_detection_enabled = Some(on);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
+    }
+
+    fn ble_opts(d: &Path, ble: Option<BleOptions>) -> Options {
+        Options {
+            socket: d.join("glassd.sock"),
+            mock: true,
+            device: None,
+            device_name: TOUCHPAD_NAME.into(),
+            invert_x: false,
+            invert_y: false,
+            tap_slop: None,
+            swipe_min_travel: None,
+            scroll_min_step: None,
+            screen_off_input: ScreenOffInput::Touches,
+            glasshub: None,
+            gaze_params: None,
+            camera: Source::Off,
+            power: Source::Off,
+            touchpad_sysfs: None,
+            state_dir: Some(d.join("state")),
+            iio: None,
+            iio_dev: None,
+            peers: PeerPolicy::open(),
+            grab_touchpad: false,
+            radio: true,
+            wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
+            companion: true,
+            companion_tcp_port: None,
+            companion_bt: false,
+            ble,
+            companion_rng_device: crate::companion::entropy::RANDOM_DEVICE.into(),
+            power_supply: d.join("no-power-supply"),
+            energy: false,
+            power_paths: PowerPaths::default(),
+        }
+    }
+
+    #[test]
+    fn a_new_glass_with_ble_has_bluetooth_on_and_the_owner_s_choice_stays() {
+        let d = tempfile::tempdir().unwrap();
+        let engine = d.path().join("engine");
+        std::fs::write(&engine, "").unwrap();
+        let ble = BleOptions {
+            engine,
+            firmware: d.path().join("fw"),
+            socket: d.path().join("ble.sock"),
+        };
+        let opts = ble_opts(d.path(), Some(ble.clone()));
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(true));
+        let mut s = daemon.settings();
+        s.bluetooth_enabled = Some(false);
+        daemon.settings_changed(&s);
+        daemon.hub.set_settings_source(s);
+        drop(daemon);
+        std::fs::remove_file(d.path().join("glassd.sock")).ok();
+        let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(false));
+        drop(daemon);
+
+        // Without the engine on the image, or not asked for: Bluetooth as it always was.
+        let e = tempfile::tempdir().unwrap();
+        std::fs::remove_file(d.path().join("glassd.sock")).ok();
+        let missing = BleOptions {
+            engine: e.path().join("absent"),
+            ..ble
+        };
+        let daemon = Daemon::new(
+            &ble_opts(e.path(), Some(missing)),
+            Box::new(crate::display::LoggingDisplay),
+        )
+        .unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(false));
+    }
+
+    /// With a shell script as the engine, through the daemon's own loop.
+    #[test]
+    fn the_capability_is_there_only_while_the_engine_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::new(
+            &ble_opts(d.path(), None),
+            Box::new(crate::display::LoggingDisplay),
+        )
+        .unwrap();
+        let has = |daemon: &Daemon| {
+            daemon
+                .hub
+                .capabilities()
+                .iter()
+                .any(|c| c == CAP_COMPANION_BLE)
+        };
+        assert!(!has(&daemon));
+        let script = format!(
+            "cd {}; echo ready; while [ ! -e die ]; do sleep 0.01; done",
+            d.path().display()
+        );
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        daemon.radio = Some(Radio::recording("wlan0", log.clone()).with_ble_engine(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+        ]));
+        let mut s = daemon.settings();
+        s.bluetooth_enabled = Some(true);
+        daemon.settings_changed(&s);
+        assert!(!has(&daemon), "not before it says it is up");
+
+        let until = |daemon: &mut Daemon, want: bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(10);
+            while has(daemon) != want {
+                assert!(std::time::Instant::now() < end, "timed out");
+                daemon.step().unwrap();
+            }
+        };
+        until(&mut daemon, true);
+        std::fs::write(d.path().join("die"), "").unwrap();
+        until(&mut daemon, false);
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "rfkill block bluetooth"),
+            "a dead engine leaves the chip on"
+        );
     }
 
     /// The boot this exists for: the random pool is not seeded and no identity is stored.
@@ -2577,6 +2810,7 @@ mod tests {
             companion: true,
             companion_tcp_port: Some(0),
             companion_bt: false,
+            ble: None,
             companion_rng_device: pool.path.clone(),
             power_supply: d.join("no-power-supply"),
             energy: false,

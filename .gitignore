@@ -1,3 +1,5 @@
 /target
 *.swp
 .DS_Store
+# Vendor firmware: read from the image at run time, never in this repository.
+*.hcd

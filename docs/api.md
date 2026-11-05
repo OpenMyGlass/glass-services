@@ -164,7 +164,7 @@ Who switches the panel:
 | `on_head_detection_enabled` | default true |
 | `screen_timeout_ms` | 3000 to 600000, default 15000; there is no "never" |
 | `nudge_sleep_enabled` | default false |
-| `wifi_enabled` | default false (`radio`): Wi-Fi off, brought up on demand |
+| `wifi_enabled` | default false (`radio`): Wi-Fi off, brought up on demand. When on, `glassd` joins the network in `wifi.conf` under `--state-dir` (a `wpa_supplicant` config, mode 0600), if the file exists |
 | `bluetooth_enabled` | default false (`radio`) |
 | `airplane_mode` | default false (`radio`): master off-switch over all radios |
 | `locale` | UI language, one of `LOCALE_IT`/`LOCALE_EN`/`LOCALE_FR`/`LOCALE_ES`; absent until chosen (clients then show English, and the launcher offers its first-run picker). Unset/unknown values in a change are ignored (the current language is kept) |

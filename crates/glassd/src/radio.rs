@@ -9,9 +9,13 @@
 //!   the state directory, or from a QR bootstrap) enabling also starts `wpa_supplicant` and
 //!   `udhcpc`, which retry by themselves, and disabling stops them. The default is Wi-Fi off,
 //!   brought up on demand for big transfers or as a fallback.
-//! - **Bluetooth:** `rfkill unblock bluetooth` then bring the HCI controller up (`hciconfig
-//!   <hci> up`, else `bluetoothctl power on`); the reverse to disable. Pairing/bonding is
-//!   bluez's (`/var/lib/bluetooth`); glassd only switches the radio.
+//! - **Bluetooth, with a BLE engine configured:** `rfkill unblock bluetooth`, then `omg-bled`
+//!   starts, and owns the chip and its UART while it runs. Disabling stops it first and blocks the
+//!   chip after. If it dies the chip is blocked too, so a dead engine cannot hold the UART awake.
+//!   See [`BleEngine`].
+//! - **Bluetooth, without one:** `rfkill unblock bluetooth` then bring the HCI controller up
+//!   (`hciconfig <hci> up`, else `bluetoothctl power on`); the reverse to disable. Pairing/bonding
+//!   is bluez's (`/var/lib/bluetooth`); glassd only switches the radio.
 //!
 //! The commands are best effort: a missing tool or a non-zero exit is logged, never fatal, so
 //! the daemon keeps running on an image that wires the radios differently. The `rfkill` step
@@ -22,8 +26,11 @@
 //! records the commands.
 
 use crate::{info, warn};
-use std::io;
-use std::process::Command;
+use std::ffi::OsString;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, RawFd};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Default Wi-Fi interface on the Glass image (BCM4330, `fw_bcmdhd`).
 pub const DEFAULT_WIFI_IFACE: &str = "wlan0";
@@ -35,6 +42,130 @@ const WPA_PID_FILE: &str = "/var/run/glassd-wpa_supplicant.pid";
 const DHCP_PID_FILE: &str = "/var/run/glassd-udhcpc.pid";
 /// The UART the Bluetooth chip is wired to.
 const DEFAULT_BT_UART: &str = "/dev/ttyO1";
+
+/// The exit code with which `omg-bled` says that trying again is pointless (no firmware).
+const BLE_EXIT_CONFIG: i32 = 78;
+/// Waits between tries after the engine dies, and with them the most tries. A dead engine keeps
+/// the chip off in between, so that it cannot hold the deep sleep back.
+const BLE_RESTART_MS: [u64; 3] = [5_000, 30_000, 120_000];
+/// An engine that ran this long was fine: its next death starts counting again.
+const BLE_STABLE_MS: u64 = 600_000;
+/// How long to give the engine after its leash is cut, before killing it. The UART must be closed
+/// before the chip goes off.
+const BLE_STOP_MS: u64 = 300;
+
+/// A running `omg-bled`.
+struct BleChild {
+    child: Child,
+    /// The leash: its end stops the engine, also when glassd dies.
+    _stdin: ChildStdin,
+    stdout: ChildStdout,
+    said: Vec<u8>,
+    started_ms: u64,
+}
+
+/// Runs `omg-bled` as a child, whose standard output says when it is ready and whose end shows as
+/// the end of that output. So this adds one descriptor to the daemon's poll set, and no timer
+/// unless the engine died.
+#[derive(Debug)]
+pub struct BleEngine {
+    command: Vec<OsString>,
+    child: Option<BleChild>,
+    /// It said it is advertising, and has not ended since.
+    running: bool,
+    /// When to try again after a death, in the daemon's monotonic milliseconds.
+    retry_at_ms: Option<u64>,
+    deaths: usize,
+    /// It reported something a new try cannot mend.
+    given_up: bool,
+}
+
+impl std::fmt::Debug for BleChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BleChild")
+            .field("pid", &self.child.id())
+            .finish()
+    }
+}
+
+impl BleEngine {
+    /// `command` is the program and its arguments.
+    pub fn new(command: Vec<OsString>) -> BleEngine {
+        BleEngine {
+            command,
+            child: None,
+            running: false,
+            retry_at_ms: None,
+            deaths: 0,
+            given_up: false,
+        }
+    }
+
+    fn start(&mut self, now_ms: u64) {
+        self.retry_at_ms = None;
+        if self.given_up || self.child.is_some() {
+            return;
+        }
+        let Some((program, args)) = self.command.split_first() else {
+            return;
+        };
+        let spawned = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+                    return;
+                };
+                // SAFETY: fcntl on a pipe we hold.
+                unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+                info!("radio: BLE engine started");
+                self.child = Some(BleChild {
+                    child,
+                    _stdin: stdin,
+                    stdout,
+                    said: Vec::new(),
+                    started_ms: now_ms,
+                });
+            }
+            Err(e) => {
+                warn!("radio: cannot start the BLE engine ({e})");
+                self.given_up = true;
+            }
+        }
+    }
+
+    /// Ends it, and returns once the UART is closed, or as good as: a killed process that does not
+    /// go is stuck in the kernel, and waiting longer would stop the daemon's loop.
+    fn stop(&mut self) {
+        self.retry_at_ms = None;
+        self.running = false;
+        let Some(c) = self.child.take() else {
+            return;
+        };
+        // Dropping standard input is what tells it to stop.
+        let BleChild {
+            mut child, _stdin, ..
+        } = c;
+        drop(_stdin);
+        let end = Instant::now() + Duration::from_millis(BLE_STOP_MS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
+                _ => {
+                    warn!("radio: the BLE engine did not stop: killing it");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+        info!("radio: BLE engine stopped");
+    }
+}
 
 /// What one system command produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +191,8 @@ pub struct Radio {
     wifi_conf: Option<std::path::PathBuf>,
     /// `wpa_supplicant` and `udhcpc` were started and not stopped yet.
     associating: bool,
+    /// Owns Bluetooth when set: see the module docs.
+    ble: Option<BleEngine>,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -147,8 +280,105 @@ impl Radio {
             bt_uart: None,
             wifi_conf: None,
             associating: false,
+            ble: None,
             wifi_on: None,
             bt_on: None,
+        }
+    }
+
+    /// Bluetooth is `omg-bled`'s from now on, run with this command line.
+    pub fn with_ble_engine(mut self, command: Vec<OsString>) -> Radio {
+        self.ble = Some(BleEngine::new(command));
+        self
+    }
+
+    /// The engine's output, for the poll set: readable when it said something or ended.
+    pub fn ble_fd(&self) -> Option<RawFd> {
+        let child = self.ble.as_ref()?.child.as_ref()?;
+        Some(child.stdout.as_raw_fd())
+    }
+
+    /// Whether the engine is advertising or holding a link. A capability follows this.
+    pub fn ble_running(&self) -> bool {
+        self.ble.as_ref().is_some_and(|b| b.running)
+    }
+
+    /// The descriptor from [`Radio::ble_fd`] has an event.
+    pub fn on_ble_event(&mut self, now_ms: u64) {
+        let Some(child) = self.ble.as_mut().and_then(|b| b.child.as_mut()) else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let ended = match child.stdout.read(&mut buf) {
+            Ok(0) => true,
+            Ok(n) => {
+                child.said.extend_from_slice(&buf[..n]);
+                false
+            }
+            Err(e) => !matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ),
+        };
+        if ended {
+            self.ble_ended(now_ms);
+            return;
+        }
+        if child.said.ends_with(b"ready\n") {
+            child.said.clear();
+            if let Some(b) = self.ble.as_mut() {
+                b.running = true;
+            }
+            // It has written to the UART, and the kick is for a port that never did. And it must
+            // not happen now in any case: one byte in the middle of its HCI stream.
+            self.bt_uart = None;
+            info!("radio: BLE engine ready");
+        }
+    }
+
+    /// The engine ended by itself. The chip goes off, because an owned chip with nobody at the
+    /// port keeps the UART from idling, which keeps the system out of deep sleep.
+    fn ble_ended(&mut self, now_ms: u64) {
+        let Some(b) = self.ble.as_mut() else { return };
+        b.running = false;
+        let Some(mut c) = b.child.take() else { return };
+        let code = c.child.wait().ok().and_then(|s| s.code());
+        if now_ms.saturating_sub(c.started_ms) >= BLE_STABLE_MS {
+            b.deaths = 0;
+        }
+        if code == Some(BLE_EXIT_CONFIG) {
+            warn!("radio: the BLE engine cannot run: BLE stays off");
+            b.given_up = true;
+        } else if let Some(wait) = BLE_RESTART_MS.get(b.deaths) {
+            warn!("radio: the BLE engine ended ({code:?}); trying again in {wait} ms");
+            b.retry_at_ms = Some(now_ms + wait);
+            b.deaths += 1;
+        } else {
+            warn!("radio: the BLE engine keeps ending ({code:?}): BLE stays off");
+            b.given_up = true;
+        }
+        self.step("rfkill", &["block", "bluetooth"]);
+        self.kick_bt_uart();
+    }
+
+    /// When [`Radio::ble_tick`] should next run, in the daemon's monotonic milliseconds.
+    pub fn ble_next_deadline(&self) -> Option<u64> {
+        self.ble.as_ref()?.retry_at_ms
+    }
+
+    /// Starts the engine again when its wait is over.
+    pub fn ble_tick(&mut self, now_ms: u64) {
+        if self
+            .ble
+            .as_ref()
+            .and_then(|b| b.retry_at_ms)
+            .is_none_or(|t| now_ms < t)
+        {
+            return;
+        }
+        self.step("rfkill", &["unblock", "bluetooth"]);
+        if let Some(b) = self.ble.as_mut() {
+            b.start(now_ms);
         }
     }
 
@@ -196,7 +426,24 @@ impl Radio {
     /// Enables or disables Bluetooth. Returns whether the authoritative rfkill step succeeded.
     pub fn set_bluetooth(&mut self, on: bool) -> bool {
         let hci = self.bt_hci.clone();
-        let ok = if on {
+        let ok = if let Some(b) = self.ble.as_mut() {
+            if on {
+                let r = self.step("rfkill", &["unblock", "bluetooth"]);
+                // The owner asked: whatever made the engine give up gets another chance.
+                if let Some(b) = self.ble.as_mut() {
+                    b.given_up = false;
+                    b.deaths = 0;
+                    b.start(mono_ms());
+                }
+                r
+            } else {
+                // The UART closes before the chip goes off, and only then is it free to kick.
+                b.stop();
+                let r = self.step("rfkill", &["block", "bluetooth"]);
+                self.kick_bt_uart();
+                r
+            }
+        } else if on {
             let r = self.step("rfkill", &["unblock", "bluetooth"]);
             // Bring the HCI controller up: hciconfig if present, else bluetoothctl.
             if !self.step("hciconfig", &[&hci, "up"]) {
@@ -335,6 +582,11 @@ impl Radio {
     pub fn state(&self) -> (Option<bool>, Option<bool>) {
         (self.wifi_on, self.bt_on)
     }
+}
+
+/// The clock [`Radio::on_ble_event`] and friends use: the daemon's monotonic base.
+pub fn mono_ms() -> u64 {
+    glass_api::monotonic_us() / 1000
 }
 
 #[cfg(test)]
@@ -505,5 +757,153 @@ mod tests {
         let mut r = Radio::with_runner(DEFAULT_WIFI_IFACE, run);
         assert!(!r.set_wifi(true));
         assert_eq!(r.state().0, Some(true));
+    }
+
+    /// A shell script in place of `omg-bled`, for what glassd does around any engine.
+    fn engine_script(dir: &std::path::Path, body: &str) -> Vec<OsString> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("cd {}; {body}", dir.display()).into(),
+        ]
+    }
+
+    /// Reads the engine's output until `want` holds.
+    fn wait_engine(r: &mut Radio, want: impl Fn(&Radio) -> bool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !want(r) {
+            assert!(Instant::now() < end, "timed out");
+            if let Some(fd) = r.ble_fd() {
+                let mut p = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd.
+                unsafe { libc::poll(&mut p, 1, 100) };
+                if p.revents != 0 {
+                    r.on_ble_event(mono_ms());
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn with_engine(body: &str) -> (Radio, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
+        let d = tempfile::tempdir().unwrap();
+        let (r, log) = recording();
+        let command = engine_script(d.path(), body);
+        (r.with_ble_engine(command), log, d)
+    }
+
+    #[test]
+    fn the_engine_owns_bluetooth_and_is_stopped_before_the_chip_goes_off() {
+        // It reports its end in a file, then waits for the leash like the real one.
+        let (mut r, log, d) = with_engine("echo ready; cat >/dev/null; echo stopped > stopped");
+        r.set_bluetooth(true);
+        assert_eq!(cmds(&log), vec!["rfkill unblock bluetooth"], "no hciconfig");
+        assert!(!r.ble_running(), "says nothing before it is up");
+        wait_engine(&mut r, Radio::ble_running);
+
+        r.set_bluetooth(false);
+        assert!(!r.ble_running());
+        assert!(d.path().join("stopped").exists(), "the chip went off first");
+        assert_eq!(cmds(&log), vec!["rfkill block bluetooth"]);
+        assert_eq!(r.ble_fd(), None);
+    }
+
+    #[test]
+    fn an_engine_that_ignores_its_leash_is_killed() {
+        let (mut r, _log, _d) = with_engine("trap '' TERM; echo ready; exec sleep 30");
+        r.set_bluetooth(true);
+        wait_engine(&mut r, Radio::ble_running);
+        let t = Instant::now();
+        r.set_bluetooth(false);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(r.ble_fd(), None);
+    }
+
+    #[test]
+    fn the_kick_never_lands_on_a_port_the_engine_owned() {
+        let d = tempfile::tempdir().unwrap();
+        let uart = d.path().join("uart");
+        std::fs::write(&uart, "").unwrap();
+        let (r, _log) = recording();
+        let mut r = r.with_ble_engine(engine_script(d.path(), "echo ready; cat >/dev/null"));
+        r.bt_uart = Some(uart.to_string_lossy().into_owned());
+        r.set_bluetooth(true);
+        wait_engine(&mut r, Radio::ble_running);
+        r.set_bluetooth(false);
+        assert_eq!(
+            std::fs::read(&uart).unwrap(),
+            b"",
+            "written after the engine"
+        );
+    }
+
+    #[test]
+    fn bluetooth_off_from_the_start_kicks_the_port_once_as_before() {
+        let d = tempfile::tempdir().unwrap();
+        let uart = d.path().join("uart");
+        std::fs::write(&uart, "").unwrap();
+        let (r, _log) = recording();
+        let mut r = r.with_ble_engine(engine_script(d.path(), "echo ready; cat >/dev/null"));
+        r.bt_uart = Some(uart.to_string_lossy().into_owned());
+        r.set_bluetooth(false);
+        r.set_bluetooth(false);
+        assert_eq!(std::fs::read(&uart).unwrap(), [0]);
+    }
+
+    #[test]
+    fn a_dead_engine_turns_the_chip_off_and_is_retried_a_few_times() {
+        let (mut r, log, _d) = with_engine("exit 3");
+        r.set_bluetooth(true);
+        cmds(&log);
+        let mut tries = 1;
+        let mut now = mono_ms();
+        loop {
+            wait_engine(&mut r, |r| r.ble_fd().is_none());
+            assert!(!r.ble_running());
+            assert!(cmds(&log).iter().any(|c| c == "rfkill block bluetooth"));
+            let Some(at) = r.ble_next_deadline() else {
+                break;
+            };
+            assert!(at > now);
+            r.ble_tick(at - 1);
+            assert!(cmds(&log).is_empty(), "before its time");
+            r.ble_tick(at);
+            assert_eq!(cmds(&log), vec!["rfkill unblock bluetooth"]);
+            tries += 1;
+            now = at;
+        }
+        assert_eq!(tries, BLE_RESTART_MS.len() + 1);
+        // No timer left: a given-up engine does not wake the system.
+        assert_eq!(r.ble_next_deadline(), None);
+        // The owner turning it on again is a new start.
+        r.set_bluetooth(false);
+        r.set_bluetooth(true);
+        assert!(r.ble_fd().is_some());
+    }
+
+    #[test]
+    fn a_missing_firmware_is_not_retried() {
+        let (mut r, log, _d) = with_engine("exit 78");
+        r.set_bluetooth(true);
+        wait_engine(&mut r, |r| r.ble_fd().is_none());
+        assert_eq!(r.ble_next_deadline(), None);
+        assert!(cmds(&log).iter().any(|c| c == "rfkill block bluetooth"));
+        assert!(!r.ble_running());
+    }
+
+    #[test]
+    fn the_running_state_follows_a_crash_while_up() {
+        let (mut r, _log, d) =
+            with_engine("echo ready; while [ ! -e die ]; do sleep 0.01; done; exit 1");
+        r.set_bluetooth(true);
+        wait_engine(&mut r, Radio::ble_running);
+        std::fs::write(d.path().join("die"), "").unwrap();
+        wait_engine(&mut r, |r| !r.ble_running());
+        assert!(r.ble_next_deadline().is_some());
     }
 }

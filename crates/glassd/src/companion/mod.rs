@@ -45,6 +45,10 @@ pub type ConnId = u64;
 const READ_BUDGET: usize = 64 * 1024;
 /// Most connections in flight at once (a bonded companion plus a few probing strangers).
 const MAX_CONNS: usize = 4;
+/// How long a BLE peer has to finish the handshake, about 800 bytes each way. One connected
+/// stranger stops the advertising, so one that says nothing must not stay. Generous for a link
+/// that was measured to stall for 3.6 s.
+const BLE_HANDSHAKE_MS: u64 = 30_000;
 
 /// Current wall-clock in milliseconds since the Unix epoch (matches the companion's `now_ms`).
 pub fn now_ms() -> u64 {
@@ -134,6 +138,8 @@ struct Conn {
     out: Vec<u8>,
     transport: Transport,
     closing: bool,
+    /// A BLE peer that has not finished the handshake goes at this wall-clock time.
+    handshake_by_ms: Option<u64>,
 }
 
 /// How often the entropy level is checked while a first identity waits for it. The level grows by
@@ -170,6 +176,8 @@ pub struct Companion {
     pending_dial: Option<String>,
     tcp_port: Option<u16>,
     bt: bool,
+    /// Where `omg-bled` connects, bound with the other listeners.
+    ble_socket: Option<PathBuf>,
     device: DeviceState,
     listeners: Listeners,
     conns: BTreeMap<ConnId, Conn>,
@@ -236,6 +244,7 @@ impl Companion {
             pending_dial: None,
             tcp_port,
             bt,
+            ble_socket: None,
             device,
             listeners: Listeners::bind(None, false),
             conns: BTreeMap::new(),
@@ -264,6 +273,15 @@ impl Companion {
             }
         }
         Ok(companion)
+    }
+
+    /// Accepts BLE sessions on this Unix socket, once the listeners are up. `omg-bled` drops a
+    /// phone that arrives before that, and the phone tries again.
+    pub fn set_ble_socket(&mut self, path: PathBuf) {
+        if matches!(self.rng, Rng::Ready) {
+            self.listeners.bind_ble(&path);
+        }
+        self.ble_socket = Some(path);
     }
 
     /// The descriptor to `poll` for `POLLIN` while the link waits for the random pool; then
@@ -305,6 +323,27 @@ impl Companion {
             Rng::Gathering { next_check_ms } => Some(next_check_ms),
             _ => None,
         }
+    }
+
+    /// When [`Companion::handshake_tick`] should next run (wall clock, ms).
+    pub fn handshake_next_deadline(&self) -> Option<u64> {
+        self.conns.values().filter_map(|c| c.handshake_by_ms).min()
+    }
+
+    /// Drops the BLE peers that did not finish the handshake in time.
+    pub fn handshake_tick(&mut self) -> Vec<Event> {
+        let now = now_ms();
+        let late: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.handshake_by_ms.is_some_and(|t| now >= t))
+            .map(|(&id, _)| id)
+            .collect();
+        let mut events = Vec::new();
+        for id in late {
+            self.drop_conn(id, "no handshake in time", &mut events);
+        }
+        events
     }
 
     /// Checks again whether a first identity may be generated. Returns the events of a dial
@@ -370,6 +409,9 @@ impl Companion {
         }
         self.save_next_seed(created);
         self.listeners = Listeners::bind(self.tcp_port, self.bt);
+        if let Some(path) = &self.ble_socket {
+            self.listeners.bind_ble(path);
+        }
         self.rng = Rng::Ready;
     }
 
@@ -524,6 +566,7 @@ impl Companion {
                 out: Vec::new(),
                 transport,
                 closing: false,
+                handshake_by_ms: (transport == Transport::Ble).then(|| now_ms() + BLE_HANDSHAKE_MS),
             },
         );
         // Drive the Hello that start() queued against the now-inserted connection.
@@ -757,6 +800,9 @@ impl Companion {
                         .get(&id)
                         .map(|c| c.transport)
                         .unwrap_or(Transport::WifiTcp);
+                    if let Some(c) = self.conns.get_mut(&id) {
+                        c.handshake_by_ms = None;
+                    }
                     // Only one active companion: close any other live link.
                     let others: Vec<ConnId> =
                         self.conns.keys().copied().filter(|&o| o != id).collect();
@@ -889,6 +935,8 @@ pub fn state_file(dir: &Path) -> PathBuf {
     Store::path_in(dir)
 }
 
+#[cfg(test)]
+mod ble_e2e;
 #[cfg(test)]
 mod crypto_e2e;
 #[cfg(test)]

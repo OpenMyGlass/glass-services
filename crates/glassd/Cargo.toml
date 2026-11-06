@@ -32,4 +32,5 @@ linux-bt = []
 # For the companion-link integration test, to craft wire frames the way a real companion does.
 omg-protocol.workspace = true
 omg-core.workspace = true
+omg-bled = { path = "../omg-bled" }
 tempfile = "3"

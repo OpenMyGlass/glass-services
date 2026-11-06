@@ -381,6 +381,15 @@ impl Hub {
         &self.capabilities
     }
 
+    /// Adds or removes a capability that comes and goes. A client reads the list in its `Welcome`,
+    /// so one already connected keeps what it saw then.
+    pub fn set_capability(&mut self, capability: &str, on: bool) {
+        self.capabilities.retain(|c| c != capability);
+        if on {
+            self.capabilities.push(capability.to_string());
+        }
+    }
+
     /// Registers a new connection.
     pub fn add_client(&mut self) -> ClientId {
         let id = self.next_id;

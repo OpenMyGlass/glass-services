@@ -427,3 +427,48 @@ Corrections to `model-b-gpu.md` when task 1 lands:
 - Section 3 loader decision: replace libhybris with route C. Its TI rejection reason should add that TI's user space is DRM-only.
 - Section 3 precedent claim ("postmarketOS packages libhybris for this device class"): I could not verify it, so remove or source it.
 - Section 4: the gralloc path is `/dev/graphics/fb0`.
+
+## 9. Results on the Glass, 2026-11-05
+
+Route C works. These are measurements unless tagged [I]. Kernel: the UART-fixed tuned-stable 3.4.113; `pvrsrvkm` loads with all 165 CRCs matching. Logs are local, `out/kmsg_gpu4*.txt`, `out/kmsg_gpu5*.txt`. Code: glass-apps branch `launcher-gpu-route-c`.
+
+**Bring-up.** `insmod` plus `pvrsrvctl --start --no-module` took under 100 ms, rc 0, no `(FAIL) SGXInit`. `GL_RENDERER=PowerVR SGX 540`, `OpenGL ES 2.0 build 1.9@2166536`. Shaders compile. No earlier device log existed: the "bring-up works" note in the state file had no primary log.
+
+**Pixels.** The GLES window path scans out TILER, not `/dev/fb0`. Reading the scanned buffer during a window run gave red, green, blue, white in the quadrants drawn, so colour and orientation are right in memory. The launcher's home card decoded from that buffer is upright. Nobody has looked at the prism yet.
+
+**Renderers, launcher with `glassd --mock`, 1 swipe per 500 ms for 20 s, cable on:**
+
+| | Software | GPU read-back (Tier 1) | GPU window (Tier 2) |
+|---|---|---|---|
+| Frames per second during swipes | 29.6 | 21 | 39.5 |
+| Render, p50 / p95 ms | 4.6 / 12.4 | 1.3 / 29 | 1.9 / 8-24 |
+| Present, p50 ms | 9.1 | 22 | 0.2 |
+| Launcher CPU during swipes | 43% of one core | 49% | 11% |
+| Launcher CPU at idle | 0 ticks in 30 s | 0 | 0 |
+| Resident memory at idle | 17 MB | 33 MB | 31 MB |
+
+- Tier 1 is worse than software. Do not ship it as a fallback.
+- The launcher sleeps a full frame after its work (`wait_time`), so frame rates are below what the renderers can do [I]. The bare probe swaps every 19.7 ms, 0.92 ms CPU per frame.
+- `gfx_pwrdm` goes OFF between frames: 888 OFF transitions in the 20 s swipe phase, none at idle.
+- `bq27520` current with the cable on is mostly net charge current and drifts more than the renderers differ, so a proper power comparison needs the cable out. One boot happened to read `Discharging` throughout with the cable in (cause unknown; it flipped to `Charging` in the next boot). In that run, 5 s per phase and one sample: idle 132 mA software, 133 mA GPU; swipes 208 mA software at 30 fps, 182 mA GPU at 39 fps. Treat this as a hint only.
+- UI audio self-test under bionic: all steps ok, rc 0. Not listened to.
+
+**Corrections to this design.**
+
+- The NEEDED closure also needs `libcorkscrew.so`, `libstlport.so`, `libgccdemangle.so`.
+- `framebuffer_device_t` has a `flags` field; `numFramebuffers` reads 0; the third buffer fails with `-ENOMEM`, so 2 buffers.
+- XE24's `libEGL` has `setSwapInterval` at window offset 68, one word later than the AOSP header.
+- The driver allocates its own TILER buffers (stride 1024 pixels). BA0 returns to `/dev/fb0`'s address when the GPU process exits, and a software launcher started afterwards scans out from `/dev/fb0` without any pan (one boot), which answers section 4.6's concern.
+- All launcher runs used `glassd --mock`: real touch, the real energy policy and screen-off with the GPU launcher are untested.
+- The `glFinish` before suspend is not built.
+
+**Supervisor and extraction (glass-apps, `native/fbwin`, `tools/extract-gpu-blobs.sh`).** The 32 stock files verify from the factory `system.img` and from a live Glass over adb. The latch counts attempts until 20 s of heartbeat, also across reboots, so a kernel crash counts too. RAM boots with real `glassd`, cable in, logs `out/kmsg_sup71.txt` and `out/kmsg_sup72.txt`:
+
+- Blobs absent or `no-gpu` set: software at once.
+- Killed three times within seconds: GPU restarted twice, then marker and software. Killed twice, then left alone: healthy again, no marker, because a kill after a healthy run starts the count from zero.
+- `SIGSTOP`: software 24 s later, scanout back on `/dev/fb0`, clock correct.
+- Idle GPU launcher: 0 CPU ticks in 30 s with 6 heartbeats; 41 MB resident.
+- One software frame, 2 s after a start, read 12:28 instead of 13:28 (UTC), in one of two boots. Later frames were right. Cause not established.
+- Not run: deep sleep with the heartbeat, the reboot when a launcher cannot be killed, touch.
+
+**Sleep gate: not measured.** `out/gpu61.img` runs software and GPU power phases and the a/b/c sleep matrix of section 5 with the cable out, 3 cycles each, for the owner to run.

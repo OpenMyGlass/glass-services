@@ -977,10 +977,22 @@ impl Radio {
 
     /// The Wi-Fi interface's IPv4 address, if it has one.
     pub fn wifi_ip(&mut self) -> Option<String> {
+        self.wifi_ips().into_iter().next()
+    }
+
+    /// All the Wi-Fi interface's IPv4 addresses.
+    pub fn wifi_ips(&mut self) -> Vec<String> {
         let iface = self.wifi_iface.clone();
-        let out = (self.run)("ip", &["-4", "-o", "addr", "show", &iface]).ok()?;
-        let after = out.stdout.split("inet ").nth(1)?;
-        Some(after.split(['/', ' ']).next()?.to_string()).filter(|ip| !ip.is_empty())
+        let Ok(out) = (self.run)("ip", &["-4", "-o", "addr", "show", &iface]) else {
+            return Vec::new();
+        };
+        out.stdout
+            .split("inet ")
+            .skip(1)
+            .filter_map(|after| after.split(['/', ' ']).next())
+            .filter(|ip| !ip.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// The Wi-Fi supplicant installed on the image, if glassd can see one (`wpa_supplicant` or

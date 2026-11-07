@@ -332,6 +332,10 @@ pub fn parse_form(body: &[u8], token: &str) -> Result<Network, Refused> {
         (true, Some(_)) | (false, None) => return Err(Refused::PasswordChoice),
     };
     let conf = wpa_supplicant_conf(&ssid, auth, psk).map_err(|_| Refused::Password)?;
+    // The supplicant keeps running on `wifi.conf.try` after it was renamed to `wifi.conf`, and must
+    // never write to that name again: it would bring the password back in a file nobody deletes.
+    let conf = conf.replacen("update_config=1\n", "update_config=0\n", 1);
+    debug_assert!(conf.contains("update_config=0\n"));
     Ok(Network { ssid, conf })
 }
 
@@ -582,6 +586,8 @@ mod tests {
             panic!("{}", status(&h));
         };
         assert_eq!(net.ssid, "My Net!");
+        assert!(net.conf.contains("\nupdate_config=0\n"));
+        assert!(!net.conf.contains("update_config=1"));
         assert!(net.conf.contains("psk=\"sup&r-secret\""));
         let shown = format!("{h:?}");
         // The response bytes are printed as numbers, and the network is redacted.

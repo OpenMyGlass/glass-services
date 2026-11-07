@@ -238,9 +238,8 @@ impl Radio {
             }
         }
         // Through a shell for the pid and the log, with the output closed: the runner waits for
-        // its pipe to close. Not `-d`, which logs handshake details. Appending, so that the log
-        // can be cut short while it is being written. Busybox's `timeout` becomes the program it
-        // runs, so the pid is hostapd's.
+        // its pipe to close. Not `-d`, which logs handshake details. Busybox's `timeout` becomes
+        // the program it runs, so the pid is hostapd's.
         let run = format!(
             "timeout -s TERM {limit_s} hostapd -e {entropy} {conf} >>{log} 2>&1 & echo $! >{pid}",
             entropy = paths.file("hostapd.entropy").display(),
@@ -389,6 +388,11 @@ impl LogReader {
         let Ok(mut file) = fs::File::open(path) else {
             return self.view;
         };
+        // Its real size, whatever has been read: also a log with no line end in it.
+        if file.metadata().is_ok_and(|m| m.len() >= LOG_LIMIT) {
+            self.too_long();
+            return self.view;
+        }
         let mut new = Vec::new();
         let read = file
             .seek(SeekFrom::Start(self.offset))
@@ -403,10 +407,16 @@ impl LogReader {
         self.view.feed(&String::from_utf8_lossy(&new[..whole]));
         self.offset += whole as u64;
         if self.offset >= LOG_LIMIT {
-            crate::warn!("wifi-setup: the hostapd log is too long: ending the access point");
-            self.view.disabled = true;
+            self.too_long();
         }
         self.view
+    }
+
+    fn too_long(&mut self) {
+        if !self.view.disabled {
+            crate::warn!("wifi-setup: the hostapd log is too long: ending the access point");
+        }
+        self.view.disabled = true;
     }
 }
 
@@ -468,6 +478,17 @@ mod tests {
         assert_eq!(r.poll(&path).clients, 1);
         assert!(!r.poll(&path).disabled);
         writeln!(w, "wlan0: AP-DISABLED ").unwrap();
+        assert!(r.poll(&path).disabled);
+    }
+
+    #[test]
+    fn a_log_that_is_long_ends_the_access_point_at_once() {
+        // Read from the start, the position is still small: the size says it.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("log");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(LOG_LIMIT + 1).unwrap();
+        let mut r = LogReader::default();
         assert!(r.poll(&path).disabled);
     }
 

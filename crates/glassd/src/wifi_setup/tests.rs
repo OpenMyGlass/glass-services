@@ -1067,7 +1067,7 @@ fn a_session_does_not_run_beside_a_supplicant_left_running() {
 }
 
 #[test]
-fn an_address_on_the_access_points_subnet_is_not_a_lease() {
+fn the_access_points_own_address_is_not_a_lease() {
     let mut r = Rig::new();
     std::fs::write(&r.conf, "old").unwrap();
     let s = r.serve();
@@ -1076,6 +1076,33 @@ fn an_address_on_the_access_points_subnet_is_not_a_lease() {
     let (end, _) = r.until(WifiSetupPhase::Failed);
     assert_eq!(end.error, ERR_JOIN);
     assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old");
+}
+
+#[test]
+fn a_home_network_on_the_same_subnet_can_be_joined() {
+    let mut r = Rig::new();
+    let s = r.serve();
+    r.world.lock().unwrap().lease = Some("192.168.77.23".into());
+    r.send_form(&s, good);
+    let (end, finished) = r.until(WifiSetupPhase::Joined);
+    assert_eq!(finished, Some(Finished::Joined));
+    assert_eq!(end.network, "HomeNet");
+}
+
+#[test]
+fn the_tried_config_can_never_be_written_back() {
+    let mut r = Rig::new();
+    let s = r.serve();
+    r.world.lock().unwrap().lease = Some("192.168.1.50".into());
+    r.send_form(&s, good);
+    while !matches!(r.setup.phase, Phase::Joining { .. }) {
+        r.step();
+    }
+    let tried = std::fs::read_to_string(r.setup.tried_conf()).unwrap();
+    assert!(tried.contains("\nupdate_config=0\n"), "{tried}");
+    r.until(WifiSetupPhase::Joined);
+    let stored = std::fs::read_to_string(&r.conf).unwrap();
+    assert!(stored.contains("\nupdate_config=0\n"));
 }
 
 #[test]

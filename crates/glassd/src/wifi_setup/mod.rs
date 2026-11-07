@@ -716,12 +716,15 @@ impl WifiSetup {
         ssid: String,
         now_us: u64,
     ) -> Update {
-        // Our own subnet is no lease: it is what the access point had, or a stale client's.
-        let on_ap = |ip: &str| {
+        // The access point's own address is no lease. The Glass was the DHCP server, never a client
+        // of its own, so no other address can be from the session: what DHCP gives now is from
+        // the network, even one that uses the same subnet. A DHCP client left from an earlier run,
+        // which could renew an old lease, was stopped by its pid file when the session started.
+        let leased = radio.wifi_ips().iter().any(|ip| {
             ip.parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| ip.octets()[..3] == ap::AP_IP.octets()[..3])
-        };
-        if radio.wifi_ip().is_some_and(|ip| !on_ap(&ip)) {
+                .is_ok_and(|ip| ip != ap::AP_IP)
+        });
+        if leased {
             if let Err(e) = ap::install_conf(&self.tried_conf(), &self.cfg.wifi_conf) {
                 // Saying "joined" would be saying it is kept. And the tried file has the password.
                 warn!("wifi-setup: cannot store the network ({e})");

@@ -199,9 +199,9 @@ impl Portal {
         let c = &mut self.conns[i];
         if !c.answered {
             let mut eof = false;
-            let mut buf = [0u8; 1024];
+            let mut buf = zeroize::Zeroizing::new([0u8; 1024]);
             while c.input.len() < http::MAX_REQUEST {
-                match c.stream.read(&mut buf) {
+                match c.stream.read(&mut buf[..]) {
                     Ok(0) => {
                         eof = true;
                         break;
@@ -231,6 +231,7 @@ impl Portal {
             }
             c.answered = true;
             // What it sent holds the password: not kept while the answer goes out.
+            zeroize::Zeroize::zeroize(&mut c.input);
             c.input = Vec::new();
         }
         let done = c.flush();

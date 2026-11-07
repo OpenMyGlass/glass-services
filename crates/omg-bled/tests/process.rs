@@ -318,8 +318,10 @@ fn nobody_listening_drops_the_phone_and_the_next_try_works() {
 fn a_controller_that_goes_silent_ends_the_process_with_a_failure() {
     let mut b = Bench::new();
     b.wait_ready();
-    // A phone connects, and the chip then answers nothing: the engine's command stays unanswered.
+    // A link comes and goes, and the chip then answers nothing: the command that turns the
+    // advertising back on stays unanswered.
     b.radio.phone_connects();
+    b.radio.disconnect(0x13);
     b.uart();
     let start = Instant::now();
     let code = loop {

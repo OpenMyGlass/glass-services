@@ -22,6 +22,8 @@ pub const OP_VS_SLEEP_MODE: u16 = 0xFC27;
 pub const OP_VS_MINIDRIVER: u16 = 0xFC2E;
 pub const OP_VS_LAUNCH_RAM: u16 = 0xFC4E;
 
+pub const STATUS_COMMAND_DISALLOWED: u8 = 0x0C;
+
 pub const EV_DISCONNECT_COMPLETE: u8 = 0x05;
 pub const EV_COMMAND_COMPLETE: u8 = 0x0E;
 pub const EV_COMMAND_STATUS: u8 = 0x0F;

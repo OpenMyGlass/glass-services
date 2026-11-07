@@ -304,6 +304,129 @@ fn a_second_connection_racing_the_advertising_is_refused() {
     );
 }
 
+/// The controller's report of a phone connecting, for a test that decides when it arrives.
+fn connection_complete() -> Vec<u8> {
+    let mut ev = vec![hci::H4_EVENT, hci::EV_LE_META, 19, 1, 0, 0x40, 0];
+    ev.extend_from_slice(&[1, 1, 1, 2, 3, 4, 5, 6, 36, 0, 0, 0, 0xF4, 1, 0]);
+    ev
+}
+
+fn adv_enables(b: &Bench) -> Vec<u8> {
+    b.radio
+        .commands
+        .iter()
+        .filter(|(op, _)| *op == hci::OP_LE_SET_ADV_ENABLE)
+        .map(|(_, p)| p[0])
+        .collect()
+}
+
+/// Up to the point where the UART holds the command `op` of the move to slow advertising, which
+/// the controller has not seen. Returns its bytes.
+fn slow_down_until_in_flight(b: &mut Bench, op: u16, param: Option<u8>) -> Vec<u8> {
+    b.radio.commands.clear();
+    b.now = b.engine.next_deadline().unwrap();
+    b.engine.tick(b.now);
+    loop {
+        let out = b.engine.hci_output().to_vec();
+        assert!(!out.is_empty(), "the command never went out");
+        b.engine.hci_written(out.len());
+        let sent = u16::from_le_bytes([out[1], out[2]]);
+        if sent == op && param.is_none_or(|v| out.get(4) == Some(&v)) {
+            return out;
+        }
+        b.radio.from_host(&out);
+        let back = b.radio.take_to_host();
+        b.engine.on_hci(&back, b.now);
+    }
+}
+
+#[test]
+fn a_connection_stops_the_advertising_by_itself_so_nothing_turns_it_off() {
+    let mut b = Bench::new();
+    b.radio.commands.clear();
+    b.engine.take_logs();
+    b.radio.phone_connects();
+    b.settle();
+    assert_eq!(adv_enables(&b), Vec::<u8>::new());
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn an_enable_in_flight_when_a_phone_connects_is_turned_off_again() {
+    let mut b = Bench::new();
+    let enable = slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(1));
+    // The connection overtakes the enable, which the controller then accepts.
+    b.engine.on_hci(&connection_complete(), b.now);
+    b.radio.from_host(&enable);
+    assert!(b.radio.advertising);
+    b.settle();
+    assert!(!b.radio.advertising, "still advertising on a connection");
+    assert_eq!(adv_enables(&b), vec![0, 1, 0]);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn an_enable_refused_because_of_the_connection_leaves_nothing_to_report_but_itself() {
+    let mut b = Bench::new();
+    slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(1));
+    b.engine.on_hci(&connection_complete(), b.now);
+    b.engine.take_logs();
+    // The enable is refused, so the disable that follows finds it off and is refused too.
+    let op = hci::OP_LE_SET_ADV_ENABLE.to_le_bytes();
+    let refused = [
+        hci::H4_EVENT,
+        hci::EV_COMMAND_COMPLETE,
+        4,
+        1,
+        op[0],
+        op[1],
+        hci::STATUS_COMMAND_DISALLOWED,
+    ];
+    b.engine.on_hci(&refused, b.now);
+    b.settle();
+    assert_eq!(adv_enables(&b), vec![0, 0]);
+    assert!(!b.radio.advertising);
+    assert_eq!(
+        b.engine.take_logs(),
+        vec!["command 200a (01) failed with status 0c".to_string()]
+    );
+    assert_eq!(b.engine.fatal(), None);
+}
+
+#[test]
+fn a_disable_crossing_a_connection_is_not_a_failure() {
+    let mut b = Bench::new();
+    let disable = slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(0));
+    // The phone got in first: the controller stopped, and says so to the disable.
+    b.radio.phone_connects();
+    let connected = b.radio.take_to_host();
+    b.engine.take_logs();
+    b.engine.on_hci(&connected, b.now);
+    b.radio.from_host(&disable);
+    b.settle();
+    // Nothing that was queued to bring the advertising back went out.
+    assert_eq!(adv_enables(&b), vec![0]);
+    assert!(!b.radio.advertising);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn advertising_comes_back_after_a_link_without_a_refused_command() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.take_logs();
+    b.radio.commands.clear();
+    b.radio.disconnect(0x13);
+    b.settle();
+    assert_eq!(adv_enables(&b), vec![1]);
+    assert!(b.radio.advertising);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
 #[test]
 fn advertising_slows_down_once_and_stays_quiet() {
     let mut b = Bench::new();

@@ -238,6 +238,12 @@ impl Engine {
         self.commands.push_back(hci::command(op, params));
     }
 
+    /// What was queued for the advertising is no longer wanted. What was queued for a link still
+    /// is: a second connection racing the advertising stays up unless its `Disconnect` goes out.
+    fn forget_advertising_commands(&mut self) {
+        self.commands.retain(|c| link_command_handle(c).is_some());
+    }
+
     fn set_adv_interval(&mut self, units: u16) {
         let mut p = Vec::with_capacity(15);
         p.extend_from_slice(&units.to_le_bytes());
@@ -641,6 +647,11 @@ impl Engine {
             }
             hci::EV_DISCONNECT_COMPLETE if e.len() >= 4 => {
                 let handle = u16::from_le_bytes([e[1], e[2]]) & 0x0FFF;
+                // Nothing queued may reach that handle now: the next link can get it.
+                if e[0] == 0 {
+                    self.commands
+                        .retain(|c| link_command_handle(c) != Some(handle));
+                }
                 let ours = self.conn.as_ref().filter(|c| c.handle == handle);
                 match (e[0], ours.map(|c| c.cutting)) {
                     (0, Some(_)) => self.on_disconnected(e[3], now_ms),
@@ -721,7 +732,7 @@ impl Engine {
                 // Whatever was on its way to the advertising is no longer wanted. The connection
                 // stopped it, and BCM4330 answered 0c to turning it off here (bled36, one link).
                 // Only an enable the controller has yet to answer can bring it back.
-                self.commands.clear();
+                self.forget_advertising_commands();
                 if self.in_flight == Some((hci::OP_LE_SET_ADV_ENABLE, 1)) {
                     self.cmd(hci::OP_LE_SET_ADV_ENABLE, &[0]);
                 }
@@ -776,7 +787,7 @@ impl Engine {
         self.to_session.clear();
         self.credits = self.max_credits;
         self.db.cccd = 0;
-        self.commands.clear();
+        self.forget_advertising_commands();
         self.advertise_fast(now_ms);
     }
 
@@ -891,6 +902,17 @@ impl Engine {
             }
             None => {}
         }
+    }
+}
+
+/// The handle a queued command is about, if it is about one link.
+fn link_command_handle(command: &[u8]) -> Option<u16> {
+    let op = u16::from_le_bytes([command[1], command[2]]);
+    match op {
+        hci::OP_DISCONNECT | hci::OP_LE_LTK_NEGATIVE => {
+            Some(u16::from_le_bytes([command[4], command[5]]) & 0x0FFF)
+        }
+        _ => None,
     }
 }
 

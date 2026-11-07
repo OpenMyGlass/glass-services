@@ -727,3 +727,106 @@ fn a_lost_byte_is_survived_and_a_stream_of_garbage_is_not() {
     b.engine.on_hci(&[0x7F; 1], b.now);
     assert!(b.engine.fatal().unwrap().contains("no packet"));
 }
+
+fn connection_complete_on(handle: u16) -> Vec<u8> {
+    let mut ev = connection_complete();
+    ev[5..7].copy_from_slice(&handle.to_le_bytes());
+    ev
+}
+
+fn ltk_request(handle: u16) -> Vec<u8> {
+    let h = handle.to_le_bytes();
+    vec![hci::H4_EVENT, hci::EV_LE_META, 3, 5, h[0], h[1]]
+}
+
+fn disconnect_complete(handle: u16) -> Vec<u8> {
+    let h = handle.to_le_bytes();
+    vec![
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0,
+        h[0],
+        h[1],
+        0x13,
+    ]
+}
+
+/// Leaves a command in flight that the controller has not answered, so what follows queues.
+fn hold_a_command_in_flight(b: &mut Bench) -> u16 {
+    b.engine.on_hci(&ltk_request(0x40), b.now);
+    swallow(b);
+    hci::OP_LE_LTK_NEGATIVE
+}
+
+/// Answers the command in flight, then each one that follows, and returns what went out.
+fn answer_commands(b: &mut Bench, in_flight: u16) -> Vec<(u16, Vec<u8>)> {
+    let complete = |op: u16| {
+        let o = op.to_le_bytes();
+        vec![hci::H4_EVENT, hci::EV_COMMAND_COMPLETE, 4, 1, o[0], o[1], 0]
+    };
+    b.engine.on_hci(&complete(in_flight), b.now);
+    let mut sent = Vec::new();
+    loop {
+        let out = b.engine.hci_output().to_vec();
+        if out.is_empty() {
+            return sent;
+        }
+        b.engine.hci_written(out.len());
+        assert_eq!(out[0], hci::H4_COMMAND);
+        let op = u16::from_le_bytes([out[1], out[2]]);
+        sent.push((op, out[4..].to_vec()));
+        b.engine.on_hci(&complete(op), b.now);
+    }
+}
+
+#[test]
+fn what_is_queued_for_a_second_connection_survives_the_end_of_the_first() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.on_hci(&connection_complete_on(0x41), b.now);
+    b.engine.on_hci(&ltk_request(0x41), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert_eq!(
+        sent[0],
+        (hci::OP_DISCONNECT, vec![0x41, 0, 0x13]),
+        "{sent:?}"
+    );
+    assert_eq!(
+        sent[1],
+        (hci::OP_LE_LTK_NEGATIVE, vec![0x41, 0]),
+        "{sent:?}"
+    );
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
+}
+
+#[test]
+fn what_is_queued_for_a_second_connection_survives_a_new_first_one() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.on_hci(&connection_complete_on(0x41), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    b.engine.on_hci(&connection_complete_on(0x42), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert_eq!(sent, vec![(hci::OP_DISCONNECT, vec![0x41, 0, 0x13])]);
+}
+
+#[test]
+fn nothing_queued_for_a_link_that_ended_goes_out_where_its_handle_may_be_reused() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.session_closed(b.now);
+    b.engine.on_hci(&ltk_request(0x40), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert!(
+        sent.iter()
+            .all(|(op, _)| *op != hci::OP_DISCONNECT && *op != hci::OP_LE_LTK_NEGATIVE),
+        "{sent:?}"
+    );
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
+}

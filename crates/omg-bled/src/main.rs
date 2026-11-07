@@ -265,7 +265,6 @@ fn run(engine: Engine, tty: &mut fs::File, socket: &Path, start: Instant) -> Res
             return Err(format!("poll: {e}"));
         }
         let now = now_ms();
-        engine.tick(now);
 
         if fds[1].revents != 0 {
             let mut b = [0u8; 16];
@@ -298,6 +297,8 @@ fn run(engine: Engine, tty: &mut fs::File, socket: &Path, start: Instant) -> Res
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err("the UART went away".into());
         }
+        // After the read: an answer that woke the loop is not judged late before it is seen.
+        engine.tick(now);
 
         let mut closed = false;
         if let Some(s) = &mut session {

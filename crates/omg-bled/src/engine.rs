@@ -679,11 +679,19 @@ impl Engine {
     }
 
     fn command_done(&mut self, op: u16, status: u8) {
+        let Some((_, first)) = self.in_flight.filter(|&(sent, _)| sent == op) else {
+            // An answer to nothing in flight: a stray, or opcode 0, which only hands out credits.
+            // The command in flight still waits for its own, and keeps its deadline.
+            if op != 0 {
+                self.log(format!(
+                    "an answer to command {op:04x}, which is not in flight"
+                ));
+            }
+            return;
+        };
+        self.in_flight = None;
         self.command_by_ms = None;
-        let first_param = self
-            .in_flight
-            .take()
-            .and_then(|(sent, first)| (sent == op).then_some(first));
+        let first_param = Some(first);
         // Refused because a connection got there first and stopped it: off is what was asked for.
         if op == hci::OP_LE_SET_ADV_ENABLE
             && first_param == Some(0)

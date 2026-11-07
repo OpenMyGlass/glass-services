@@ -830,3 +830,45 @@ fn nothing_queued_for_a_link_that_ended_goes_out_where_its_handle_may_be_reused(
     );
     assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
 }
+
+#[test]
+fn an_answer_to_another_command_leaves_the_one_in_flight_waiting() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    // Something else to send, behind the command in flight.
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let by = b.engine.next_deadline();
+    let reset = hci::OP_RESET.to_le_bytes();
+    let stray = [
+        hci::H4_EVENT,
+        hci::EV_COMMAND_COMPLETE,
+        4,
+        1,
+        reset[0],
+        reset[1],
+        0,
+    ];
+    b.engine.on_hci(&stray, b.now);
+    let credits_only = [hci::H4_EVENT, hci::EV_COMMAND_COMPLETE, 3, 1, 0, 0];
+    b.engine.on_hci(&credits_only, b.now);
+    assert!(
+        b.engine.hci_output().is_empty(),
+        "the next command went out early"
+    );
+    assert_eq!(b.engine.next_deadline(), by, "the deadline moved");
+    b.engine.tick(b.now + COMMAND_TIMEOUT_MS);
+    assert!(
+        b.engine.fatal().is_some(),
+        "the unanswered command was forgotten"
+    );
+
+    // The right answer lets the next one go.
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held2 = hold_a_command_in_flight(&mut b);
+    assert_eq!(held, held2);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held2);
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
+}

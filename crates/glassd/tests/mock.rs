@@ -1677,3 +1677,58 @@ fn sigterm_ends_a_wifi_setup_session_and_the_daemon_cleanly() {
     assert!(!socket.exists(), "and so did the socket");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A companion QR during a Wi-Fi setup session must not take the radio from it: no join, and
+/// so no `wifi_enabled` turned on by it.
+#[test]
+fn a_companion_qr_is_ignored_while_a_wifi_setup_session_runs() {
+    use glass_api::proto::{WifiSetupPhase, WifiSetupRequest};
+    let dir = test_dir("wifi-setup-qr");
+    let mut m = Mock::start_in(&dir, &["--state-dir", dir.join("state").to_str().unwrap()]);
+    let mut c = m.client(&[Topic::WifiSetup, Topic::Settings]);
+    set_settings(
+        &mut c,
+        Settings {
+            wifi_setup_ap_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    c.send(Body2::WifiSetup(WifiSetupRequest { start: true }))
+        .unwrap();
+    c.recv_until(T, |f| {
+        wifi_setup(f).is_some_and(|s| s.phase == WifiSetupPhase::Serving as i32)
+    })
+    .unwrap()
+    .unwrap();
+
+    let qr = omg_protocol::bootstrap::WifiBootstrap::wpa("Casa", "password1").encode();
+    m.send(&format!("companion-qr {qr}"));
+    // Sent after the QR on stdin, answered after it was handled.
+    let s = set_settings(&mut c, Settings::default());
+    assert_eq!(s.wifi_enabled, Some(false), "the QR did not join");
+
+    // After the session the same QR joins.
+    c.send(Body2::WifiSetup(WifiSetupRequest { start: false }))
+        .unwrap();
+    c.recv_until(T, |f| {
+        wifi_setup(f).is_some_and(|s| s.phase == WifiSetupPhase::Off as i32)
+    })
+    .unwrap()
+    .unwrap();
+    m.send(&format!("companion-qr {qr}"));
+    let deadline = Instant::now() + T;
+    loop {
+        let s = set_settings(&mut c, Settings::default());
+        if s.wifi_enabled == Some(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the QR never joined after the session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    drop(m);
+    let _ = std::fs::remove_dir_all(&dir);
+}

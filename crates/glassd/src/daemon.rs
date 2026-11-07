@@ -203,8 +203,9 @@ pub struct Daemon {
     privileged_uids: Vec<u32>,
     /// The session was active at the last look: TCP is closed for it, and suspend is held off.
     wifi_setup_was_active: bool,
-    /// The random pool passed the test once in this boot. It drains afterwards, as reads take
-    /// from it, but the `getrandom` crate does not need it to pass again.
+    /// The random pool passed the test once in this process. It drains afterwards, as reads take
+    /// from it, but the `getrandom` crate does not need it to pass again. A restarted glassd tests
+    /// again: the kernel keeps its pool across a restart, so it passes again unless drained.
     wifi_setup_pool_ok: bool,
     /// Who changed the Wi-Fi wish during a session: see [`WishDuringSetup`].
     wifi_wish: WishDuringSetup,
@@ -2405,6 +2406,13 @@ impl Daemon {
             "companion: QR ssid {:?} addr {:?}",
             boot.ssid, boot.companion_addr
         );
+        // The radio is the setup session's: joining from here would run a supplicant beside its
+        // access point, and the session would then restore the radio over it. The QR can be
+        // scanned again once the session is over.
+        if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+            warn!("companion: QR ignored while a Wi-Fi setup session runs");
+            return;
+        }
         if let Some(radio) = &mut self.radio {
             match companion::bootstrap::wpa_supplicant_conf(
                 &boot.ssid,
@@ -3537,7 +3545,8 @@ mod tests {
         w.changed(false, false);
         w.session_started();
         assert!(w.joined_turns_wifi_on());
-        // Off and on again during the session: the last word was on.
+        // Off and on again during the session: once turned off, the owner's off stands, even
+        // though the last change was back on.
         w.changed(true, true);
         w.changed(true, false);
         w.changed(true, true);

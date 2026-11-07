@@ -78,7 +78,10 @@ pub fn bind_to_device(b: &Binding) -> io::Result<TcpListener> {
 
 struct Conn {
     stream: TcpStream,
-    input: Vec<u8>,
+    /// What the peer sent, which may hold the password. Its whole capacity is reserved at once,
+    /// so it is never moved to a bigger buffer and left behind unwiped, and it is wiped when
+    /// cleared and when the connection goes, whichever way it goes.
+    input: zeroize::Zeroizing<Vec<u8>>,
     /// The answer, once there is one, and how much of it went out.
     output: Vec<u8>,
     sent: usize,
@@ -178,7 +181,7 @@ impl Portal {
                     }
                     self.conns.push(Conn {
                         stream,
-                        input: Vec::new(),
+                        input: zeroize::Zeroizing::new(Vec::with_capacity(http::MAX_REQUEST)),
                         output: Vec::new(),
                         sent: 0,
                         answered: false,
@@ -231,8 +234,7 @@ impl Portal {
             }
             c.answered = true;
             // What it sent holds the password: not kept while the answer goes out.
-            zeroize::Zeroize::zeroize(&mut c.input);
-            c.input = Vec::new();
+            zeroize::Zeroize::zeroize(&mut *c.input);
         }
         let done = c.flush();
         if network.is_some() {
@@ -372,6 +374,30 @@ mod tests {
             client.join().unwrap()
         });
         assert!(second.contains("409"));
+    }
+
+    #[test]
+    fn the_request_buffer_never_grows_past_what_was_reserved() {
+        let mut p = Portal::bind(&lo(), "abcd".into(), http::Lang::En).unwrap();
+        let addr = p.listener.local_addr().unwrap();
+        let mut c = TcpStream::connect(addr).unwrap();
+        pump(&mut p, 100, || false);
+        assert_eq!(p.conns.len(), 1);
+        let reserved = p.conns[0].input.capacity();
+        assert!(reserved >= http::MAX_REQUEST);
+        // More than the limit, with no end of head: refused, after reading up to the limit.
+        let _ = c.write_all(&vec![b'a'; 2 * http::MAX_REQUEST]);
+        let mut seen = 0;
+        for _ in 0..50 {
+            pump(&mut p, 10, || false);
+            if let Some(conn) = p.conns.first() {
+                seen = seen.max(conn.input.len());
+                assert_eq!(conn.input.capacity(), reserved, "no reallocation");
+            } else {
+                break;
+            }
+        }
+        assert!(seen <= http::MAX_REQUEST);
     }
 
     #[test]

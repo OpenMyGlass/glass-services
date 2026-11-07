@@ -17,7 +17,8 @@ pub const MAX_REQUEST: usize = 4096;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Network {
     pub ssid: String,
-    pub conf: String,
+    /// Wiped when dropped.
+    pub conf: zeroize::Zeroizing<String>,
 }
 
 impl std::fmt::Debug for Network {
@@ -310,31 +311,37 @@ pub fn parse_form(body: &[u8], token: &str) -> Result<Network, Refused> {
         if slot.is_some() {
             return Err(Refused::Malformed);
         }
-        *slot = Some(form_decode(v).ok_or(Refused::Malformed)?);
+        // Each decoded value is wiped when dropped: one of them is the password.
+        *slot = Some(zeroize::Zeroizing::new(
+            form_decode(v).ok_or(Refused::Malformed)?,
+        ));
     }
     let got_token = got_token.ok_or(Refused::Malformed)?;
     if !same(&got_token, token) {
         return Err(Refused::Token);
     }
-    let ssid = ssid.ok_or(Refused::Malformed)?;
+    let ssid = ssid.ok_or(Refused::Malformed)?.to_string();
     if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
         return Err(Refused::Ssid);
     }
     let password = password.filter(|p| !p.is_empty());
-    let open = match open.as_deref() {
+    let open = open.as_ref().map(|o| o.as_str());
+    let open = match open {
         None => false,
         Some("1") => true,
         Some(_) => return Err(Refused::Malformed),
     };
-    let (auth, psk) = match (open, password.as_deref()) {
+    let (auth, psk) = match (open, password.as_ref().map(|p| p.as_str())) {
         (true, None) => (WifiAuth::Open, None),
         (false, Some(p)) => (WifiAuth::WpaPsk, Some(p)),
         (true, Some(_)) | (false, None) => return Err(Refused::PasswordChoice),
     };
-    let conf = wpa_supplicant_conf(&ssid, auth, psk).map_err(|_| Refused::Password)?;
+    let made = zeroize::Zeroizing::new(
+        wpa_supplicant_conf(&ssid, auth, psk).map_err(|_| Refused::Password)?,
+    );
     // The supplicant keeps running on `wifi.conf.try` after it was renamed to `wifi.conf`, and must
     // never write to that name again: it would bring the password back in a file nobody deletes.
-    let conf = conf.replacen("update_config=1\n", "update_config=0\n", 1);
+    let conf = zeroize::Zeroizing::new(made.replacen("update_config=1\n", "update_config=0\n", 1));
     debug_assert!(conf.contains("update_config=0\n"));
     Ok(Network { ssid, conf })
 }

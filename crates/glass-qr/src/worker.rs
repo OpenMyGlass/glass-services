@@ -12,7 +12,8 @@
 //!
 //! ```text
 //! request:  "OMGQ" width:u32 height:u32 pixels:width*height bytes
-//! response: count:u8 (at most MAX_CODES), then count times  length:u16 text:length bytes
+//! response: grids:u8 (at most DECODER_MAX_GRIDS) texts:u8 (at most grids),
+//!           then texts times  length:u16 text:length bytes (at most MAX_TEXT_BYTES)
 //! ```
 //!
 //! The worker only decodes. The camera process checks the answer and validates the texts itself,
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::scan::{self, Frame, MAX_CODES, Scan};
+use crate::scan::{self, Codes, DECODER_MAX_GRIDS, Frame, Scan};
 use crate::setup::MAX_TEXT_BYTES;
 
 /// What a request starts with.
@@ -104,11 +105,7 @@ impl Worker {
         }
     }
 
-    fn exchange(
-        &mut self,
-        frame: Frame<'_>,
-        until: Instant,
-    ) -> io::Result<Vec<Zeroizing<Vec<u8>>>> {
+    fn exchange(&mut self, frame: Frame<'_>, until: Instant) -> io::Result<Codes> {
         if self.running.is_none() {
             self.running = Some(self.start()?);
         }
@@ -121,13 +118,14 @@ impl Worker {
         for row in frame.rows() {
             write_until(&mut w.stdin, row, until)?;
         }
-        let mut count = [0u8];
-        read_until(&mut w.stdout, &mut count, until)?;
-        if usize::from(count[0]) > MAX_CODES {
+        let mut counts = [0u8; 2];
+        read_until(&mut w.stdout, &mut counts, until)?;
+        let [grids, count] = counts.map(usize::from);
+        if grids > DECODER_MAX_GRIDS || count > grids {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let mut texts = Vec::with_capacity(count[0].into());
-        for _ in 0..count[0] {
+        let mut texts = Vec::with_capacity(count);
+        for _ in 0..count {
             let mut len = [0u8; 2];
             read_until(&mut w.stdout, &mut len, until)?;
             let len = usize::from(u16::from_le_bytes(len));
@@ -138,7 +136,7 @@ impl Worker {
             read_until(&mut w.stdout, &mut text, until)?;
             texts.push(text);
         }
-        Ok(texts)
+        Ok(Codes { grids, texts })
     }
 
     fn start(&mut self) -> io::Result<Running> {
@@ -214,9 +212,69 @@ fn wait(fd: &impl AsRawFd, events: libc::c_short, until: Instant) -> io::Result<
     }
 }
 
+/// SIGPIPE blocked for this thread while it lives. A write to a pipe whose reader is gone raises
+/// SIGPIPE, which by default ends the process. Rust's runtime ignores it at start, but the camera
+/// process need not be a Rust program, or may restore the default. So each write blocks it, and a
+/// SIGPIPE raised meanwhile is taken back before it is unblocked: a dead worker is then only an
+/// `EPIPE` error. One left pending from before is left alone.
+struct SigpipeBlocked {
+    old: libc::sigset_t,
+    set: libc::sigset_t,
+    was_pending: bool,
+}
+
+impl SigpipeBlocked {
+    fn new() -> io::Result<SigpipeBlocked> {
+        // SAFETY: sigset_t is plain data, filled in by sigemptyset before any use.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid pointers to local sigsets.
+        let r = unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old)
+        };
+        if r != 0 {
+            return Err(io::Error::from_raw_os_error(r));
+        }
+        Ok(SigpipeBlocked {
+            old,
+            set,
+            was_pending: sigpipe_pending(),
+        })
+    }
+}
+
+fn sigpipe_pending() -> bool {
+    // SAFETY: as above; sigpending fills the set.
+    let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigpending(&mut pending) == 0 && libc::sigismember(&pending, libc::SIGPIPE) == 1
+    }
+}
+
+impl Drop for SigpipeBlocked {
+    fn drop(&mut self) {
+        if !self.was_pending && sigpipe_pending() {
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: valid set and timeout; takes the pending SIGPIPE without running a handler.
+            unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &zero) };
+        }
+        // SAFETY: restores the mask saved in new().
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+}
+
 fn write_until(out: &mut ChildStdin, mut buf: &[u8], until: Instant) -> io::Result<()> {
     while !buf.is_empty() {
-        match out.write(buf) {
+        let written = {
+            let _blocked = SigpipeBlocked::new()?;
+            out.write(buf)
+        };
+        match written {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => buf = &buf[n..],
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait(out, libc::POLLOUT, until)?,

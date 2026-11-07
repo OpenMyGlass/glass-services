@@ -100,15 +100,31 @@ fn a_worker_that_takes_the_frame_and_hangs_is_killed() {
     assert_eq!(w.scan(f).err(), Some(WorkerError::Deadline));
 }
 
+/// The scripts below read the whole 640x480 request before they answer, so that each tests its
+/// answer and not a broken pipe. This one answers in protocol, to show they can pass.
+#[test]
+fn a_scripted_answer_in_protocol_is_taken() {
+    let (frame, view) = code_frame();
+    let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
+    let mut w = sh("head -c 307212 >/dev/null; printf '\\000\\000'; sleep 5");
+    assert!(matches!(w.scan(f), Ok(Scan::NoCode)));
+    let mut w = sh("head -c 307212 >/dev/null; printf '\\005\\000'; sleep 5");
+    assert!(
+        matches!(w.scan(f), Ok(Scan::Ambiguous)),
+        "more grids than MAX_CODES"
+    );
+}
+
 #[test]
 fn a_worker_out_of_protocol_is_a_failure() {
     let (frame, view) = code_frame();
     let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
     for script in [
-        "exit 0",                                            // dies at once
-        "head -c 12 >/dev/null; printf '\\377'",             // more codes than allowed
-        "head -c 12 >/dev/null; printf '\\001\\377\\377'",   // a text longer than allowed
-        "head -c 12 >/dev/null; printf '\\001\\005\\000ab'", // cut short
+        "exit 0",                                                     // dies at once
+        "head -c 307212 >/dev/null; printf '\\011\\000'", // more grids than quircs gives
+        "head -c 307212 >/dev/null; printf '\\001\\002'", // more texts than grids
+        "head -c 307212 >/dev/null; printf '\\001\\001\\377\\377'", // a text longer than allowed
+        "head -c 307212 >/dev/null; printf '\\001\\001\\005\\000ab'", // cut short
     ] {
         let mut w = sh(script).with_deadline(Duration::from_secs(2));
         assert_eq!(w.scan(f).err(), Some(WorkerError::Failed), "{script}");

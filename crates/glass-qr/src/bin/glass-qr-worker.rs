@@ -5,7 +5,7 @@
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use glass_qr::scan::{Frame, MAX_CODES, Scanner, check_size};
+use glass_qr::scan::{DECODER_MAX_GRIDS, Frame, Scanner, check_size};
 use glass_qr::setup::MAX_TEXT_BYTES;
 use glass_qr::worker::MAGIC;
 use zeroize::Zeroizing;
@@ -39,11 +39,15 @@ fn serve(mut input: impl Read, mut output: impl Write) -> io::Result<()> {
         }
         input.read_exact(&mut pixels)?;
         let frame = Frame::new(&pixels, width, height, width).expect("checked above");
-        let texts = scanner.read_codes(frame);
+        let codes = scanner.read_codes(frame);
         // Sized for the largest answer, so that it never moves and leaves copies behind.
-        let mut answer = Zeroizing::new(Vec::with_capacity(1 + MAX_CODES * (2 + MAX_TEXT_BYTES)));
-        answer.push(texts.len() as u8);
-        for t in &texts {
+        let mut answer = Zeroizing::new(Vec::with_capacity(
+            2 + DECODER_MAX_GRIDS * (2 + MAX_TEXT_BYTES),
+        ));
+        // quircs reports at most 8 grids; the other side refuses more.
+        answer.push(codes.grids.min(u8::MAX.into()) as u8);
+        answer.push(codes.texts.len() as u8);
+        for t in &codes.texts {
             answer.extend_from_slice(&(t.len() as u16).to_le_bytes());
             answer.extend_from_slice(t);
         }

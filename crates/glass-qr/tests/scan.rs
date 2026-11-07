@@ -133,7 +133,7 @@ fn another_code_in_view_is_refused_and_does_not_end_the_scan() {
         let view = View::plain();
         let frame = render(&matrix(text, EcLevel::M), &view, &mut Rng::new(1));
         let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
-        assert_eq!(Scanner::new().read_codes(f).len(), 1);
+        assert_eq!(Scanner::new().read_codes(f).texts.len(), 1);
         assert!(matches!(
             Scanner::new().scan(f),
             Scan::Refused(setup::SetupError::NotSetup)
@@ -167,7 +167,7 @@ fn a_setup_code_next_to_a_link() {
             frame.extend_from_slice(&right[y * half.width..(y + 1) * half.width]);
         }
         let f = Frame::new(&frame, width, height, width).unwrap();
-        assert_eq!(Scanner::new().read_codes(f).len(), 2);
+        assert_eq!(Scanner::new().read_codes(f).texts.len(), 2);
         assert!(matches!(Scanner::new().scan(f), Scan::Setup(_)));
     }
 }
@@ -188,7 +188,7 @@ fn side_by_side(left: &[u8], right: &[u8]) -> Scan {
         frame.extend_from_slice(&r[y * half.width..(y + 1) * half.width]);
     }
     let f = Frame::new(&frame, width, height, width).unwrap();
-    assert_eq!(Scanner::new().read_codes(f).len(), 2);
+    assert_eq!(Scanner::new().read_codes(f).texts.len(), 2);
     Scanner::new().scan(f)
 }
 
@@ -209,6 +209,69 @@ fn two_different_setup_codes_are_ambiguous() {
         side_by_side(hostile.as_bytes(), real.as_bytes()),
         Scan::Ambiguous
     ));
+}
+
+/// Up to six codes across one 1280x720 frame, three cells by two, each turned a little differently
+/// so that finder patterns of neighbours do not line up.
+fn grid_of_codes(texts: &[&[u8]]) -> Vec<u8> {
+    let (w, h) = (1280, 720);
+    let (cw, ch) = (w / 3, h / 2);
+    let mut frame = vec![140u8; w * h];
+    for (i, text) in texts.iter().enumerate() {
+        let view = View {
+            width: cw,
+            height: ch,
+            px_per_module: 3.0,
+            angle_deg: [0.0, 30.0, 60.0, 15.0, 45.0, 75.0][i],
+            ..View::plain()
+        };
+        let part = render(
+            &matrix(text, EcLevel::L),
+            &view,
+            &mut Rng::new(i as u64 + 1),
+        );
+        let (x0, y0) = ((i % 3) * cw, (i / 3) * ch);
+        for y in 0..ch {
+            frame[(y0 + y) * w + x0..(y0 + y) * w + x0 + cw]
+                .copy_from_slice(&part[y * cw..(y + 1) * cw]);
+        }
+    }
+    frame
+}
+
+/// A sticker of junk codes and a hostile setup code next to the real one: the junk must not
+/// crowd the real code out of the decoder, whatever the order, so the frame is refused.
+#[test]
+fn junk_codes_cannot_crowd_out_the_real_one() {
+    use glass_qr::setup::{TAG_PAIRING_CODE, TAG_WIFI_AUTH, TAG_WIFI_SSID};
+    let mut hostile = Vec::new();
+    field(&mut hostile, TAG_WIFI_SSID, TEST_SSID.as_bytes());
+    field(&mut hostile, TAG_WIFI_AUTH, &[0]);
+    field(&mut hostile, TAG_PAIRING_CODE, b"attacker-code");
+    let hostile = setup::seal(&hostile);
+    let real = full_text();
+    // Longer than any setup text: decoded, then dropped.
+    let junk = "j".repeat(setup::MAX_TEXT_BYTES + 1);
+    let j = junk.as_bytes();
+    let (h, r) = (hostile.as_bytes(), real.as_bytes());
+    for order in [
+        [j, j, j, h, r],
+        [r, j, j, j, h],
+        [h, j, r, j, j],
+        [j, h, j, j, r],
+    ] {
+        let frame = grid_of_codes(&order);
+        let f = Frame::new(&frame, 1280, 720, 1280).unwrap();
+        let codes = Scanner::new().read_codes(f);
+        // The decoder sees all five, and reads both setup codes: the junk only fills slots.
+        assert_eq!(codes.grids, 5);
+        assert_eq!(codes.texts.len(), 2);
+        assert!(matches!(Scanner::new().scan(f), Scan::Ambiguous));
+    }
+    // Junk alone beside the real code is no reason to refuse it.
+    let frame = grid_of_codes(&[j, r, j]);
+    let f = Frame::new(&frame, 1280, 720, 1280).unwrap();
+    assert!(matches!(Scanner::new().scan(f), Scan::Setup(t) if &t[..] == r));
 }
 
 #[test]
@@ -233,7 +296,7 @@ fn a_code_longer_than_any_setup_is_dropped_unread() {
         &mut Rng::new(1),
     );
     let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
-    assert!(Scanner::new().read_codes(f).is_empty());
+    assert!(Scanner::new().read_codes(f).texts.is_empty());
     assert!(matches!(Scanner::new().scan(f), Scan::NoCode));
 }
 

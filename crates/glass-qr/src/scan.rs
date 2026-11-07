@@ -31,8 +31,12 @@ use crate::setup::{self, MAX_TEXT_BYTES, SetupError};
 pub const MAX_PIXELS: usize = 1280 * 720;
 /// The smallest side of a frame: version 1 of a QR code at one pixel per module.
 pub const MIN_SIDE: usize = 21;
-/// Codes decoded in one frame at most. More than one in view is already unusual.
+/// Codes in one frame at most, read or not. A frame with more is refused as [`Scan::Ambiguous`]:
+/// codes that cannot be read must not crowd a real one out.
 pub const MAX_CODES: usize = 4;
+/// The most grids `quircs` reports for a frame; it ignores any more. A frame where it reached this
+/// is beyond [`MAX_CODES`] anyway.
+pub const DECODER_MAX_GRIDS: usize = 8;
 
 /// One luma plane, 8 bits per pixel. Printing one shows its size, not what the camera saw.
 #[derive(Clone, Copy)]
@@ -116,18 +120,34 @@ pub enum Scan {
     /// Codes that are not valid setup codes, and the reason for the last one. Keep scanning: a
     /// link on a poster in view must not end the scan.
     Refused(SetupError),
-    /// Two different valid setup codes. Neither is offered: a sticker next to the real code must
-    /// not be able to win by being read first. Keep scanning, and say why nothing is offered.
+    /// Two different valid setup codes, or more than [`MAX_CODES`] codes of any kind. Nothing is
+    /// offered: a sticker next to the real code must not win by being read first, nor by hiding the
+    /// real code behind junk. Keep scanning, and say why nothing is offered.
+    ///
+    /// This cannot catch a real code too blurred to be read next to a hostile one that can be: then
+    /// only the hostile code is seen, and only the offer screen, which shows all it would change,
+    /// stops it.
     Ambiguous,
     /// The text of the one valid setup code in view, which [`setup::parse`] accepts.
     Setup(Zeroizing<Vec<u8>>),
 }
 
+/// The codes in a frame: how many the decoder found, and the texts of those that could be read.
+pub struct Codes {
+    /// Grids found, read or not, at most [`DECODER_MAX_GRIDS`].
+    pub grids: usize,
+    /// Texts of at most [`MAX_TEXT_BYTES`], one per grid that decoded.
+    pub texts: Vec<Zeroizing<Vec<u8>>>,
+}
+
 /// What a frame's codes add up to.
-pub(crate) fn decide(texts: Vec<Zeroizing<Vec<u8>>>) -> Scan {
+pub(crate) fn decide(codes: Codes) -> Scan {
+    if codes.grids > MAX_CODES {
+        return Scan::Ambiguous;
+    }
     let mut result = Scan::NoCode;
     let mut found: Option<Zeroizing<Vec<u8>>> = None;
-    for text in texts {
+    for text in codes.texts {
         match setup::parse(&text) {
             Ok(_) => match &found {
                 Some(first) if **first != *text => return Scan::Ambiguous,
@@ -154,9 +174,9 @@ impl Scanner {
         Scanner::default()
     }
 
-    /// The texts of up to [`MAX_CODES`] codes in the frame, of at most [`MAX_TEXT_BYTES`]. A code
-    /// that does not decode, or with a longer text, is left out.
-    pub fn read_codes(&mut self, frame: Frame<'_>) -> Vec<Zeroizing<Vec<u8>>> {
+    /// Every grid the decoder finds, each decoded: those that do not decode, or with a longer text
+    /// than [`MAX_TEXT_BYTES`], are counted in [`Codes::grids`] but have no text.
+    pub fn read_codes(&mut self, frame: Frame<'_>) -> Codes {
         let (width, height) = (frame.width, frame.height);
         let pixels = if frame.stride == width {
             &frame.data[..width * height]
@@ -173,14 +193,21 @@ impl Scanner {
             }
             &self.tight[..]
         };
-        self.quirc
-            .identify(width, height, pixels)
-            .take(MAX_CODES)
-            .filter_map(|code| {
-                let payload = Zeroizing::new(code.ok()?.decode().ok()?.payload);
-                (payload.len() <= MAX_TEXT_BYTES).then_some(payload)
-            })
-            .collect()
+        let mut codes = Codes {
+            grids: 0,
+            texts: Vec::new(),
+        };
+        for code in self.quirc.identify(width, height, pixels) {
+            codes.grids += 1;
+            let Some(data) = code.ok().and_then(|c| c.decode().ok()) else {
+                continue;
+            };
+            let payload = Zeroizing::new(data.payload);
+            if payload.len() <= MAX_TEXT_BYTES {
+                codes.texts.push(payload);
+            }
+        }
+        codes
     }
 
     /// Looks for a setup code in the frame. See [`Scan`] for a frame with several codes.

@@ -31,6 +31,7 @@ fn a_full_code_gives_an_offer_and_its_secrets_stay_behind() {
         SetupOffer {
             wifi_ssid: Some(TEST_SSID.into()),
             wifi_auth: Some(WifiAuth::WpaPsk),
+            wifi_hidden: false,
             companion_addr: Some(TEST_ADDR.parse().unwrap()),
             pairs_new_companion: true,
             has_seed: true,
@@ -309,6 +310,9 @@ fn hidden_has_one_spelling() {
         parse_body(&b)
     };
     assert!(hidden(&[1]).unwrap().wifi().unwrap().hidden);
+    assert!(hidden(&[1]).unwrap().offer().wifi_hidden);
+    let shown = parse_body(&wifi_only(b"Net", 0, None)).unwrap().offer();
+    assert!(!shown.wifi_hidden);
     for v in [&[0][..], &[2], &[], &[1, 1]] {
         assert_eq!(
             err(hidden(v)),
@@ -389,6 +393,14 @@ fn an_ssid_cannot_lie_on_the_screen() {
         (" Home", "\\u{20}Home"),
         ("Home ", "Home\\u{20}"),
         (" ", "\\u{20}"),
+        ("Ca\u{d0}a", "Ca\\u{d0}a"),
+        ("Ca\u{110}a", "Ca\\u{110}a"),
+        ("Ca\u{138}a", "Ca\\u{138}a"),
+        ("Ca\u{140}a", "Ca\\u{140}a"),
+        ("Ca\u{b7}a", "Ca\\u{b7}a"),
+        // A run of spaces that reads as one.
+        ("Casa  Rossa", "Casa \\u{20}Rossa"),
+        ("a   b", "a \\u{20}\\u{20}b"),
         // A backslash cannot fake an escape.
         ("Home\\u{20}", "Home\\u{5c}u{20}"),
     ] {
@@ -556,6 +568,7 @@ fn holds_the_rules(s: &Setup) {
     assert!(s.wifi().is_some() || s.seed().is_some() || s.pairing_code().is_some());
     let o = s.offer();
     assert_eq!(o.wifi_auth, s.wifi().map(|w| w.auth));
+    assert_eq!(o.wifi_hidden, s.wifi().is_some_and(|w| w.hidden));
     assert_eq!(o.pairs_new_companion, s.pairing_code().is_some());
     assert_eq!(o.companion_addr, s.companion_addr());
 }

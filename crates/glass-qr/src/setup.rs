@@ -26,8 +26,9 @@
 //!
 //! - **Seed:** mixed into the Glass's pool, never trusted: see [`MixOnlySeed`].
 //!
-//! The offer shows everything a code would change: the network and how it is secured, the
-//! companion it would dial, and whether it pairs a new companion. A hostile code is one the user
+//! The offer shows everything a code would change: the network, how it is secured and whether it
+//! is hidden, the companion it would dial, whether it pairs a new companion, and whether it
+//! carries a seed. A hostile code is one the user
 //! could tell from the real one only by these.
 //!
 //! Errors say what was wrong and never hold any of the content, so they are safe to log.
@@ -140,6 +141,8 @@ pub struct SetupOffer {
     pub wifi_ssid: Option<String>,
     /// How that network is secured. [`WifiAuth::Open`] is worth saying.
     pub wifi_auth: Option<WifiAuth>,
+    /// The network does not announce itself, so the Glass would probe for it by name.
+    pub wifi_hidden: bool,
     /// The companion it would dial.
     pub companion_addr: Option<SocketAddr>,
     /// The code pairs a new companion: it carries a pairing code. Say so plainly, because it
@@ -211,6 +214,7 @@ impl Setup {
         SetupOffer {
             wifi_ssid: self.wifi.as_ref().map(|w| display_ssid(&w.ssid)),
             wifi_auth: self.wifi.as_ref().map(|w| w.auth),
+            wifi_hidden: self.wifi.as_ref().is_some_and(|w| w.hidden),
             companion_addr: self.companion_addr,
             pairs_new_companion: self.pairing_code.is_some(),
             has_seed: self.seed.is_some(),
@@ -278,18 +282,22 @@ impl Setup {
 
 /// An SSID as the launcher shows it. Kept as they are: printable ASCII, and the precomposed letters
 /// and signs of Latin-1 and Latin Extended-A that the Glass font draws, less those that pass for
-/// others (no-break space, soft hyphen, long s, dotless i). Anything else, a backslash, and a space
-/// at either end are written `\u{hex}`, so that what shows is what would be joined: no combining
-/// marks, no blank or invisible characters, no other forms of the same letters.
+/// others: no-break space, soft hyphen, middle dot, Ð and Đ (which pass for each other), ĸ (for k),
+/// ŀ (for l and a dot), long s, dotless i. Anything else, a backslash, a space at either end and
+/// every space after another are written `\u{hex}`, so that what shows is what would be joined: no
+/// combining marks, no blank or invisible characters, no other forms of the same letters, no run of
+/// spaces that reads as one.
 pub fn display_ssid(ssid: &str) -> String {
     let last = ssid.chars().count().saturating_sub(1);
     let mut out = String::with_capacity(ssid.len());
+    let mut previous = None;
     for (i, c) in ssid.chars().enumerate() {
         let shown = match c {
-            ' ' => i != 0 && i != last,
+            ' ' => i != 0 && i != last && previous != Some(' '),
             '\\' => false,
             '!'..='~' => true,
-            '\u{a0}' | '\u{ad}' | '\u{17f}' | '\u{131}' => false,
+            '\u{a0}' | '\u{ad}' | '\u{b7}' | '\u{d0}' | '\u{110}' | '\u{131}' | '\u{138}'
+            | '\u{140}' | '\u{17f}' => false,
             '\u{a1}'..='\u{17f}' => true,
             _ => false,
         };
@@ -298,6 +306,7 @@ pub fn display_ssid(ssid: &str) -> String {
         } else {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         }
+        previous = Some(c);
     }
     out
 }

@@ -5,7 +5,7 @@ whole, without its examples, profiles and CI files. glass-qr uses it through `[p
 the workspace `Cargo.toml`.
 
 One change, in `find_alignment_pattern` (`src/identify.rs`, marked "OpenMyGlass"): the estimate of a
-module's area is computed in i64 and the search ends when it is larger than a module of a 21-module
+module's area is computed in i128 and the search ends when it is larger than a module of a 21-module
 code filling the image. Before it, wrong finder patterns could make one frame take seconds: the
 spiral search runs about 100 steps per pixel of that estimate. `glass-qr`'s `slow_frames` test holds
 frames that did.

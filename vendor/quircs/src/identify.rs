@@ -560,13 +560,14 @@ fn find_alignment_pattern(
     perspective_map(&c2.c, u + 1.0f64, v, &mut c);
     // OpenMyGlass: this estimates the area of one module, from finder patterns that may be wrong,
     // and the spiral below takes about 100 steps per pixel of it. Unclamped, one frame took
-    // seconds, and in i32 the products could overflow. A code is at least 21 modules a side and
+    // seconds, and in i32 the products could overflow; i128 holds any product of two i32
+    // differences. A code is at least 21 modules a side and
     // must fit in the image, so a larger module cannot be there: the search ends, and the grid
     // keeps the alignment point extrapolated from the finder patterns.
-    let (ax, ay) = (i64::from(a.x) - i64::from(b.x), i64::from(a.y) - i64::from(b.y));
-    let (cx, cy) = (i64::from(c.x) - i64::from(b.x), i64::from(c.y) - i64::from(b.y));
+    let (ax, ay) = (i128::from(a.x) - i128::from(b.x), i128::from(a.y) - i128::from(b.y));
+    let (cx, cy) = (i128::from(c.x) - i128::from(b.x), i128::from(c.y) - i128::from(b.y));
     let size_estimate = (ax * -cy + ay * cx).abs();
-    let largest_module = (image.width.min(image.height) / 21) as i64;
+    let largest_module = (image.width.min(image.height) / 21) as i128;
     if size_estimate > largest_module * largest_module {
         return;
     }

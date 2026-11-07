@@ -125,7 +125,8 @@ pub struct Engine {
     /// The PDU going out now: its remaining ACL packets, first at the back.
     current: Vec<Vec<u8>>,
     commands: VecDeque<Vec<u8>>,
-    command_in_flight: bool,
+    /// The command the controller has not answered: its opcode and first parameter byte.
+    in_flight: Option<(u16, u8)>,
     hci_out: Vec<u8>,
     to_session: Vec<u8>,
     actions: Vec<Action>,
@@ -153,7 +154,7 @@ impl Engine {
             notify_bytes: 0,
             current: Vec::new(),
             commands: VecDeque::new(),
-            command_in_flight: false,
+            in_flight: None,
             hci_out: Vec::new(),
             to_session: Vec::new(),
             actions: Vec::new(),
@@ -396,12 +397,7 @@ impl Engine {
 
     /// Moves what may go now to the UART's queue: one command at a time, and ACL against credits.
     fn pump(&mut self) {
-        if !self.command_in_flight
-            && let Some(c) = self.commands.pop_front()
-        {
-            self.hci_out.extend_from_slice(&c);
-            self.command_in_flight = true;
-        }
+        self.send_next_command();
         let cutting = self.conn.as_ref().is_none_or(|c| c.cutting);
         while !cutting && self.credits > 0 && self.hci_out.len() < HCI_OUT_MAX {
             if self.current.is_empty() {
@@ -452,12 +448,20 @@ impl Engine {
         self.notify.clear();
         self.notify_bytes = 0;
         self.current.clear();
-        if self.command_in_flight {
+        self.send_next_command();
+    }
+
+    /// One command at a time: the next goes once the controller answered the last.
+    fn send_next_command(&mut self) {
+        if self.in_flight.is_some() {
             return;
         }
         if let Some(c) = self.commands.pop_front() {
+            self.in_flight = Some((
+                u16::from_le_bytes([c[1], c[2]]),
+                c.get(4).copied().unwrap_or(0),
+            ));
             self.hci_out.extend_from_slice(&c);
-            self.command_in_flight = true;
         }
     }
 
@@ -488,13 +492,11 @@ impl Engine {
     fn on_event(&mut self, code: u8, e: &[u8], now_ms: u64) {
         match code {
             hci::EV_COMMAND_COMPLETE if e.len() >= 3 => {
-                self.command_in_flight = false;
                 let op = u16::from_le_bytes([e[1], e[2]]);
                 let status = e.get(3).copied().unwrap_or(0);
                 self.command_done(op, status);
             }
             hci::EV_COMMAND_STATUS if e.len() >= 4 => {
-                self.command_in_flight = false;
                 let op = u16::from_le_bytes([e[2], e[3]]);
                 self.command_done(op, e[0]);
             }
@@ -529,8 +531,22 @@ impl Engine {
     }
 
     fn command_done(&mut self, op: u16, status: u8) {
+        let first_param = self
+            .in_flight
+            .take()
+            .and_then(|(sent, first)| (sent == op).then_some(first));
+        // Refused because a connection got there first and stopped it: off is what was asked for.
+        if op == hci::OP_LE_SET_ADV_ENABLE
+            && first_param == Some(0)
+            && status == hci::STATUS_COMMAND_DISALLOWED
+        {
+            return;
+        }
         if status != 0 {
-            let line = format!("command {op:04x} failed with status {status:02x}");
+            let line = match first_param {
+                Some(p) => format!("command {op:04x} ({p:02x}) failed with status {status:02x}"),
+                None => format!("command {op:04x} failed with status {status:02x}"),
+            };
             // The setup has no second chance. Later, a failure races with a connection arriving.
             if !self.started {
                 self.fatal = Some(line);
@@ -564,10 +580,13 @@ impl Engine {
                     interval as u32 * 5 / 4
                 ));
                 self.fast_adv_until_ms = None;
-                // Whatever was on its way to the advertising is no longer wanted, and it must be
-                // off: it stops by itself on a connection, unless an enable was in flight.
+                // Whatever was on its way to the advertising is no longer wanted. The connection
+                // stopped it, and BCM4330 answered 0c to turning it off here (bled36, one link).
+                // Only an enable the controller has yet to answer can bring it back.
                 self.commands.clear();
-                self.cmd(hci::OP_LE_SET_ADV_ENABLE, &[0]);
+                if self.in_flight == Some((hci::OP_LE_SET_ADV_ENABLE, 1)) {
+                    self.cmd(hci::OP_LE_SET_ADV_ENABLE, &[0]);
+                }
                 self.db.cccd = 0;
                 self.conn = Some(Conn {
                     handle,

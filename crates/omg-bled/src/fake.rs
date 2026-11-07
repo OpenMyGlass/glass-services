@@ -112,7 +112,15 @@ impl FakeController {
                 reply.extend_from_slice(&(ACL_LEN as u16).to_le_bytes());
                 reply.push(CREDITS as u8);
             }
+            // Turning off what a connection already stopped: as BCM4330 answered in bled36, one link.
+            hci::OP_LE_SET_ADV_ENABLE if params.first() == Some(&0) && !self.advertising => {
+                reply[3] = hci::STATUS_COMMAND_DISALLOWED;
+            }
             hci::OP_LE_SET_ADV_ENABLE => self.advertising = params.first() == Some(&1),
+            // Parameters may not change while advertising.
+            hci::OP_LE_SET_ADV_PARAMS if self.advertising => {
+                reply[3] = hci::STATUS_COMMAND_DISALLOWED;
+            }
             hci::OP_DISCONNECT => {
                 let mut status = vec![0, 1, op as u8, (op >> 8) as u8];
                 self.commands.push((op, params));

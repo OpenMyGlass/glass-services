@@ -38,6 +38,9 @@ pub const DEFAULT_WIFI_IFACE: &str = "wlan0";
 pub const DEFAULT_BT_HCI: &str = "hci0";
 /// The supplicant config's name in the state directory. It holds the network's password.
 pub const WIFI_CONF_FILE: &str = "wifi.conf";
+/// How often, and how many times, `wpa_supplicant` is tried again when it would not start.
+const ASSOC_RETRY_US: u64 = 2_000_000;
+const ASSOC_MAX_FAILURES: u32 = 5;
 const WPA_PID_FILE: &str = "/var/run/glassd-wpa_supplicant.pid";
 const DHCP_PID_FILE: &str = "/var/run/glassd-udhcpc.pid";
 /// The UART the Bluetooth chip is wired to.
@@ -274,6 +277,9 @@ pub struct Radio {
     ble: Option<BleEngine>,
     /// A Wi-Fi setup session owns the interface: the settings do not drive it for now.
     wifi_held: bool,
+    /// `wpa_supplicant` refused to start this many times in a row, and the next try's time.
+    assoc_failures: u32,
+    assoc_retry_at_us: Option<u64>,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -451,6 +457,8 @@ impl Radio {
             associating: false,
             ble: None,
             wifi_held: false,
+            assoc_failures: 0,
+            assoc_retry_at_us: None,
             wifi_on: None,
             bt_on: None,
         }
@@ -668,6 +676,7 @@ impl Radio {
             self.start_association();
             r
         } else {
+            self.forget_association_failures();
             self.stop_association();
             self.step("ip", &["link", "set", &iface, "down"]);
             self.step("rfkill", &["block", "wifi"])
@@ -791,7 +800,7 @@ impl Radio {
         }
         let iface = self.wifi_iface.clone();
         let conf_arg = conf.to_string_lossy().into_owned();
-        self.step(
+        let started = self.step(
             "wpa_supplicant",
             &[
                 "-B",
@@ -805,6 +814,14 @@ impl Radio {
                 WPA_PID_FILE,
             ],
         );
+        // An old one that is still going holds the control socket, and this one exits at once.
+        // Nothing else would ever try again.
+        if !started {
+            self.assoc_failures += 1;
+            return;
+        }
+        self.assoc_failures = 0;
+        self.assoc_retry_at_us = None;
         // Through a shell, with the output closed: the runner waits for its pipe to close, and
         // udhcpc stays in the foreground until it has a lease.
         let dhcp = format!("udhcpc -b -i {iface} -p {DHCP_PID_FILE} >/dev/null 2>&1 &");
@@ -816,6 +833,40 @@ impl Radio {
     /// A Wi-Fi setup session takes the interface: [`Radio::apply`] leaves Wi-Fi alone for now.
     pub(crate) fn hold_wifi(&mut self) {
         self.wifi_held = true;
+        self.forget_association_failures();
+    }
+
+    fn forget_association_failures(&mut self) {
+        self.assoc_failures = 0;
+        self.assoc_retry_at_us = None;
+    }
+
+    /// When [`Radio::association_tick`] next has work (`CLOCK_MONOTONIC` µs).
+    pub fn association_next_deadline(&self) -> Option<u64> {
+        self.assoc_retry_at_us
+    }
+
+    /// Tries `wpa_supplicant` again if it refused to start, a few times.
+    pub fn association_tick(&mut self, now_us: u64) {
+        if self.assoc_failures == 0 {
+            return;
+        }
+        if self.assoc_failures > ASSOC_MAX_FAILURES {
+            warn!("radio: wpa_supplicant will not start: giving up");
+            self.forget_association_failures();
+            return;
+        }
+        match self.assoc_retry_at_us {
+            None => self.assoc_retry_at_us = Some(now_us + ASSOC_RETRY_US),
+            Some(at) if now_us >= at => {
+                self.assoc_retry_at_us = None;
+                self.start_association();
+                if self.assoc_failures > 0 {
+                    self.assoc_retry_at_us = Some(now_us + ASSOC_RETRY_US);
+                }
+            }
+            Some(_) => {}
+        }
     }
 
     /// The session gave the interface back, in an unknown state: the next [`Radio::apply`] drives
@@ -831,11 +882,22 @@ impl Radio {
         self.wifi_held = false;
     }
 
-    /// The network tried by [`Radio::join_wifi`] did not work: back to `conf`.
+    /// The network tried by [`Radio::join_wifi`] did not work: back to `conf`. The radio stays
+    /// held: the supplicant has only been told to go, and a new one started before it has gone
+    /// cannot get the control socket. Wait, then [`Radio::release_wifi`].
     pub(crate) fn abandon_join(&mut self, conf: std::path::PathBuf) {
         self.stop_association();
+        self.forget_association_failures();
         self.wifi_conf = Some(conf);
-        self.release_wifi();
+    }
+
+    /// Stops a supplicant and a DHCP client that another run of the daemon left, which this one
+    /// knows of only by their pid files.
+    pub(crate) fn stop_stale_association(&mut self) {
+        self.associating = false;
+        let kill =
+            format!("kill $(cat {WPA_PID_FILE} {DHCP_PID_FILE} 2>/dev/null) 2>/dev/null; true");
+        self.step("sh", &["-c", &kill]);
     }
 
     pub(crate) fn stop_association(&mut self) {
@@ -943,6 +1005,71 @@ mod tests {
             .position(|c| c.contains("link set wlan0 down"))
             .unwrap();
         assert!(kill < down);
+    }
+
+    #[test]
+    fn a_supplicant_that_will_not_start_is_tried_again_and_then_given_up() {
+        let d = tempfile::tempdir().unwrap();
+        let conf = d.path().join(WIFI_CONF_FILE);
+        std::fs::write(&conf, "network={}").unwrap();
+        let refusals = Arc::new(Mutex::new(2));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (r2, s2) = (refusals.clone(), seen.clone());
+        let mut r = Radio::with_runner(
+            "wlan0",
+            Box::new(move |p, _| {
+                s2.lock().unwrap().push(p.to_string());
+                let mut left = r2.lock().unwrap();
+                let ok = p != "wpa_supplicant" || *left == 0;
+                if p == "wpa_supplicant" && *left > 0 {
+                    *left -= 1;
+                }
+                Ok(Outcome {
+                    ok,
+                    stdout: String::new(),
+                })
+            }),
+        )
+        .with_wifi_conf(&conf);
+        let starts = |s: &Arc<Mutex<Vec<String>>>| {
+            s.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "wpa_supplicant")
+                .count()
+        };
+        r.set_wifi(true);
+        assert_eq!(starts(&seen), 1);
+        assert!(
+            !r.associating,
+            "no DHCP client for a supplicant that is not there"
+        );
+        r.association_tick(0);
+        let at = r.association_next_deadline().unwrap();
+        r.association_tick(at - 1);
+        assert_eq!(starts(&seen), 1);
+        r.association_tick(at);
+        assert_eq!(starts(&seen), 2);
+        r.association_tick(at + ASSOC_RETRY_US);
+        assert_eq!(starts(&seen), 3);
+        assert!(r.associating);
+        assert_eq!(r.association_next_deadline(), None);
+        assert!(
+            seen.lock().unwrap().iter().any(|p| p == "sh"),
+            "the DHCP client"
+        );
+
+        // It never starts: a limited number of tries, and no more deadlines.
+        *refusals.lock().unwrap() = 1000;
+        r.set_wifi(false);
+        r.set_wifi(true);
+        let mut now = 0;
+        for _ in 0..50 {
+            r.association_tick(now);
+            now += ASSOC_RETRY_US;
+        }
+        assert_eq!(r.association_next_deadline(), None);
+        assert_eq!(starts(&seen), 4 + ASSOC_MAX_FAILURES as usize);
     }
 
     #[test]

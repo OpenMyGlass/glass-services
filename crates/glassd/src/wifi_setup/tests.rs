@@ -12,7 +12,14 @@ struct World {
     link_up_fails: bool,
     firmware_line: Option<String>,
     lease: Option<String>,
+    /// The test's clock.
+    now: u64,
+    /// When the old supplicant was told to go. Until it has, it holds the control socket.
+    supplicant_killed_at: Option<u64>,
 }
+
+/// How long the old supplicant takes to go, in this model. Under the 2 s the session waits.
+const SUPPLICANT_EXIT_US: u64 = 1_000_000;
 
 type SharedWorld = Arc<Mutex<World>>;
 
@@ -32,6 +39,12 @@ fn runner(world: SharedWorld) -> Runner {
             out.ok = !w.no_tools;
         } else if line.contains("link set wlan0 up") {
             out.ok = !w.link_up_fails;
+        } else if line.contains("glassd-wpa_supplicant.pid") && line.contains("kill") {
+            w.supplicant_killed_at = Some(w.now);
+        } else if line.starts_with("wpa_supplicant") {
+            out.ok = w
+                .supplicant_killed_at
+                .is_none_or(|at| w.now >= at + SUPPLICANT_EXIT_US);
         } else if line.contains("dmesg") {
             out.stdout = w.firmware_line.clone().unwrap_or_default();
         } else if line.starts_with("ip -4 -o addr show") {
@@ -55,34 +68,37 @@ struct Rig {
 
 const AP_MODE: &str = "[ 14.38] Firmware up: op_mode=0x0002, MAC=f8:8f:ca:11:a2:24";
 
+fn config(root: &std::path::Path) -> Config {
+    Config {
+        paths: ApPaths {
+            run_dir: root.join("ap"),
+            firmware_param: root.join("firmware_path"),
+            stock_firmware: root.join("fw_bcmdhd.bin"),
+        },
+        binding: Binding {
+            device: "lo".into(),
+            ip: Ipv4Addr::LOCALHOST,
+            port: 0,
+        },
+        wifi_conf: root.join("wifi.conf"),
+        timeouts: Timeouts::default(),
+        assume_enabled: false,
+    }
+}
+
 impl Rig {
     fn new() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (param, stock) = (root.join("firmware_path"), root.join("fw_bcmdhd.bin"));
-        std::fs::write(&param, "").unwrap();
-        std::fs::write(&stock, "firmware").unwrap();
+        std::fs::write(root.join("firmware_path"), "").unwrap();
+        std::fs::write(root.join("fw_bcmdhd.bin"), "firmware").unwrap();
         let world: SharedWorld = Arc::new(Mutex::new(World {
             firmware_line: Some(AP_MODE.into()),
             ..Default::default()
         }));
         let conf = root.join("wifi.conf");
         let radio = Radio::with_runner("wlan0", runner(world.clone())).with_wifi_conf(conf.clone());
-        let setup = WifiSetup::new(Config {
-            paths: ApPaths {
-                run_dir: root.join("ap"),
-                firmware_param: param,
-                stock_firmware: stock,
-            },
-            binding: Binding {
-                device: "lo".into(),
-                ip: Ipv4Addr::LOCALHOST,
-                port: 0,
-            },
-            wifi_conf: conf.clone(),
-            timeouts: Timeouts::default(),
-            assume_enabled: false,
-        });
+        let setup = WifiSetup::new(config(root));
         Rig {
             _dir: dir,
             world,
@@ -91,6 +107,20 @@ impl Rig {
             conf,
             now: 1_000_000,
         }
+    }
+
+    /// The daemon died and started again: a new radio and a new session, knowing only the files.
+    fn restart(&mut self) -> Update {
+        self.radio = Radio::with_runner("wlan0", runner(self.world.clone()))
+            .with_wifi_conf(self.conf.clone());
+        self.setup = WifiSetup::new(config(self._dir.path()));
+        self.world.lock().unwrap().log.clear();
+        self.setup.cleanup_stale(&mut self.radio, self.now)
+    }
+
+    /// What the daemon does with `Finished::Restore`: drive the radio to what the settings say.
+    fn apply_settings(&mut self, wifi: bool) {
+        self.radio.apply(wifi, false);
     }
 
     fn ctx() -> Context {
@@ -126,6 +156,7 @@ impl Rig {
             .next_deadline()
             .expect("a deadline")
             .max(self.now);
+        self.world.lock().unwrap().now = self.now;
         self.setup.tick(&mut self.radio, self.now)
     }
 
@@ -342,6 +373,34 @@ fn a_firmware_in_the_wrong_mode_is_not_believed() {
 }
 
 #[test]
+fn a_mode_the_kernel_log_does_not_show_is_not_believed_either() {
+    let mut r = Rig::new();
+    r.world.lock().unwrap().firmware_line = None;
+    r.start();
+    let (s, _) = r.until(WifiSetupPhase::Failed);
+    assert_eq!(s.error, ERR_FIRMWARE_MODE);
+    assert!(!r.cmds().iter().any(|l| l.contains("hostapd -e")));
+}
+
+#[test]
+fn the_daemons_end_by_themselves_after_the_session_could_have() {
+    let mut r = Rig::new();
+    r.serve();
+    let limit = Timeouts::default().daemons_limit_s();
+    assert!(limit > 630 && limit < 700, "{limit}");
+    let run = |needle: &str| {
+        r.cmds()
+            .iter()
+            .find(|l| l.contains(needle))
+            .expect(needle)
+            .clone()
+    };
+    assert!(run("hostapd -e").contains(&format!("timeout -s TERM {limit} hostapd")));
+    assert!(run("udhcpd").contains(&format!("timeout -s TERM {limit} busybox-extras")));
+    assert!(run("command -v").contains("command -v timeout"));
+}
+
+#[test]
 fn a_link_that_will_not_come_up_ends_the_session() {
     let mut r = Rig::new();
     r.world.lock().unwrap().link_up_fails = true;
@@ -385,28 +444,73 @@ fn the_session_times_out_and_leaves_nothing_behind() {
     );
 }
 
+/// Runs a session to each stage in turn, and cancels there.
 #[test]
 fn a_cancel_ends_the_session_at_any_stage() {
-    let mut r = Rig::new();
-    r.serve();
-    let u = r.setup.stop(&mut r.radio, r.now);
-    assert_eq!(u.state.unwrap().phase, WifiSetupPhase::Stopping as i32);
-    let (_, finished) = r.until(WifiSetupPhase::Off);
-    assert_eq!(finished, Some(Finished::Restore));
-    assert!(!r.setup.active());
-
-    let mut r = Rig::new();
-    r.start();
-    r.setup.stop(&mut r.radio, r.now);
-    r.until(WifiSetupPhase::Off);
-    assert!(!r.setup.active());
-
-    // A second stop while stopping changes nothing.
-    let mut r = Rig::new();
-    r.serve();
-    r.setup.stop(&mut r.radio, r.now);
-    r.setup.stop(&mut r.radio, r.now);
-    r.until(WifiSetupPhase::Off);
+    fn check(stage: &str, prepare: impl Fn(&mut Rig)) {
+        let mut r = Rig::new();
+        std::fs::write(&r.conf, "old").unwrap();
+        prepare(&mut r);
+        assert!(r.setup.active(), "{stage}");
+        r.setup.stop(&mut r.radio, r.now);
+        r.setup.stop(&mut r.radio, r.now);
+        let before = r.cmds().len();
+        let (end, finished) = r.until(WifiSetupPhase::Off);
+        assert_eq!(finished, Some(Finished::Restore), "{stage}");
+        assert!(end.password.is_empty());
+        assert!(!r.setup.active(), "{stage}");
+        assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old", "{stage}");
+        assert!(!r.setup.tried_conf().exists(), "{stage}");
+        assert!(!r.setup.cfg.paths.run_dir.exists(), "{stage}");
+        assert!(
+            !r.cmds()[before..]
+                .iter()
+                .any(|l| l.starts_with("wpa_supplicant")),
+            "{stage}: nothing is joined after a cancel"
+        );
+    }
+    check("settling", |r| {
+        r.start();
+    });
+    check("settling, link down", |r| {
+        r.start();
+        r.step();
+    });
+    check("starting", |r| {
+        r.start();
+        r.step();
+        r.step();
+    });
+    check("serving", |r| {
+        r.serve();
+    });
+    let send = |r: &mut Rig| {
+        let s = r.serve();
+        r.send_form(&s, good);
+    };
+    check("flushing", send);
+    check("leaving to join", |r| {
+        send(r);
+        r.step();
+        assert!(matches!(r.setup.phase, Phase::Leaving { .. }));
+    });
+    check("leaving to join, link down", |r| {
+        send(r);
+        r.step();
+        r.step();
+        assert!(matches!(r.setup.phase, Phase::Leaving { downed: true, .. }));
+    });
+    check("joining", |r| {
+        send(r);
+        r.step();
+        r.step();
+        r.step();
+        assert!(matches!(r.setup.phase, Phase::Joining { .. }));
+    });
+    check("leaving to stop", |r| {
+        r.serve();
+        r.setup.stop(&mut r.radio, r.now);
+    });
 }
 
 #[test]
@@ -433,12 +537,62 @@ fn clients_on_the_access_point_are_reported() {
 }
 
 #[test]
-fn hostapd_going_away_ends_the_session() {
+fn hostapd_reporting_the_end_ends_the_session() {
     let mut r = Rig::new();
     r.serve();
     r.hostapd_says("wlan0: AP-DISABLED \n");
     let (s, _) = r.until(WifiSetupPhase::Failed);
     assert_eq!(s.error, ERR_AP);
+}
+
+/// A pid that no process has: of one that was just reaped.
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[test]
+fn hostapd_dying_silently_ends_the_session() {
+    let mut r = Rig::new();
+    r.serve();
+    let started = r.now;
+    let pid = r.setup.cfg.paths.run_dir.join("hostapd.pid");
+    std::fs::write(pid, format!("{}\n", dead_pid())).unwrap();
+    let (s, _) = r.until(WifiSetupPhase::Failed);
+    assert_eq!(s.error, ERR_AP);
+    assert!(r.now < started + 20_000_000, "at once, not at the timeout");
+}
+
+#[test]
+fn hostapd_dying_while_it_starts_ends_the_session() {
+    let mut r = Rig::new();
+    r.start();
+    r.step();
+    r.step();
+    let started = r.now;
+    let pid = r.setup.cfg.paths.run_dir.join("hostapd.pid");
+    std::fs::write(pid, format!("{}\n", dead_pid())).unwrap();
+    let (s, _) = r.until(WifiSetupPhase::Failed);
+    assert_eq!(s.error, ERR_AP);
+    assert!(r.now < started + 20_000_000);
+}
+
+#[test]
+fn a_daemon_that_ignores_term_gets_kill() {
+    let mut r = Rig::new();
+    r.serve();
+    let me = std::process::id();
+    let pid = r.setup.cfg.paths.run_dir.join("hostapd.pid");
+    std::fs::write(pid, format!("{me}\n")).unwrap();
+    r.setup.stop(&mut r.radio, r.now);
+    r.until(WifiSetupPhase::Off);
+    let c = r.cmds();
+    let at = |n: &str| c.iter().position(|l| l.contains(n)).expect(n);
+    assert_eq!(c[at("kill -TERM")], format!("kill -TERM {me}"));
+    assert_eq!(c[at("kill -KILL")], format!("kill -KILL {me}"));
+    assert!(at("kill -TERM") < at("kill -KILL"));
 }
 
 #[test]
@@ -483,7 +637,7 @@ fn a_network_that_works_is_kept_and_the_access_point_is_gone_first() {
 }
 
 #[test]
-fn a_network_that_fails_changes_nothing() {
+fn a_network_that_fails_changes_nothing_and_the_old_one_is_joined_again() {
     let mut r = Rig::new();
     std::fs::write(&r.conf, "old").unwrap();
     let s = r.serve();
@@ -495,26 +649,70 @@ fn a_network_that_fails_changes_nothing() {
     assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old");
     assert!(!r.setup.tried_conf().exists(), "the typed password is gone");
     assert!(!r.setup.active());
+
+    // The old supplicant has had its time: the old network's starts at the first try.
+    let conf = r.conf.to_string_lossy().into_owned();
+    r.world.lock().unwrap().log.clear();
+    r.apply_settings(true);
+    let c = r.cmds();
+    assert_eq!(
+        c.iter().filter(|l| l.starts_with("wpa_supplicant")).count(),
+        1
+    );
+    assert!(
+        c.iter()
+            .any(|l| l.starts_with("wpa_supplicant") && l.contains(&conf))
+    );
+    assert!(c.iter().any(|l| l.contains("udhcpc")));
+    r.radio.association_tick(r.now);
+    assert_eq!(
+        r.radio.association_next_deadline(),
+        None,
+        "nothing to retry"
+    );
 }
 
 #[test]
-fn a_cancel_while_joining_changes_nothing() {
+fn a_cancel_while_joining_waits_for_the_supplicant_before_the_old_network() {
     let mut r = Rig::new();
     std::fs::write(&r.conf, "old").unwrap();
     let s = r.serve();
     r.send_form(&s, good);
-    for _ in 0..50 {
-        if matches!(r.setup.phase, Phase::Joining { .. }) {
-            break;
-        }
+    while !matches!(r.setup.phase, Phase::Joining { .. }) {
         r.step();
     }
-    assert!(matches!(r.setup.phase, Phase::Joining { .. }));
     let u = r.setup.stop(&mut r.radio, r.now);
-    assert_eq!(u.finished, Some(Finished::Restore));
+    assert_eq!(u.state.unwrap().phase, WifiSetupPhase::Stopping as i32);
+    assert_eq!(u.finished, None, "not yet: the supplicant is still going");
+    // With the option: the tried file's name starts the same.
+    let conf = format!("-c {} ", r.conf.display());
+    let old_started = |r: &Rig| {
+        r.cmds()
+            .iter()
+            .any(|l| l.starts_with("wpa_supplicant") && l.contains(&conf))
+    };
+    r.apply_settings(true);
+    assert!(!old_started(&r), "held");
+    let (_, finished) = r.until(WifiSetupPhase::Off);
+    assert_eq!(finished, Some(Finished::Restore));
+    r.apply_settings(true);
+    assert!(old_started(&r));
     assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old");
-    assert!(!r.setup.tried_conf().exists());
-    assert!(!r.setup.active());
+}
+
+#[test]
+fn a_network_that_cannot_be_stored_is_not_called_joined() {
+    let mut r = Rig::new();
+    let s = r.serve();
+    r.world.lock().unwrap().lease = Some("192.168.1.50".into());
+    // A directory in its place: the rename fails.
+    std::fs::create_dir(&r.conf).unwrap();
+    std::fs::write(r.conf.join("x"), "").unwrap();
+    r.send_form(&s, good);
+    let (end, finished) = r.until(WifiSetupPhase::Failed);
+    assert_eq!(end.error, ERR_FILES);
+    assert_eq!(finished, Some(Finished::Restore));
+    assert!(!r.setup.tried_conf().exists(), "the typed password is gone");
 }
 
 #[test]
@@ -553,28 +751,125 @@ fn the_radio_stays_with_the_session_whatever_the_settings_say() {
     );
 }
 
+/// A new radio knows nothing, at every stage a daemon could have died in.
 #[test]
-fn a_session_left_by_a_dead_daemon_is_ended_at_start() {
+fn a_session_left_by_a_dead_daemon_is_ended_at_start_with_the_waits() {
+    fn check(stage: &str, prepare: impl Fn(&mut Rig)) {
+        let mut r = Rig::new();
+        std::fs::write(&r.conf, "old").unwrap();
+        prepare(&mut r);
+        let run = r.setup.cfg.paths.run_dir.clone();
+        let tried = r.setup.tried_conf();
+        let joining = tried.exists();
+        let start = r.now;
+        let u = r.restart();
+        assert!(u.state.is_some(), "{stage}");
+        assert!(r.setup.active(), "{stage}");
+        assert!(!tried.exists(), "{stage}: the typed password");
+        let at_once = r.cmds();
+        assert!(
+            !at_once.iter().any(|l| l.contains("link set wlan0 down")),
+            "{stage}: the first wait comes first: {at_once:?}"
+        );
+        assert_eq!(
+            at_once
+                .iter()
+                .any(|l| l.contains("glassd-wpa_supplicant.pid")),
+            joining,
+            "{stage}: {at_once:?}"
+        );
+
+        // The radio stays with the cleanup, whatever the settings say.
+        r.apply_settings(true);
+        assert!(
+            !r.cmds().iter().any(|l| l.starts_with("wpa_supplicant")),
+            "{stage}"
+        );
+
+        let (_, finished) = r.until(WifiSetupPhase::Off);
+        assert_eq!(finished, Some(Finished::Restore), "{stage}");
+        assert!(r.now >= start + 4_000_000, "{stage}: 2 s and 2 s");
+        assert!(!run.exists(), "{stage}");
+        assert_eq!(
+            std::fs::read_to_string(&r.setup.cfg.paths.firmware_param).unwrap(),
+            "\n",
+            "{stage}"
+        );
+        assert!(
+            r.cmds().iter().any(|l| l.contains("link set wlan0 down")),
+            "{stage}"
+        );
+        assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old", "{stage}");
+
+        // And the old network comes back.
+        r.apply_settings(true);
+        assert!(
+            r.cmds().iter().any(|l| l.starts_with("wpa_supplicant")),
+            "{stage}"
+        );
+        r.radio.association_tick(r.now);
+        assert_eq!(r.radio.association_next_deadline(), None, "{stage}");
+    }
+    check("serving", |r| {
+        r.serve();
+        let run = r.setup.cfg.paths.run_dir.clone();
+        std::fs::write(run.join("hostapd.pid"), "4242\n").unwrap();
+    });
+    check("starting", |r| {
+        r.start();
+        r.step();
+        r.step();
+    });
+    check("joining", |r| {
+        let s = r.serve();
+        r.send_form(&s, good);
+        while !matches!(r.setup.phase, Phase::Joining { .. }) {
+            r.step();
+        }
+        assert!(r.setup.tried_conf().exists());
+        assert!(!r.setup.cfg.paths.run_dir.exists());
+    });
+}
+
+#[test]
+fn nothing_left_means_nothing_done_at_start() {
     let mut r = Rig::new();
+    let u = r.restart();
+    assert!(u.state.is_none());
+    assert!(!r.setup.active());
+    assert!(r.cmds().is_empty());
+}
+
+#[test]
+fn an_exit_ends_the_session_at_any_stage() {
+    let mut r = Rig::new();
+    r.setup.cfg.timeouts.settle_us = 1;
     r.serve();
     let run = r.setup.cfg.paths.run_dir.clone();
-    std::fs::write(run.join("hostapd.pid"), "4242\n").unwrap();
-    std::fs::write(r.setup.tried_conf(), "secret").unwrap();
-    r.world.lock().unwrap().log.clear();
-
-    let (param, tried) = (
-        r.setup.cfg.paths.firmware_param.clone(),
-        r.setup.tried_conf(),
-    );
-    r.setup.cleanup_stale(&mut r.radio);
+    r.setup.shutdown(&mut r.radio);
+    assert!(!r.setup.active());
     assert!(!run.exists());
-    assert!(!tried.exists());
-    assert_eq!(std::fs::read_to_string(param).unwrap(), "\n");
-    assert!(r.cmds().iter().any(|l| l == "kill -TERM 4242"));
 
-    // Nothing left: nothing done.
-    r.world.lock().unwrap().log.clear();
-    r.setup.cleanup_stale(&mut r.radio);
+    let mut r = Rig::new();
+    r.setup.cfg.timeouts.settle_us = 1;
+    let s = r.serve();
+    r.send_form(&s, good);
+    while !matches!(r.setup.phase, Phase::Joining { .. }) {
+        r.step();
+    }
+    let tried = r.setup.tried_conf();
+    assert!(tried.exists());
+    r.setup.shutdown(&mut r.radio);
+    assert!(!tried.exists());
+    assert!(
+        r.cmds()
+            .iter()
+            .any(|l| l.contains("glassd-wpa_supplicant.pid"))
+    );
+
+    // No session: nothing to do, and no wait.
+    let mut r = Rig::new();
+    r.setup.shutdown(&mut r.radio);
     assert!(r.cmds().is_empty());
 }
 

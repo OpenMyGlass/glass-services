@@ -158,7 +158,7 @@ fn response(status: &str, html: Option<String>) -> Vec<u8> {
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\n\
-         Referrer-Policy: no-referrer\r\n\
+         Referrer-Policy: same-origin\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
          form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\n\
          \r\n{body}",
@@ -393,7 +393,7 @@ pub fn handle(site: &Site, input: &[u8]) -> Handled {
     match head.one("origin") {
         Err(()) => return bad(),
         Ok(Some(o)) if o.strip_prefix("http://") != Some(site.host.as_str()) => {
-            return Handled::Respond(response("403 Forbidden", None));
+            return Handled::Respond(refused_page(site, Refused::Token));
         }
         Ok(_) => {}
     }
@@ -404,7 +404,8 @@ pub fn handle(site: &Site, input: &[u8]) -> Handled {
         Ok(None) => None,
         Ok(Some(v)) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
             match v.parse::<usize>() {
-                Ok(n) if end + 4 + n <= MAX_REQUEST => Some(n),
+                // Not a plain sum: a length near usize::MAX would wrap around and pass.
+                Ok(n) if n.checked_add(end + 4).is_some_and(|t| t <= MAX_REQUEST) => Some(n),
                 _ => return Handled::Respond(response("413 Content Too Large", None)),
             }
         }
@@ -467,6 +468,89 @@ mod tests {
         match h {
             Handled::Respond(b) | Handled::Accepted(b, _) => String::from_utf8_lossy(b).to_string(),
             Handled::NeedMore => String::new(),
+        }
+    }
+
+    /// `Referrer-Policy: no-referrer` makes browsers send `Origin: null` on the page's own form,
+    /// and that is refused. Sent by Firefox 159 for a form on a page with these headers.
+    #[test]
+    fn a_form_from_a_real_browser_is_accepted() {
+        const CAPTURED: &str = "POST /join HTTP/1.1\r\n\
+            Host: 127.0.0.1:18081\r\n\
+            User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0\r\n\
+            Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
+            Accept-Language: it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7\r\n\
+            Accept-Encoding: gzip, deflate, br, zstd\r\n\
+            Referer: http://127.0.0.1:18081/\r\n\
+            Content-Type: application/x-www-form-urlencoded\r\n\
+            Content-Length: 36\r\n\
+            Origin: http://127.0.0.1:18081\r\n\
+            Connection: keep-alive\r\n\
+            Upgrade-Insecure-Requests: 1\r\n\
+            Sec-Fetch-Dest: document\r\n\
+            Sec-Fetch-Mode: navigate\r\n\
+            Sec-Fetch-Site: same-origin\r\n\
+            Priority: u=0, i\r\n\
+            \r\n\
+            token=abcd&ssid=N&password=password1";
+        let s = Site {
+            host: "127.0.0.1:18081".into(),
+            token: "abcd".into(),
+            lang: Lang::En,
+        };
+        assert!(matches!(
+            handle(&s, CAPTURED.as_bytes()),
+            Handled::Accepted(..)
+        ));
+        let page = body_of(&handle(
+            &s,
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:18081\r\n\r\n",
+        ));
+        assert!(page.contains("Referrer-Policy: same-origin"));
+        assert!(
+            !page.contains("no-referrer"),
+            "it would bring back Origin: null"
+        );
+    }
+
+    #[test]
+    fn a_refused_origin_gets_a_page_saying_so() {
+        let mut req =
+            String::from_utf8(post(&format!("token={TOKEN}&ssid=N&password=password"))).unwrap();
+        req = req.replacen("\r\n", "\r\nOrigin: null\r\n", 1);
+        let h = handle(&site(), req.as_bytes());
+        assert_eq!(status(&h), "HTTP/1.1 403 Forbidden");
+        assert!(body_of(&h).contains("expired"));
+    }
+
+    #[test]
+    fn a_length_that_would_wrap_around_is_refused() {
+        for n in [u64::MAX, u64::from(u32::MAX), u64::MAX - 100] {
+            let r = format!(
+                "POST /join HTTP/1.1\r\nHost: 192.168.77.1\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {n}\r\n\r\n"
+            );
+            assert_eq!(
+                status(&handle(&site(), r.as_bytes())),
+                "HTTP/1.1 413 Content Too Large"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_buffer_always_gets_an_answer() {
+        // Whatever the split between head and body: the portal stops reading at this size, so
+        // waiting for more here would leave the connection ready and never read.
+        let head = |n: usize| {
+            format!(
+                "POST /join HTTP/1.1\r\nHost: 192.168.77.1\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {n}\r\n\r\n"
+            )
+        };
+        for n in [1, 100, 3000, MAX_REQUEST - 1, MAX_REQUEST] {
+            let mut input = head(n).into_bytes();
+            input.resize(MAX_REQUEST, b'a');
+            assert_ne!(handle(&site(), &input), Handled::NeedMore, "{n}");
         }
     }
 

@@ -201,6 +201,11 @@ pub struct Daemon {
     owns_socket: bool,
     peers: PeerPolicy,
     privileged_uids: Vec<u32>,
+    /// The session was active at the last look: TCP is closed for it, and suspend is held off.
+    wifi_setup_was_active: bool,
+    /// Readable when a termination signal came in: see [`catch_termination`].
+    term_fd: Option<RawFd>,
+    terminating: bool,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -332,6 +337,38 @@ fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
 
 /// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
 const CAP_COMPANION_BLE: &str = "companion-ble";
+
+/// The write end of the pipe that [`catch_termination`] returns the other end of.
+static TERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_termination(_: libc::c_int) {
+    let fd = TERM_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: `write` may be called from a signal handler; the byte is a live local.
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// From now on `SIGTERM` and `SIGINT` make the returned descriptor readable instead of ending the
+/// process at once, for [`Daemon::watch_termination`]. By a pipe, and not a flag, because the daemon
+/// can be blocked in `poll` with no timeout and the signal can come just before it gets there.
+pub fn catch_termination() -> io::Result<RawFd> {
+    let mut fds = [0; 2];
+    // SAFETY: a live array of two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    TERM_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler above does only what a handler may.
+        if unsafe { libc::signal(signal, on_termination as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fds[0])
+}
 
 /// The session's language, as the launcher's.
 fn wifi_setup_lang(locale: Option<i32>) -> wifi_setup::http::Lang {
@@ -966,6 +1003,9 @@ impl Daemon {
             owns_socket,
             peers: opts.peers.clone(),
             privileged_uids: opts.privileged_uids.clone(),
+            wifi_setup_was_active: false,
+            term_fd: None,
+            terminating: false,
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -1026,8 +1066,9 @@ impl Daemon {
             d.policy.screen(),
         );
         // A session left by a daemon that died must not outlive it: its access point goes first.
-        if let (Some(w), Some(r)) = (&d.wifi_setup, &mut d.radio) {
-            w.cleanup_stale(r);
+        if let (Some(w), Some(r)) = (&mut d.wifi_setup, &mut d.radio) {
+            let u = w.cleanup_stale(r, now().mono_us);
+            d.wifi_setup_update(u);
         }
         // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
         // off by default and a prior run's state does not leak in.
@@ -1043,9 +1084,20 @@ impl Daemon {
 
     /// Runs forever (until a fatal error).
     pub fn run(&mut self) -> io::Result<()> {
-        loop {
+        while !self.terminating {
             self.step()?;
         }
+        info!("exiting on a signal");
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            w.shutdown(r);
+        }
+        Ok(())
+    }
+
+    /// `run` returns, after ending what must not outlive the daemon, when `fd` is readable. See
+    /// [`catch_termination`].
+    pub fn watch_termination(&mut self, fd: RawFd) {
+        self.term_fd = Some(fd);
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -1071,6 +1123,9 @@ impl Daemon {
             self.hub.next_deadline(),
             self.battery_deadline,
             self.wifi_setup.as_ref().and_then(WifiSetup::next_deadline),
+            self.radio
+                .as_ref()
+                .and_then(Radio::association_next_deadline),
             self.companion.as_ref().and_then(|c| {
                 // Wall clock to the monotonic base, and never a busy loop.
                 let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
@@ -1141,6 +1196,7 @@ impl Daemon {
             CompanionConn(companion::ConnId),
             BleEngine,
             WifiSetup,
+            Terminate,
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -1210,6 +1266,9 @@ impl Daemon {
                 add(fd, events, Src::WifiSetup);
             }
         }
+        if let Some(fd) = self.term_fd {
+            add(fd, libc::POLLIN, Src::Terminate);
+        }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -1242,6 +1301,7 @@ impl Daemon {
             }
             match src {
                 Src::Listener => self.accept(),
+                Src::Terminate => self.terminating = true,
                 Src::Touchpad => self.read_touchpad(),
                 Src::WifiSetup => {
                     let t = now().mono_us;
@@ -1391,6 +1451,9 @@ impl Daemon {
         if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
             let u = w.tick(r, t.mono_us);
             self.wifi_setup_update(u);
+        }
+        if let Some(r) = &mut self.radio {
+            r.association_tick(t.mono_us);
         }
         self.run_mock_commands();
     }
@@ -2621,8 +2684,16 @@ impl Daemon {
     fn wifi_setup_update(&mut self, u: wifi_setup::Update) {
         let active = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
         self.power_policy.set_held(active);
-        if active && let Some(power) = &mut self.power_io {
-            power.stay_awake();
+        if active != self.wifi_setup_was_active {
+            self.wifi_setup_was_active = active;
+            if active && let Some(power) = &mut self.power_io {
+                power.stay_awake();
+            }
+            let events = match &mut self.companion {
+                Some(c) => c.set_tcp_closed(active),
+                None => Vec::new(),
+            };
+            self.companion_events(events);
         }
         if let Some(state) = u.state {
             self.publish(service_frame::Body::WifiSetupState(state));

@@ -73,12 +73,8 @@ pub struct Listeners {
 }
 
 impl Listeners {
-    /// Binds the enabled listeners. TCP binds `0.0.0.0:port`; RFCOMM binds
-    /// [`DEFAULT_RFCOMM_CHANNEL`] when built with `linux-bt`. A listener that cannot bind is
-    /// logged and skipped (best effort), so one transport being unavailable never stops the
-    /// other.
-    pub fn bind(tcp_port: Option<u16>, bt: bool) -> Listeners {
-        let tcp = tcp_port.and_then(|port| match TcpListener::bind(("0.0.0.0", port)) {
+    fn bind_tcp(tcp_port: Option<u16>) -> Option<TcpListener> {
+        tcp_port.and_then(|port| match TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => {
                 let _ = l.set_nonblocking(true);
                 crate::info!("companion: TCP listening on 0.0.0.0:{port}");
@@ -88,7 +84,26 @@ impl Listeners {
                 crate::warn!("companion: cannot bind TCP :{port} ({e})");
                 None
             }
-        });
+        })
+    }
+
+    /// The port TCP listens on, if it does.
+    #[cfg(test)]
+    pub fn tcp_port(&self) -> Option<u16> {
+        self.tcp.as_ref()?.local_addr().ok().map(|a| a.port())
+    }
+
+    /// Closes the TCP listener, or binds it again. The others are not on the same networks.
+    pub fn set_tcp(&mut self, tcp_port: Option<u16>) {
+        self.tcp = Self::bind_tcp(tcp_port);
+    }
+
+    /// Binds the enabled listeners. TCP binds `0.0.0.0:port`; RFCOMM binds
+    /// [`DEFAULT_RFCOMM_CHANNEL`] when built with `linux-bt`. A listener that cannot bind is
+    /// logged and skipped (best effort), so one transport being unavailable never stops the
+    /// other.
+    pub fn bind(tcp_port: Option<u16>, bt: bool) -> Listeners {
+        let tcp = Self::bind_tcp(tcp_port);
         #[cfg(feature = "linux-bt")]
         let bt = bt.then(bt::RfcommListener::bind).and_then(|r| match r {
             Ok(l) => {

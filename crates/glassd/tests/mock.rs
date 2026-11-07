@@ -1621,3 +1621,59 @@ fn wifi_setup_session_over_the_socket_logs_no_password() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sigterm_ends_a_wifi_setup_session_and_the_daemon_cleanly() {
+    use glass_api::proto::{WifiSetupPhase, WifiSetupRequest};
+    let dir = test_dir("wifi-setup-term");
+    let socket = dir.join("glassd.sock");
+    let mut child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .args(["--mock", "--socket"])
+            .arg(&socket)
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    );
+    let _stdin = child.0.stdin.take();
+    let deadline = Instant::now() + T;
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "no socket");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut c = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
+    c.subscribe(&[Topic::WifiSetup, Topic::Settings]).unwrap();
+    set_settings(
+        &mut c,
+        Settings {
+            wifi_setup_ap_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    c.send(Body2::WifiSetup(WifiSetupRequest { start: true }))
+        .unwrap();
+    c.recv_until(T, |f| {
+        wifi_setup(f).is_some_and(|s| s.phase == WifiSetupPhase::Serving as i32)
+    })
+    .unwrap()
+    .unwrap();
+    let run = dir.join("state").join("mock-ap");
+    assert!(run.exists());
+
+    // SAFETY: a signal to a child of this test, not yet reaped.
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + T;
+    let status = loop {
+        if let Some(s) = child.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "still running");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(!run.exists(), "the session went with it");
+    assert!(!socket.exists(), "and so did the socket");
+    let _ = std::fs::remove_dir_all(&dir);
+}

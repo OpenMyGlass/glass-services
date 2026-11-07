@@ -59,6 +59,14 @@ impl ApPaths {
     }
 }
 
+/// What the access point runs with.
+#[derive(Clone, Copy)]
+pub struct ApCredentials<'a> {
+    pub ssid: &'a str,
+    pub password: &'a str,
+    pub entropy: &'a [u8],
+}
+
 /// Why the access point could not come up. `code` is what the launcher gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApError {
@@ -72,6 +80,8 @@ pub enum ApError {
     LinkUp,
     /// The firmware came up in a mode other than AP.
     WrongMode(u32),
+    /// The kernel log does not say what mode the firmware came up in.
+    UnknownMode,
     /// The address could not be set, or the page could not be bound.
     Serve,
 }
@@ -83,7 +93,7 @@ impl ApError {
             ApError::NoFirmware => super::ERR_NO_FIRMWARE,
             ApError::Files => super::ERR_FILES,
             ApError::LinkUp => super::ERR_LINK_UP,
-            ApError::WrongMode(_) => super::ERR_FIRMWARE_MODE,
+            ApError::WrongMode(_) | ApError::UnknownMode => super::ERR_FIRMWARE_MODE,
             ApError::Serve => super::ERR_SERVE,
         }
     }
@@ -157,7 +167,8 @@ impl Radio {
         if !paths.stock_firmware.exists() || !paths.firmware_param.exists() {
             return Err(ApError::NoFirmware);
         }
-        let tools = "command -v hostapd >/dev/null && command -v busybox-extras >/dev/null";
+        let tools = "command -v hostapd >/dev/null && command -v busybox-extras >/dev/null \
+                     && command -v timeout >/dev/null";
         if !self.step("sh", &["-c", tools]) {
             return Err(ApError::NoTools);
         }
@@ -169,13 +180,21 @@ impl Radio {
     ///
     /// The password is in a file in a private directory and never on a command line, where any
     /// process could read it and [`Radio::step`] would log it on a failure.
+    ///
+    /// `limit_s` bounds the daemons by themselves, for a glassd that dies without telling them.
+    /// `check_mode`: the firmware's mode must be in the kernel log, and be AP.
     pub fn ap_start(
         &mut self,
         paths: &ApPaths,
-        ssid: &str,
-        password: &str,
-        entropy: &[u8],
+        creds: ApCredentials<'_>,
+        limit_s: u64,
+        check_mode: bool,
     ) -> Result<(), ApError> {
+        let ApCredentials {
+            ssid,
+            password,
+            entropy,
+        } = creds;
         let iface = self.wifi_iface().to_string();
         let files = |paths: &ApPaths| -> io::Result<()> {
             remove_run_dir(&paths.run_dir)?;
@@ -206,15 +225,21 @@ impl Radio {
         if !self.step("ip", &["link", "set", &iface, "up"]) {
             return Err(ApError::LinkUp);
         }
-        match self.firmware_mode() {
-            Some(OP_MODE_AP) => {}
-            Some(mode) => return Err(ApError::WrongMode(mode)),
-            None => warn!("wifi-setup: the firmware's mode is not in the kernel log"),
+        if check_mode {
+            match self.firmware_mode() {
+                Some(OP_MODE_AP) => {}
+                Some(mode) => return Err(ApError::WrongMode(mode)),
+                // The line was written less than a second ago. Going on without it would be to
+                // trust an AP-ENABLED that the default mode also logs.
+                None => return Err(ApError::UnknownMode),
+            }
         }
         // Through a shell for the pid and the log, with the output closed: the runner waits for
-        // its pipe to close. Not `-d`, which logs handshake details.
+        // its pipe to close. Not `-d`, which logs handshake details. Appending, so that the log
+        // can be cut short while it is being written. Busybox's `timeout` becomes the program it
+        // runs, so the pid is hostapd's.
         let run = format!(
-            "hostapd -e {entropy} {conf} >{log} 2>&1 & echo $! >{pid}",
+            "timeout -s TERM {limit_s} hostapd -e {entropy} {conf} >>{log} 2>&1 & echo $! >{pid}",
             entropy = paths.file("hostapd.entropy").display(),
             conf = paths.file("hostapd.conf").display(),
             log = paths.hostapd_log().display(),
@@ -234,7 +259,7 @@ impl Radio {
     }
 
     /// `hostapd` has the access point up: gives it its address and a DHCP server.
-    pub fn ap_serve(&mut self, paths: &ApPaths) -> Result<(), ApError> {
+    pub fn ap_serve(&mut self, paths: &ApPaths, limit_s: u64) -> Result<(), ApError> {
         let iface = self.wifi_iface().to_string();
         self.step("ip", &["addr", "flush", "dev", &iface]);
         let address = format!("{AP_IP}/{AP_PREFIX}");
@@ -243,7 +268,7 @@ impl Radio {
         }
         // Alpine's busybox has no udhcpd: it is in busybox-extras.
         let run = format!(
-            "busybox-extras udhcpd -f {conf} >/dev/null 2>&1 & echo $! >{pid}",
+            "timeout -s TERM {limit_s} busybox-extras udhcpd -f {conf} >/dev/null 2>&1 & echo $! >{pid}",
             conf = paths.file("udhcpd.conf").display(),
             pid = paths.file("udhcpd.pid").display(),
         );
@@ -251,23 +276,20 @@ impl Radio {
         Ok(())
     }
 
-    /// Whether `hostapd` still runs. Without its pid file (not started yet) it counts as running.
+    /// Whether `hostapd` still runs. Without its pid file (not started yet) it counts as running;
+    /// a file with no pid in it does not: `/proc/` itself always exists.
     pub fn ap_alive(&self, paths: &ApPaths) -> bool {
-        let Ok(pid) = fs::read_to_string(paths.hostapd_pid()) else {
+        let Ok(text) = fs::read_to_string(paths.hostapd_pid()) else {
             return true;
         };
-        Path::new("/proc").join(pid.trim()).exists()
+        let pids = pids_in(&text);
+        !pids.is_empty() && pids.iter().all(|p| pid_exists(p))
     }
 
     /// Stops the daemons, so that `hostapd` can tell the clients and leave the firmware clean.
     /// Then wait, then [`Radio::ap_teardown`].
     pub fn ap_stop_daemons(&mut self, paths: &ApPaths) {
-        let pids = [paths.hostapd_pid(), paths.file("udhcpd.pid")]
-            .iter()
-            .filter_map(|p| fs::read_to_string(p).ok())
-            .flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
-            .collect::<Vec<_>>();
+        let pids = daemon_pids(paths);
         if !pids.is_empty() {
             let mut args = vec!["-TERM"];
             args.extend(pids.iter().map(String::as_str));
@@ -279,6 +301,16 @@ impl Radio {
     /// otherwise seem to have an address at once), the firmware, the name in the driver.
     pub fn ap_teardown(&mut self, paths: &ApPaths) {
         let iface = self.wifi_iface().to_string();
+        // What did not take the hint has had its time.
+        let left: Vec<String> = daemon_pids(paths)
+            .into_iter()
+            .filter(|p| pid_exists(p))
+            .collect();
+        if !left.is_empty() {
+            let mut args = vec!["-KILL"];
+            args.extend(left.iter().map(String::as_str));
+            self.step("kill", &args);
+        }
         self.step("ip", &["addr", "flush", "dev", &iface]);
         self.step("ip", &["link", "set", &iface, "down"]);
         // As `echo "" > firmware_path` in the experiments. A lone newline, not nothing: on the
@@ -290,15 +322,26 @@ impl Radio {
             warn!("wifi-setup: cannot remove the session's files ({e})");
         }
     }
+}
 
-    /// A session left behind by a daemon that died: ends it, if there is one. For the start.
-    pub fn ap_cleanup_stale(&mut self, paths: &ApPaths) {
-        if paths.run_dir.exists() {
-            warn!("wifi-setup: ending a session left by an earlier run");
-            self.ap_stop_daemons(paths);
-            self.ap_teardown(paths);
-        }
-    }
+/// The whole numbers in a pid file: nothing else may become an argument of `kill`.
+fn pids_in(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn pid_exists(pid: &str) -> bool {
+    Path::new("/proc").join(pid).exists()
+}
+
+fn daemon_pids(paths: &ApPaths) -> Vec<String> {
+    [paths.hostapd_pid(), paths.file("udhcpd.pid")]
+        .iter()
+        .filter_map(|p| fs::read_to_string(p).ok())
+        .flat_map(|text| pids_in(&text))
+        .collect()
 }
 
 fn remove_run_dir(dir: &Path) -> io::Result<()> {
@@ -328,20 +371,60 @@ pub struct LogView {
     pub clients: u32,
 }
 
-pub fn read_log(text: &str) -> LogView {
-    let mut v = LogView::default();
-    for line in text.lines() {
-        if line.contains("AP-ENABLED") {
-            v.enabled = true;
-        } else if line.contains("AP-DISABLED") {
-            v.disabled = true;
-        } else if line.contains("AP-STA-CONNECTED") {
-            v.clients += 1;
-        } else if line.contains("AP-STA-DISCONNECTED") {
-            v.clients = v.clients.saturating_sub(1);
+impl LogView {
+    fn feed(&mut self, text: &str) {
+        for line in text.lines() {
+            if line.contains("AP-ENABLED") {
+                self.enabled = true;
+            } else if line.contains("AP-DISABLED") {
+                self.disabled = true;
+            } else if line.contains("AP-STA-CONNECTED") {
+                self.clients += 1;
+            } else if line.contains("AP-STA-DISCONNECTED") {
+                self.clients = self.clients.saturating_sub(1);
+            }
         }
     }
-    v
+}
+
+/// The log, read only where it had got to, and cut short when it gets long: a device going on and
+/// off the access point adds to it for as long as a session runs, in RAM.
+#[derive(Debug, Default)]
+pub struct LogReader {
+    offset: u64,
+    view: LogView,
+}
+
+/// The log is cut at this size.
+const LOG_KEEP: u64 = 64 * 1024;
+
+impl LogReader {
+    /// What the log says, with what was added since the last call.
+    pub fn poll(&mut self, path: &Path) -> LogView {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = fs::File::options().read(true).write(true).open(path) else {
+            return self.view;
+        };
+        let mut new = Vec::new();
+        let read = file
+            .seek(SeekFrom::Start(self.offset))
+            .and_then(|_| (&mut file).take(LOG_KEEP).read_to_end(&mut new));
+        if read.is_err() {
+            return self.view;
+        }
+        // A line still being written waits for the next call.
+        let Some(whole) = new.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+            return self.view;
+        };
+        self.view.feed(&String::from_utf8_lossy(&new[..whole]));
+        self.offset += whole as u64;
+        // Only with nothing left to read, or the cut would lose it.
+        let at_end = file.metadata().is_ok_and(|m| m.len() == self.offset);
+        if self.offset >= LOG_KEEP && at_end && file.set_len(0).is_ok() {
+            self.offset = 0;
+        }
+        self.view
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +446,71 @@ mod tests {
         assert!(c.contains("\nssid=OMG-Glass-ab12\n") && c.ends_with("wpa_passphrase=pw\n"));
         assert!(!c.contains("country_code"));
         assert!(!c.contains("TKIP"));
+    }
+
+    fn read_log(text: &str) -> LogView {
+        let mut v = LogView::default();
+        v.feed(text);
+        v
+    }
+
+    #[test]
+    fn the_log_is_read_from_where_it_got_to_and_stays_short() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("log");
+        let mut w = fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut r = LogReader::default();
+        assert_eq!(r.poll(&d.path().join("absent")), LogView::default());
+        write!(w, "wlan0: AP-ENABLED \nwlan0: AP-STA-CONN").unwrap();
+        let v = r.poll(&path);
+        assert!(v.enabled);
+        assert_eq!(v.clients, 0, "half a line waits");
+        writeln!(w, "ECTED aa").unwrap();
+        assert_eq!(r.poll(&path).clients, 1);
+        assert_eq!(r.poll(&path).clients, 1, "a line counts once");
+
+        // Much more than the limit, with the count kept across the cuts.
+        for i in 0..20_000 {
+            let e = if i % 2 == 0 { "DIS" } else { "" };
+            writeln!(w, "wlan0: AP-STA-{e}CONNECTED aa:bb:cc:dd:ee:ff").unwrap();
+            if i % 500 == 0 {
+                r.poll(&path);
+            }
+        }
+        for _ in 0..50 {
+            r.poll(&path);
+        }
+        assert_eq!(r.poll(&path).clients, 1);
+        assert!(r.poll(&path).enabled);
+        assert!(fs::metadata(&path).unwrap().len() < 2 * LOG_KEEP);
+        writeln!(w, "wlan0: AP-DISABLED ").unwrap();
+        assert!(
+            r.poll(&path).disabled,
+            "written after a cut, and still found"
+        );
+    }
+
+    #[test]
+    fn a_pid_file_without_a_pid_is_not_a_running_daemon() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = ApPaths {
+            run_dir: d.path().to_path_buf(),
+            firmware_param: d.path().join("p"),
+            stock_firmware: d.path().join("f"),
+        };
+        let r = Radio::recording("wlan0", Default::default());
+        assert!(r.ap_alive(&paths), "not started yet");
+        for dead in ["", "\n", "x\n"] {
+            fs::write(paths.hostapd_pid(), dead).unwrap();
+            assert!(!r.ap_alive(&paths), "{dead:?}");
+        }
+        fs::write(paths.hostapd_pid(), format!("{}\n", std::process::id())).unwrap();
+        assert!(r.ap_alive(&paths));
     }
 
     #[test]

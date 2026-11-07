@@ -7,9 +7,10 @@
 //! Glass goes:
 //!
 //! ```text
-//! Off -> Settling -> Starting -> Serving -> Leaving -> Joining -> Off (joined or failed)
-//!                        \            \___ timeout, cancel ___> Leaving -> Off
-//!                         \___ no AP-ENABLED ________________> Leaving -> Off
+//! Off -> Settling -> Starting -> Serving -> Flushing -> Leaving -> Joining -> Off (joined)
+//!                        \            \___ timeout, cancel ___> Leaving -> Off        |
+//!                         \___ no AP-ENABLED ________________> Leaving -> Off        |
+//!                                                                 ^___ no lease, cancel
 //! ```
 //!
 //! The password of the access point and the password that is typed are never logged: this module
@@ -57,6 +58,7 @@ const PASSWORD_LEN: usize = 12;
 const _: () = assert!(PASSWORD_LEN >= 8, "WPA2 needs at least 8");
 /// hostapd's entropy file: its counter (2 is "ready") and 20 bytes for its pool.
 const ENTROPY_LEN: usize = 21;
+const DAEMONS_MARGIN_S: u64 = 30;
 /// How often the `hostapd` log and the join are checked.
 const CHECK_US: u64 = 1_000_000;
 
@@ -73,6 +75,15 @@ pub struct Timeouts {
     pub flush_us: u64,
     /// To get a lease from the new network.
     pub join_us: u64,
+}
+
+impl Timeouts {
+    /// How long `hostapd` and `udhcpd` may run at all. This is what ends the access point when
+    /// the daemon was killed and not restarted: a whole session, with a margin for the daemon
+    /// to get there first.
+    pub fn daemons_limit_s(&self) -> u64 {
+        (self.enable_us + self.session_us + self.flush_us) / 1_000_000 + DAEMONS_MARGIN_S
+    }
 }
 
 impl Default for Timeouts {
@@ -167,8 +178,21 @@ fn generate(lang: Lang) -> Result<Credentials, getrandom::Error> {
 #[derive(Debug)]
 enum Then {
     Join(Network),
-    /// Back to what the settings say, with this error if it is not `None`.
-    Restore(Option<&'static str>),
+    /// Back to what the settings say, with this error if it is not `None`, about this network
+    /// if there was one.
+    Restore {
+        error: Option<&'static str>,
+        network: String,
+    },
+}
+
+impl Then {
+    fn restore(error: Option<&'static str>) -> Then {
+        Then::Restore {
+            error,
+            network: String::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -244,6 +268,7 @@ pub struct Update {
 pub struct WifiSetup {
     cfg: Config,
     phase: Phase,
+    log: ap::LogReader,
 }
 
 fn state(phase: WifiSetupPhase) -> WifiSetupState {
@@ -269,6 +294,7 @@ impl WifiSetup {
         WifiSetup {
             cfg,
             phase: Phase::Off,
+            log: ap::LogReader::default(),
         }
     }
 
@@ -281,11 +307,42 @@ impl WifiSetup {
         self.cfg.wifi_conf.with_file_name(TRIED_CONF)
     }
 
-    /// What a session left in the state directory, and in the driver, if a daemon died in it.
-    pub fn cleanup_stale(&self, radio: &mut Radio) {
-        radio.ap_cleanup_stale(&self.cfg.paths);
-        // A network that was being tried holds a password and was never confirmed.
-        let _ = std::fs::remove_file(self.tried_conf());
+    /// Ends what a daemon that died in a session left: the daemons, or the supplicant and the DHCP
+    /// client if it was already joining, with the same waits as any other end. `radio` knows
+    /// nothing of those; the files tell. For the daemon's start.
+    pub fn cleanup_stale(&mut self, radio: &mut Radio, now_us: u64) -> Update {
+        let ap = self.cfg.paths.run_dir.exists();
+        let joining = self.tried_conf().exists();
+        if !ap && !joining {
+            return Update::default();
+        }
+        warn!("wifi-setup: ending a session left by an earlier run");
+        radio.hold_wifi();
+        if joining {
+            radio.stop_stale_association();
+            // It holds a password, and was never confirmed.
+            let _ = std::fs::remove_file(self.tried_conf());
+        }
+        self.leave(radio, Then::restore(None), now_us)
+    }
+
+    /// The daemon is exiting: ends the session now, waiting here since there is no later.
+    pub fn shutdown(&mut self, radio: &mut Radio) {
+        if !self.active() {
+            return;
+        }
+        info!("wifi-setup: ending the session for the exit");
+        radio.ap_stop_daemons(&self.cfg.paths);
+        if matches!(self.phase, Phase::Joining { .. }) || self.tried_conf().exists() {
+            radio.stop_association();
+            let _ = std::fs::remove_file(self.tried_conf());
+        }
+        std::thread::sleep(std::time::Duration::from_micros(
+            self.cfg.timeouts.settle_us,
+        ));
+        radio.ap_teardown(&self.cfg.paths);
+        radio.release_wifi();
+        self.phase = Phase::Off;
     }
 
     /// The state to tell a client asking now.
@@ -316,7 +373,7 @@ impl WifiSetup {
                     network: network.ssid.clone(),
                     ..state(WifiSetupPhase::Joining)
                 },
-                Then::Restore(_) => state(WifiSetupPhase::Stopping),
+                Then::Restore { .. } => state(WifiSetupPhase::Stopping),
             },
             Phase::Joining { ssid, .. } => WifiSetupState {
                 network: ssid.clone(),
@@ -362,6 +419,7 @@ impl WifiSetup {
             }
         };
         info!("wifi-setup: starting");
+        self.log = ap::LogReader::default();
         radio.hold_wifi();
         radio.ap_prepare();
         self.phase = Phase::Settling {
@@ -374,20 +432,36 @@ impl WifiSetup {
 
     /// `WifiSetupRequest{start: false}`, the setting going off, or airplane mode.
     pub fn stop(&mut self, radio: &mut Radio, now_us: u64) -> Update {
-        match &self.phase {
-            Phase::Off | Phase::Leaving { .. } => return self.publish_current(now_us),
+        match &mut self.phase {
+            Phase::Off => return self.publish_current(now_us),
+            // Already going. One that was to join afterwards must not: that would turn the radio
+            // on for a minute and could replace the network, after a cancel or in airplane mode.
+            Phase::Leaving { then, .. } => {
+                if matches!(then, Then::Join(_)) {
+                    info!("wifi-setup: the network will not be joined");
+                    *then = Then::restore(None);
+                }
+                return self.publish_current(now_us);
+            }
             Phase::Joining { .. } => {
-                radio.abandon_join(self.cfg.wifi_conf.clone());
-                let _ = std::fs::remove_file(self.tried_conf());
-                self.phase = Phase::Off;
-                return Update {
-                    state: Some(state(WifiSetupPhase::Off)),
-                    finished: Some(Finished::Restore),
-                };
+                return self.abandon_join(radio, Then::restore(None), now_us);
             }
             _ => {}
         }
-        self.leave(radio, Then::Restore(None), now_us)
+        self.leave(radio, Then::restore(None), now_us)
+    }
+
+    /// Stops trying the network, keeping the old one. The radio goes back after the wait for the
+    /// supplicant to go.
+    fn abandon_join(&mut self, radio: &mut Radio, then: Then, now_us: u64) -> Update {
+        radio.abandon_join(self.cfg.wifi_conf.clone());
+        let _ = std::fs::remove_file(self.tried_conf());
+        self.phase = Phase::Leaving {
+            until: now_us + self.cfg.timeouts.settle_us,
+            downed: true,
+            then,
+        };
+        self.publish_current(now_us)
     }
 
     fn leave(&mut self, radio: &mut Radio, then: Then, now_us: u64) -> Update {
@@ -404,7 +478,7 @@ impl WifiSetup {
         if let ApError::WrongMode(mode) = e {
             warn!("wifi-setup: the firmware came up in mode {mode}, not AP");
         }
-        self.leave(radio, Then::Restore(Some(e.code())), now_us)
+        self.leave(radio, Then::restore(Some(e.code())), now_us)
     }
 
     /// When [`WifiSetup::tick`] next has work (`CLOCK_MONOTONIC` µs).
@@ -485,12 +559,13 @@ impl WifiSetup {
                 Update::default()
             }
             Phase::Settling { creds, .. } => {
-                match radio.ap_start(
-                    &self.cfg.paths,
-                    &creds.ssid,
-                    &creds.password,
-                    &creds.entropy,
-                ) {
+                let run = ap::ApCredentials {
+                    ssid: &creds.ssid,
+                    password: &creds.password,
+                    entropy: &creds.entropy,
+                };
+                let limit = self.cfg.timeouts.daemons_limit_s();
+                match radio.ap_start(&self.cfg.paths, run, limit, !self.cfg.assume_enabled) {
                     Ok(()) => {
                         self.phase = Phase::Starting {
                             until: now_us + self.cfg.timeouts.enable_us,
@@ -546,7 +621,8 @@ impl WifiSetup {
     ) -> Update {
         let view = self.log_view();
         if view.enabled || self.cfg.assume_enabled {
-            if let Err(e) = radio.ap_serve(&self.cfg.paths) {
+            let limit = self.cfg.timeouts.daemons_limit_s();
+            if let Err(e) = radio.ap_serve(&self.cfg.paths, limit) {
                 return self.fail_start(radio, e, now_us);
             }
             let portal = match Portal::bind(&self.cfg.binding, creds.token.clone(), creds.lang) {
@@ -568,7 +644,7 @@ impl WifiSetup {
         }
         if view.disabled || now_us >= until || !radio.ap_alive(&self.cfg.paths) {
             warn!("wifi-setup: the access point did not come up");
-            return self.leave(radio, Then::Restore(Some(ERR_AP)), now_us);
+            return self.leave(radio, Then::restore(Some(ERR_AP)), now_us);
         }
         self.phase = Phase::Starting {
             until,
@@ -589,12 +665,12 @@ impl WifiSetup {
     ) -> Update {
         if now_us >= until {
             info!("wifi-setup: timed out");
-            return self.leave(radio, Then::Restore(Some(ERR_TIMEOUT)), now_us);
+            return self.leave(radio, Then::restore(Some(ERR_TIMEOUT)), now_us);
         }
         let view = self.log_view();
         if view.disabled || !radio.ap_alive(&self.cfg.paths) {
             warn!("wifi-setup: the access point stopped");
-            return self.leave(radio, Then::Restore(Some(ERR_AP)), now_us);
+            return self.leave(radio, Then::restore(Some(ERR_AP)), now_us);
         }
         portal.0.expire(now_us);
         self.phase = Phase::Serving {
@@ -613,10 +689,11 @@ impl WifiSetup {
 
     fn after_leaving(&mut self, radio: &mut Radio, then: Then, now_us: u64) -> Update {
         match then {
-            Then::Restore(error) => {
+            Then::Restore { error, network } => {
                 radio.release_wifi();
+                let end = error.map_or(state(WifiSetupPhase::Off), failed);
                 Update {
-                    state: Some(error.map_or(state(WifiSetupPhase::Off), failed)),
+                    state: Some(WifiSetupState { network, ..end }),
                     finished: Some(Finished::Restore),
                 }
             }
@@ -641,8 +718,13 @@ impl WifiSetup {
     ) -> Update {
         if radio.wifi_ip().is_some() {
             if let Err(e) = ap::install_conf(&self.tried_conf(), &self.cfg.wifi_conf) {
-                // It works for now; it just will not be there after a reboot.
+                // Saying "joined" would be saying it is kept. And the tried file has the password.
                 warn!("wifi-setup: cannot store the network ({e})");
+                let then = Then::Restore {
+                    error: Some(ERR_FILES),
+                    network: ssid,
+                };
+                return self.abandon_join(radio, then, now_us);
             }
             radio.finish_join(self.cfg.wifi_conf.clone());
             info!("wifi-setup: joined");
@@ -656,15 +738,11 @@ impl WifiSetup {
         }
         if now_us >= until {
             info!("wifi-setup: no lease from the network");
-            radio.abandon_join(self.cfg.wifi_conf.clone());
-            let _ = std::fs::remove_file(self.tried_conf());
-            return Update {
-                state: Some(WifiSetupState {
-                    network: ssid,
-                    ..failed(ERR_JOIN)
-                }),
-                finished: Some(Finished::Restore),
+            let then = Then::Restore {
+                error: Some(ERR_JOIN),
+                network: ssid,
             };
+            return self.abandon_join(radio, then, now_us);
         }
         self.phase = Phase::Joining {
             until,
@@ -674,11 +752,8 @@ impl WifiSetup {
         Update::default()
     }
 
-    fn log_view(&self) -> ap::LogView {
-        match std::fs::read_to_string(self.cfg.paths.hostapd_log()) {
-            Ok(text) => ap::read_log(&text),
-            Err(_) => ap::LogView::default(),
-        }
+    fn log_view(&mut self) -> ap::LogView {
+        self.log.poll(&self.cfg.paths.hostapd_log())
     }
 }
 

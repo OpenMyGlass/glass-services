@@ -216,7 +216,11 @@ impl Portal {
                 }
             }
             match http::handle(&self.site, &c.input) {
-                Handled::NeedMore if eof => return (true, None),
+                // Full and still not whole: it would stay readable with nothing reading it, and
+                // the loop would spin. `http::handle` should not let this happen.
+                Handled::NeedMore if eof || c.input.len() >= http::MAX_REQUEST => {
+                    return (true, None);
+                }
                 Handled::NeedMore => return (false, None),
                 Handled::Respond(out) => c.output = out,
                 Handled::Accepted(_, _) if closing => c.output = http::closing(),

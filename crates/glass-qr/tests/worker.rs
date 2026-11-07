@@ -106,13 +106,23 @@ fn a_worker_that_takes_the_frame_and_hangs_is_killed() {
 fn a_scripted_answer_in_protocol_is_taken() {
     let (frame, view) = code_frame();
     let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
-    let mut w = sh("head -c 307212 >/dev/null; printf '\\000\\000'; sleep 5");
+    let mut w = sh("head -c 307212 >/dev/null; printf '\\000\\000\\000\\002\\000'; sleep 5");
     assert!(matches!(w.scan(f), Ok(Scan::NoCode)));
-    let mut w = sh("head -c 307212 >/dev/null; printf '\\005\\000'; sleep 5");
+    let mut w = sh("head -c 307212 >/dev/null; printf '\\005\\000\\017\\002\\000'; sleep 5");
     assert!(
         matches!(w.scan(f), Ok(Scan::Ambiguous)),
         "more grids than MAX_CODES"
     );
+    // At the caps, which the protocol allows, the frame is refused as ambiguous.
+    for answer in ["\\000\\000\\040\\002\\000", "\\000\\000\\003\\376\\377"] {
+        let script = format!("head -c 307212 >/dev/null; printf '{answer}'; sleep 5");
+        let mut w = Worker::new(move || {
+            let mut c = Command::new("sh");
+            c.args(["-c", &script]);
+            c
+        });
+        assert!(matches!(w.scan(f), Ok(Scan::Ambiguous)), "{answer}");
+    }
 }
 
 #[test]
@@ -120,11 +130,13 @@ fn a_worker_out_of_protocol_is_a_failure() {
     let (frame, view) = code_frame();
     let f = Frame::new(&frame, view.width, view.height, view.width).unwrap();
     for script in [
-        "exit 0",                                                     // dies at once
-        "head -c 307212 >/dev/null; printf '\\011\\000'", // more grids than quircs gives
-        "head -c 307212 >/dev/null; printf '\\001\\002'", // more texts than grids
-        "head -c 307212 >/dev/null; printf '\\001\\001\\377\\377'", // a text longer than allowed
-        "head -c 307212 >/dev/null; printf '\\001\\001\\005\\000ab'", // cut short
+        "exit 0",                                                                    // dies at once
+        "head -c 307212 >/dev/null; printf '\\011\\000\\000\\002\\000'", // more grids than quircs gives
+        "head -c 307212 >/dev/null; printf '\\001\\002\\003\\002\\000'", // more texts than grids
+        "head -c 307212 >/dev/null; printf '\\001\\000\\041\\002\\000'", // 33 finder patterns
+        "head -c 307212 >/dev/null; printf '\\001\\000\\003\\377\\377'", // 65535 regions
+        "head -c 307212 >/dev/null; printf '\\001\\001\\003\\002\\000\\377\\377'", // text too long
+        "head -c 307212 >/dev/null; printf '\\001\\001\\003\\002\\000\\005\\000ab'", // cut short
     ] {
         let mut w = sh(script).with_deadline(Duration::from_secs(2));
         assert_eq!(w.scan(f).err(), Some(WorkerError::Failed), "{script}");

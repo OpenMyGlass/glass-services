@@ -37,6 +37,18 @@ pub const MAX_CODES: usize = 4;
 /// The most grids `quircs` reports for a frame; it ignores any more. A frame where it reached this
 /// is beyond [`MAX_CODES`] anyway.
 pub const DECODER_MAX_GRIDS: usize = 8;
+/// The most finder patterns `quircs` keeps (`record_capstone`); it drops any more without a word,
+/// so a code below a row of them would go unseen.
+pub const DECODER_MAX_CAPSTONES: usize = 32;
+/// The most dark regions `quircs` labels (`region_code`), counting its two reserved ones; past it,
+/// it finds no more finder patterns.
+pub const DECODER_MAX_REGIONS: usize = 65_534;
+/// Finder patterns that [`MAX_CODES`] codes, 3 each, and a margin of 8 can explain. The margin is
+/// for patterns a scene can make by chance: in the synthetic frames of the tests a code alone gives
+/// its 3 and no more, and alignment patterns, of another shape, are not counted. More than this
+/// is a frame built to hide something, or too busy to trust; it was chosen, not measured on real
+/// scenes, and the Glass scene test should check it.
+pub const MAX_CAPSTONES_EXPLAINED: usize = 3 * MAX_CODES + 8;
 
 /// One luma plane, 8 bits per pixel. Printing one shows its size, not what the camera saw.
 #[derive(Clone, Copy)]
@@ -120,29 +132,43 @@ pub enum Scan {
     /// Codes that are not valid setup codes, and the reason for the last one. Keep scanning: a
     /// link on a poster in view must not end the scan.
     Refused(SetupError),
-    /// Two different valid setup codes, or more than [`MAX_CODES`] codes of any kind. Nothing is
-    /// offered: a sticker next to the real code must not win by being read first, nor by hiding the
-    /// real code behind junk. Keep scanning, and say why nothing is offered.
+    /// Nothing offered, because the frame may hide a code. A sticker next to the real code must
+    /// not win by being read first, nor by crowding the real code out of the decoder. So:
     ///
-    /// This cannot catch a real code too blurred to be read next to a hostile one that can be: then
-    /// only the hostile code is seen, and only the offer screen, which shows all it would change,
-    /// stops it.
+    /// - two different valid setup codes;
+    /// - more than [`MAX_CODES`] codes, read or not;
+    /// - [`DECODER_MAX_CAPSTONES`] finder patterns, the most `quircs` keeps, so it may have
+    ///   dropped some; or more than [`MAX_CAPSTONES_EXPLAINED`];
+    /// - [`DECODER_MAX_REGIONS`] dark regions, the most it labels, so it may have stopped looking.
+    ///
+    /// Not caught here: a real code that cannot be read (blurred, or a stray finder pattern next to
+    /// it taking one of its own into a wrong triple) beside a hostile one that can. [`Session`]
+    /// refuses a scan that ever sees two different setup codes, and the offer screen shows all a
+    /// code would change, which is then what stops it.
     Ambiguous,
     /// The text of the one valid setup code in view, which [`setup::parse`] accepts.
     Setup(Zeroizing<Vec<u8>>),
 }
 
-/// The codes in a frame: how many the decoder found, and the texts of those that could be read.
+/// The codes in a frame: what the decoder found, and the texts of those that could be read.
 pub struct Codes {
     /// Grids found, read or not, at most [`DECODER_MAX_GRIDS`].
     pub grids: usize,
+    /// Finder patterns found, at most [`DECODER_MAX_CAPSTONES`].
+    pub capstones: usize,
+    /// Dark regions labelled, at most [`DECODER_MAX_REGIONS`].
+    pub regions: usize,
     /// Texts of at most [`MAX_TEXT_BYTES`], one per grid that decoded.
     pub texts: Vec<Zeroizing<Vec<u8>>>,
 }
 
 /// What a frame's codes add up to.
 pub(crate) fn decide(codes: Codes) -> Scan {
-    if codes.grids > MAX_CODES {
+    if codes.grids > MAX_CODES
+        || codes.capstones >= DECODER_MAX_CAPSTONES
+        || codes.capstones > MAX_CAPSTONES_EXPLAINED
+        || codes.regions >= DECODER_MAX_REGIONS
+    {
         return Scan::Ambiguous;
     }
     let mut result = Scan::NoCode;
@@ -195,6 +221,8 @@ impl Scanner {
         };
         let mut codes = Codes {
             grids: 0,
+            capstones: 0,
+            regions: 0,
             texts: Vec::new(),
         };
         for code in self.quirc.identify(width, height, pixels) {
@@ -207,11 +235,92 @@ impl Scanner {
                 codes.texts.push(payload);
             }
         }
+        codes.capstones = self.quirc.num_capstones();
+        codes.regions = self.quirc.num_regions();
         codes
     }
 
     /// Looks for a setup code in the frame. See [`Scan`] for a frame with several codes.
     pub fn scan(&mut self, frame: Frame<'_>) -> Scan {
         decide(self.read_codes(frame))
+    }
+}
+
+/// Frames that must show the same setup text before it is offered.
+pub const FRAMES_TO_AGREE: usize = 3;
+/// Frames that may pass between two of those, read or not, before the count starts again.
+pub const MAX_FRAMES_BETWEEN: usize = 5;
+
+/// What a scan has come to, so far.
+pub enum SessionStep {
+    /// Keep scanning: this frame had no setup code, and this is why.
+    Scanning(Scan),
+    /// Keep scanning: this frame showed the setup text, which this many recent frames agree on.
+    Agreeing(usize),
+    /// The same setup text in [`FRAMES_TO_AGREE`] frames, and no other ever: offer it. The session
+    /// is over.
+    Offer(Zeroizing<Vec<u8>>),
+    /// Two different setup codes have been seen, in one frame or in two, or the session is over.
+    /// End the scan; the user may start another.
+    Refused,
+}
+
+/// One scan's frames, judged together. A single frame cannot tell a real code that is hard to
+/// read from one that is not there, so the scan offers a text only once [`FRAMES_TO_AGREE`] frames
+/// have shown it, not more than [`MAX_FRAMES_BETWEEN`] frames apart, and refuses for good as soon
+/// as any frame shows another setup code, or is [`Scan::Ambiguous`].
+#[derive(Default)]
+pub struct Session {
+    /// The one setup text seen so far.
+    text: Option<Zeroizing<Vec<u8>>>,
+    agreeing: usize,
+    since_last: usize,
+    over: bool,
+}
+
+impl Session {
+    pub fn new() -> Session {
+        Session::default()
+    }
+
+    /// Takes the next frame's result.
+    pub fn feed(&mut self, scan: Scan) -> SessionStep {
+        if self.over {
+            return SessionStep::Refused;
+        }
+        match scan {
+            Scan::Ambiguous => {
+                self.end();
+                SessionStep::Refused
+            }
+            Scan::Setup(text) => {
+                match &self.text {
+                    Some(seen) if **seen != *text => {
+                        self.end();
+                        return SessionStep::Refused;
+                    }
+                    Some(_) if self.since_last <= MAX_FRAMES_BETWEEN => self.agreeing += 1,
+                    _ => {
+                        self.text = Some(text);
+                        self.agreeing = 1;
+                    }
+                }
+                self.since_last = 0;
+                if self.agreeing >= FRAMES_TO_AGREE {
+                    self.over = true;
+                    return SessionStep::Offer(self.text.take().expect("set above"));
+                }
+                SessionStep::Agreeing(self.agreeing)
+            }
+            other => {
+                self.since_last += 1;
+                SessionStep::Scanning(other)
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        self.over = true;
+        self.text = None;
     }
 }

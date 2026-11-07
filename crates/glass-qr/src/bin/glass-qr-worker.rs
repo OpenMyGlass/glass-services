@@ -42,11 +42,13 @@ fn serve(mut input: impl Read, mut output: impl Write) -> io::Result<()> {
         let codes = scanner.read_codes(frame);
         // Sized for the largest answer, so that it never moves and leaves copies behind.
         let mut answer = Zeroizing::new(Vec::with_capacity(
-            2 + DECODER_MAX_GRIDS * (2 + MAX_TEXT_BYTES),
+            5 + DECODER_MAX_GRIDS * (2 + MAX_TEXT_BYTES),
         ));
-        // quircs reports at most 8 grids; the other side refuses more.
+        // quircs keeps within these; the other side refuses more, so clamping cannot hide anything.
         answer.push(codes.grids.min(u8::MAX.into()) as u8);
         answer.push(codes.texts.len() as u8);
+        answer.push(codes.capstones.min(u8::MAX.into()) as u8);
+        answer.extend_from_slice(&(codes.regions.min(u16::MAX.into()) as u16).to_le_bytes());
         for t in &codes.texts {
             answer.extend_from_slice(&(t.len() as u16).to_le_bytes());
             answer.extend_from_slice(t);

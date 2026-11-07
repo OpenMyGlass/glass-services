@@ -518,3 +518,212 @@ fn stress() {
     }
     println!("{n} frames, {decoded} read, slowest {slowest:?}");
 }
+
+const W: usize = 1280;
+const H: usize = 720;
+
+fn paste(frame: &mut [u8], part: &[u8], pw: usize, ph: usize, x0: usize, y0: usize) {
+    for y in 0..ph {
+        frame[(y0 + y) * W + x0..(y0 + y) * W + x0 + pw]
+            .copy_from_slice(&part[y * pw..(y + 1) * pw]);
+    }
+}
+
+/// One lone finder pattern, of module `m`, on a light square, at (x0, y0).
+fn lone_finder(frame: &mut [u8], x0: usize, y0: usize, m: usize) {
+    for v in 0..9 * m {
+        frame[(y0 + v) * W + x0..(y0 + v) * W + x0 + 9 * m].fill(220);
+    }
+    for v in 0..7 {
+        for u in 0..7 {
+            let ring = matches!(u, 0 | 6) || matches!(v, 0 | 6);
+            let core = (2..=4).contains(&u) && (2..=4).contains(&v);
+            if ring || core {
+                for dy in 0..m {
+                    let row = (y0 + m + v * m + dy) * W + x0 + m + u * m;
+                    frame[row..row + m].fill(20);
+                }
+            }
+        }
+    }
+}
+
+fn hostile_text() -> String {
+    use glass_qr::setup::{TAG_PAIRING_CODE, TAG_WIFI_AUTH, TAG_WIFI_SSID};
+    let mut hostile = Vec::new();
+    field(&mut hostile, TAG_WIFI_SSID, TEST_SSID.as_bytes());
+    field(&mut hostile, TAG_WIFI_AUTH, &[0]);
+    field(&mut hostile, TAG_PAIRING_CODE, b"attacker-code");
+    setup::seal(&hostile)
+}
+
+/// The hostile code at the top left, the real one at the bottom right, and a band in between.
+fn hostile_band_real(band: impl Fn(&mut [u8])) -> Vec<u8> {
+    let mut frame = vec![140u8; W * H];
+    let v = View {
+        width: 600,
+        height: 300,
+        px_per_module: 3.0,
+        ..View::plain()
+    };
+    let hostile = render(
+        &matrix(hostile_text().as_bytes(), EcLevel::L),
+        &v,
+        &mut Rng::new(1),
+    );
+    let real = render(
+        &matrix(full_text().as_bytes(), EcLevel::L),
+        &v,
+        &mut Rng::new(2),
+    );
+    paste(&mut frame, &hostile, 600, 300, 0, 0);
+    paste(&mut frame, &real, 600, 300, 660, 410);
+    band(&mut frame);
+    frame
+}
+
+fn outcome(frame: &[u8]) -> &'static str {
+    let f = Frame::new(frame, W, H, W).unwrap();
+    match Scanner::new().scan(f) {
+        Scan::Setup(t) if t[..] == *full_text().as_bytes() => "real",
+        Scan::Setup(_) => "HOSTILE",
+        Scan::Ambiguous => "ambiguous",
+        Scan::NoCode => "nocode",
+        Scan::Refused(_) => "refused",
+    }
+}
+
+/// A row of lone finder patterns between the two codes: `quircs` keeps 32 finder patterns and drops
+/// the rest, so the real code below the row would go unseen and the hostile one win. From the
+/// review's proof of concept.
+#[test]
+fn a_row_of_finder_patterns_cannot_hide_the_real_code() {
+    let both = hostile_band_real(|_| {});
+    assert_eq!(outcome(&both), "ambiguous", "both codes seen");
+    for lone in [20, 26, 29, 31] {
+        let frame = hostile_band_real(|f| {
+            for i in 0..lone {
+                lone_finder(f, 10 + i * 40, 330, 4);
+            }
+        });
+        assert_eq!(outcome(&frame), "ambiguous", "{lone} lone finder patterns");
+    }
+}
+
+/// A band of tiny 1:1:3:1:1 runs, each a candidate finder pattern in dark regions of its own, uses
+/// up `quircs`'s region labels, after which it finds no more finder patterns. On this frame the
+/// commit before this rule read neither code; the rule is that a frame at the cap is refused.
+#[test]
+fn a_frame_that_uses_up_the_region_labels_is_refused() {
+    let mut frame = vec![140u8; W * H];
+    let v = View {
+        width: 400,
+        height: 130,
+        px_per_module: 2.0,
+        ..View::plain()
+    };
+    let hostile = render(
+        &matrix(hostile_text().as_bytes(), EcLevel::L),
+        &v,
+        &mut Rng::new(1),
+    );
+    let real = render(
+        &matrix(full_text().as_bytes(), EcLevel::L),
+        &v,
+        &mut Rng::new(2),
+    );
+    paste(&mut frame, &hostile, 400, 130, 0, 0);
+    paste(&mut frame, &real, 400, 130, 800, 590);
+    let f = Frame::new(&frame, W, H, W).unwrap();
+    assert_eq!(
+        Scanner::new().read_codes(f).texts.len(),
+        2,
+        "both readable alone"
+    );
+    for y in (140..580).step_by(2) {
+        let row = &mut frame[y * W..(y + 1) * W];
+        row.fill(220);
+        for x0 in (0..W - 8).step_by(8) {
+            // dark 1, light 1, dark 3, light 1, dark 1, light 1
+            for (dx, dark) in [1, 0, 1, 1, 1, 0, 1, 0].into_iter().enumerate() {
+                if dark == 1 {
+                    row[x0 + dx] = 20;
+                }
+            }
+        }
+    }
+    let f = Frame::new(&frame, W, H, W).unwrap();
+    let codes = Scanner::new().read_codes(f);
+    assert_eq!(
+        codes.regions,
+        glass_qr::scan::DECODER_MAX_REGIONS,
+        "labels used up"
+    );
+    assert_eq!(outcome(&frame), "ambiguous");
+}
+
+fn setup_scan(text: &str) -> Scan {
+    Scan::Setup(zeroize::Zeroizing::new(text.as_bytes().to_vec()))
+}
+
+#[test]
+fn a_session_offers_after_three_agreeing_frames() {
+    let mut s = Session::new();
+    let real = full_text();
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(1)
+    ));
+    assert!(matches!(
+        s.feed(Scan::NoCode),
+        SessionStep::Scanning(Scan::NoCode)
+    ));
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(2)
+    ));
+    match s.feed(setup_scan(&real)) {
+        SessionStep::Offer(t) => assert_eq!(&t[..], real.as_bytes()),
+        _ => panic!("no offer"),
+    }
+    // Over once offered.
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Refused));
+}
+
+#[test]
+fn a_session_starts_counting_again_after_a_long_gap() {
+    let mut s = Session::new();
+    let real = full_text();
+    s.feed(setup_scan(&real));
+    s.feed(setup_scan(&real));
+    for _ in 0..=MAX_FRAMES_BETWEEN {
+        s.feed(Scan::NoCode);
+    }
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(1)
+    ));
+}
+
+/// The real code in one frame and a hostile one in a later frame, or the other way round: the scan
+/// is refused for good, even if one of them then shows alone.
+#[test]
+fn a_session_that_ever_sees_two_setup_codes_is_refused() {
+    let (real, hostile) = (full_text(), hostile_text());
+    for (first, then) in [(&real, &hostile), (&hostile, &real)] {
+        let mut s = Session::new();
+        assert!(matches!(
+            s.feed(setup_scan(first)),
+            SessionStep::Agreeing(1)
+        ));
+        assert!(matches!(s.feed(Scan::NoCode), SessionStep::Scanning(_)));
+        assert!(matches!(s.feed(setup_scan(then)), SessionStep::Refused));
+        for _ in 0..FRAMES_TO_AGREE {
+            assert!(matches!(s.feed(setup_scan(first)), SessionStep::Refused));
+        }
+    }
+    let mut s = Session::new();
+    s.feed(setup_scan(&real));
+    assert!(matches!(s.feed(Scan::Ambiguous), SessionStep::Refused));
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Refused));
+}

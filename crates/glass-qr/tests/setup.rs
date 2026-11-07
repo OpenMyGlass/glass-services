@@ -30,15 +30,18 @@ fn a_full_code_gives_an_offer_and_its_secrets_stay_behind() {
         s.offer(),
         SetupOffer {
             wifi_ssid: Some(TEST_SSID.into()),
+            wifi_auth: Some(WifiAuth::WpaPsk),
+            companion_addr: Some(TEST_ADDR.parse().unwrap()),
+            pairs_new_companion: true,
             has_seed: true,
-            has_pairing_code: true,
         }
     );
     let w = s.wifi().unwrap();
     assert_eq!(w.auth, WifiAuth::WpaPsk);
     assert_eq!(w.password, Some(TEST_PASSWORD));
     assert!(!w.hidden);
-    assert_eq!(s.seed(), Some(&TEST_SEED));
+    assert_eq!(s.seed().unwrap().bytes_to_mix_uncredited(), &TEST_SEED[..]);
+    assert_eq!(&s.to_text()[..], full_text());
     assert_eq!(s.pairing_code(), Some(TEST_CODE));
     assert_eq!(s.companion_addr(), Some(TEST_ADDR.parse().unwrap()));
 }
@@ -330,50 +333,70 @@ fn auth_has_known_values_only() {
 }
 
 #[test]
-fn an_ssid_cannot_lie_on_the_screen() {
-    let bad_field = SetupError::BadField(TAG_WIFI_SSID);
-    for ssid in [
-        "",              // empty
-        "Home\nFree",    // a second line
-        "Home\u{7}",     // a control character
-        "Home\u{85}x",   // C1
-        "emoH\u{202e}x", // right-to-left override
-        "Home\u{2066}x", // bidi isolate
-        "Ho\u{200b}me",  // zero width
-        "Ho\u{ad}me",    // soft hyphen
-        "Ho\u{feff}me",  // byte order mark
-        "Ho\u{e0041}me", // tag character
-        "Ho\u{2028}me",  // line separator
-        "Ho\u{3164}me",  // Hangul filler, draws nothing
-        " Home",
-        "Home ",
-        "Home\u{3000}", // ideographic space
-    ] {
+fn an_ssid_with_a_control_character_is_refused() {
+    for ssid in ["", "Home\nFree", "Home\u{7}", "Home\u{85}x", "\u{0}"] {
         assert_eq!(
             err(parse_body(&wifi_only(ssid.as_bytes(), 0, None))),
-            bad_field,
+            SetupError::BadField(TAG_WIFI_SSID),
             "{ssid:?}"
         );
     }
-    assert_eq!(err(parse_body(&wifi_only(&[b's'; 33], 0, None))), bad_field);
-    assert_eq!(
-        err(parse_body(&wifi_only(b"\xff\xfeHome", 0, None))),
-        bad_field
-    );
-    for ssid in [
-        "Casa Rossa",
-        "Caffè",
-        "\"quoted\"",
-        "a;b:c,d\\e",
-        "ネット",
-        "Home 🏠",
-    ] {
-        assert!(
-            parse_body(&wifi_only(ssid.as_bytes(), 0, None)).is_ok(),
-            "{ssid:?}"
-        );
-    }
+    let bad = SetupError::BadField(TAG_WIFI_SSID);
+    assert_eq!(err(parse_body(&wifi_only(&[b's'; 33], 0, None))), bad);
+    assert_eq!(err(parse_body(&wifi_only(b"\xff\xfeHome", 0, None))), bad);
     assert!(parse_body(&wifi_only(&[b's'; 32], 0, None)).is_ok());
+}
+
+/// Whatever the SSID, the offer shows it so that it cannot pass for another one.
+#[test]
+fn an_ssid_cannot_lie_on_the_screen() {
+    let shown = |ssid: &str| {
+        let s = parse_body(&wifi_only(ssid.as_bytes(), 0, None)).expect(ssid);
+        assert_eq!(s.wifi().unwrap().ssid, ssid, "joined as it is");
+        s.offer().wifi_ssid.unwrap()
+    };
+    for (ssid, want) in [
+        ("Casa Rossa", "Casa Rossa"),
+        ("Caffè", "Caffè"),
+        ("Łódź-Straße", "Łódź-Straße"),
+        ("\"quoted\" a;b:c,d", "\"quoted\" a;b:c,d"),
+        // Blank, or invisible, alone or inside.
+        ("\u{2800}", "\\u{2800}"),
+        ("Ho\u{a0}me", "Ho\\u{a0}me"),
+        ("Ho\u{2003}me", "Ho\\u{2003}me"),
+        ("Ho\u{200b}me", "Ho\\u{200b}me"),
+        ("Ho\u{ad}me", "Ho\\u{ad}me"),
+        ("Ho\u{feff}me", "Ho\\u{feff}me"),
+        ("Ho\u{3164}me", "Ho\\u{3164}me"),
+        ("Ho\u{e0041}me", "Ho\\u{e0041}me"),
+        ("Ho\u{2028}me", "Ho\\u{2028}me"),
+        // Reordering.
+        ("emoH\u{202e}x", "emoH\\u{202e}x"),
+        ("Home\u{2066}x", "Home\\u{2066}x"),
+        // Another form of the same letters: decomposed, or a combining mark first.
+        ("Cafe\u{301}", "Cafe\\u{301}"),
+        ("\u{301}Home", "\\u{301}Home"),
+        // Letters that pass for others.
+        ("Ca\u{17f}a", "Ca\\u{17f}a"),
+        ("W\u{131}Fi", "W\\u{131}Fi"),
+        ("H\u{43e}me", "H\\u{43e}me"),
+        // Drawn as something else, or not by this font.
+        ("Ho\u{fffc}me", "Ho\\u{fffc}me"),
+        ("Ho\u{e000}me", "Ho\\u{e000}me"),
+        ("Ho\u{1d159}me", "Ho\\u{1d159}me"),
+        ("ネット", "\\u{30cd}\\u{30c3}\\u{30c8}"),
+        // Spaces at the ends.
+        (" Home", "\\u{20}Home"),
+        ("Home ", "Home\\u{20}"),
+        (" ", "\\u{20}"),
+        // A backslash cannot fake an escape.
+        ("Home\\u{20}", "Home\\u{5c}u{20}"),
+    ] {
+        assert_eq!(shown(ssid), want, "{ssid:?}");
+    }
+    // Two SSIDs that look alike never show alike.
+    assert_ne!(shown("Caf\u{e9}"), shown("Cafe\u{301}"));
+    assert_ne!(shown("Home"), shown("Home\u{a0}"));
 }
 
 #[test]
@@ -495,31 +518,103 @@ fn a_pairing_code_has_a_small_alphabet() {
     }
 }
 
-/// Anything parse accepts has one spelling: encoding its fields again gives the same text. And any
-/// mutated text either fails or still passes every rule; above all, nothing panics.
+/// Whatever is accepted holds every rule, by checks written separately here.
+fn holds_the_rules(s: &Setup) {
+    if let Some(w) = s.wifi() {
+        assert!((1..=MAX_SSID_BYTES).contains(&w.ssid.len()));
+        assert!(!w.ssid.chars().any(char::is_control));
+        assert_eq!(w.password.is_some(), w.auth != WifiAuth::Open);
+        if let Some(p) = w.password {
+            assert!(!p.bytes().any(|b| b < 32 || b == 127));
+            match w.auth {
+                WifiAuth::WpaPsk => assert!((8..=63).contains(&p.len())),
+                WifiAuth::Wep => assert!([5, 13, 16].contains(&p.len())),
+                _ => assert!((1..=MAX_SAE_PASSWORD_BYTES).contains(&p.len())),
+            }
+        }
+    }
+    if let Some(a) = s.companion_addr() {
+        let local = match a.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+            std::net::IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+            }
+        };
+        assert!(local && a.port() != 0, "{a}");
+    }
+    if let Some(seed) = s.seed() {
+        assert_eq!(seed.bytes_to_mix_uncredited().len(), SEED_BYTES);
+    }
+    if let Some(c) = s.pairing_code() {
+        assert!((MIN_PAIRING_CODE..=MAX_PAIRING_CODE).contains(&c.len()));
+        assert!(
+            c.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
+    }
+    assert!(s.wifi().is_some() || s.seed().is_some() || s.pairing_code().is_some());
+    let o = s.offer();
+    assert_eq!(o.wifi_auth, s.wifi().map(|w| w.auth));
+    assert_eq!(o.pairs_new_companion, s.pairing_code().is_some());
+    assert_eq!(o.companion_addr, s.companion_addr());
+}
+
+/// Mutated bodies, sealed again so that they get past the checksum to the field parser. Whatever
+/// is accepted holds every rule and has one spelling: encoding it again gives the very same text.
 #[test]
-fn random_and_mutated_texts_never_panic() {
+fn mutated_bodies_are_refused_or_hold_every_rule() {
     let mut rng = Rng::new(1);
-    let base = full_text().into_bytes();
     let body = full_body();
+    let (mut accepted, mut refused) = (0, 0);
     for _ in 0..200_000 {
+        let mut b = body.clone();
+        for _ in 0..=rng.below(3) {
+            let i = rng.below(b.len());
+            // Half the time a byte nearby in value, which more often keeps a field valid.
+            b[i] = if rng.below(2) == 0 {
+                rng.next() as u8
+            } else {
+                b[i].wrapping_add(1 + rng.below(3) as u8)
+            };
+        }
+        if rng.below(4) == 0 {
+            b.truncate(rng.below(b.len() + 1));
+        }
+        let text = seal(&b);
+        match parse(text.as_bytes()) {
+            Ok(s) => {
+                accepted += 1;
+                holds_the_rules(&s);
+                assert_eq!(&s.to_text()[..], text, "one spelling");
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(
+        accepted > 10_000 && refused > 10_000,
+        "{accepted} {refused}"
+    );
+}
+
+/// Changed texts, with their checksum: only an unchanged text gets through, and nothing panics.
+#[test]
+fn mutated_texts_never_panic() {
+    let mut rng = Rng::new(2);
+    let base = full_text().into_bytes();
+    for _ in 0..100_000 {
         let mut t = base.clone();
         for _ in 0..=rng.below(4) {
             let i = rng.below(t.len());
             t[i] = rng.next() as u8;
         }
-        let _ = parse(&t);
-
-        // Past the checksum and the base64, right into the field parser.
-        let mut b = body.clone();
-        for _ in 0..=rng.below(4) {
-            let i = rng.below(b.len());
-            b[i] = rng.next() as u8;
+        if let Ok(s) = parse(&t) {
+            assert_eq!(t, base);
+            holds_the_rules(&s);
         }
-        b.truncate(rng.below(b.len() + 1));
-        let _ = parse_body(&b);
-
         let noise: Vec<u8> = (0..rng.below(64)).map(|_| rng.next() as u8).collect();
-        let _ = parse_body(&noise);
+        if let Ok(s) = parse(seal(&noise).as_bytes()) {
+            holds_the_rules(&s);
+        }
     }
 }

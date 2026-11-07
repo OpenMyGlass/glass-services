@@ -143,6 +143,41 @@ pub fn finder_field(width: usize, height: usize, cell: usize) -> Vec<u8> {
     f
 }
 
+/// A frame of the stress test: the full code at a random view, with stamps of finder patterns at
+/// random places, for wrong triples and odd geometry. The same seed gives the same frame.
+pub fn stress_frame(seed: u64, width: usize, height: usize) -> Vec<u8> {
+    let code = matrix(full_text().as_bytes(), EcLevel::L);
+    let mut rng = Rng::new(seed + 1);
+    let view = View {
+        width,
+        height,
+        px_per_module: 2.0 + 4.0 * rng.unit(),
+        angle_deg: 360.0 * rng.unit(),
+        tilt: (0.004 * (rng.unit() - 0.5), 0.004 * (rng.unit() - 0.5)),
+        dark: rng.next() as u8 / 2,
+        light: 128 + rng.next() as u8 / 2,
+        noise: 30.0 * rng.unit(),
+        gradient: 200.0 * (rng.unit() - 0.5),
+    };
+    let mut frame = render(&code, &view, &mut rng);
+    let field = finder_field(width, height, 7 + rng.below(40));
+    for _ in 0..rng.below(30) {
+        let (x, y) = (rng.below(width - 40), rng.below(height - 40));
+        let (bw, bh) = (rng.below(40), rng.below(40));
+        for row in y..y + bh {
+            frame[row * width + x..row * width + x + bw]
+                .copy_from_slice(&field[row * width + x..row * width + x + bw]);
+        }
+    }
+    frame
+}
+
+/// Seeds of [`stress_frame`] at 320x240 that took 0.1 to 5 s each on the host before the fix in
+/// vendor/quircs, against about a millisecond for most.
+pub const SLOW_SEEDS: [u64; 10] = [
+    2630, 6751, 7160, 7894, 17051, 24031, 25404, 29141, 29234, 29373,
+];
+
 /// Field `tag` of a body.
 pub fn field(body: &mut Vec<u8>, tag: u8, value: &[u8]) {
     body.push(tag);

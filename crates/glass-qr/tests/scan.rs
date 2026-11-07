@@ -172,6 +172,54 @@ fn a_setup_code_next_to_a_link() {
     }
 }
 
+/// Two codes side by side in one frame.
+fn side_by_side(left: &[u8], right: &[u8]) -> Scan {
+    let (width, height) = (1280, 480);
+    let half = View {
+        width: width / 2,
+        height,
+        ..View::plain()
+    };
+    let l = render(&matrix(left, EcLevel::M), &half, &mut Rng::new(1));
+    let r = render(&matrix(right, EcLevel::M), &half, &mut Rng::new(2));
+    let mut frame = Vec::with_capacity(width * height);
+    for y in 0..height {
+        frame.extend_from_slice(&l[y * half.width..(y + 1) * half.width]);
+        frame.extend_from_slice(&r[y * half.width..(y + 1) * half.width]);
+    }
+    let f = Frame::new(&frame, width, height, width).unwrap();
+    assert_eq!(Scanner::new().read_codes(f).len(), 2);
+    Scanner::new().scan(f)
+}
+
+/// A sticker with an attacker's code beside the real one: neither wins, whichever is read first.
+#[test]
+fn two_different_setup_codes_are_ambiguous() {
+    use glass_qr::setup::{TAG_PAIRING_CODE, TAG_WIFI_AUTH, TAG_WIFI_SSID};
+    let mut hostile = Vec::new();
+    field(&mut hostile, TAG_WIFI_SSID, TEST_SSID.as_bytes());
+    field(&mut hostile, TAG_WIFI_AUTH, &[0]);
+    field(&mut hostile, TAG_PAIRING_CODE, b"attacker-code");
+    let (real, hostile) = (full_text(), setup::seal(&hostile));
+    assert!(matches!(
+        side_by_side(real.as_bytes(), hostile.as_bytes()),
+        Scan::Ambiguous
+    ));
+    assert!(matches!(
+        side_by_side(hostile.as_bytes(), real.as_bytes()),
+        Scan::Ambiguous
+    ));
+}
+
+#[test]
+fn the_same_setup_code_twice_is_not_ambiguous() {
+    let real = full_text();
+    assert!(matches!(
+        side_by_side(real.as_bytes(), real.as_bytes()),
+        Scan::Setup(_)
+    ));
+}
+
 #[test]
 fn a_code_longer_than_any_setup_is_dropped_unread() {
     let text = "x".repeat(setup::MAX_TEXT_BYTES + 1);
@@ -359,9 +407,23 @@ fn damaged_codes_do_not_panic_or_give_another_text() {
     }
 }
 
-/// A long search for an image that makes the decoder panic, or a slow one, which it prints. Off by default; run with
-/// `cargo test --release -p glass-qr --test scan -- --ignored --nocapture stress`, with `QR_STRESS`
-/// set to the number of frames.
+/// Frames that once took up to 5 s each, from the alignment search fixed in vendor/quircs.
+#[test]
+fn slow_frames() {
+    let mut scanner = Scanner::new();
+    for seed in SLOW_SEEDS {
+        let frame = stress_frame(seed, 320, 240);
+        let start = std::time::Instant::now();
+        scanner.scan(Frame::new(&frame, 320, 240, 320).unwrap());
+        let took = start.elapsed();
+        // Unoptimized and on a busy machine: still far below what these took optimized before.
+        assert!(took.as_millis() < 500, "seed {seed}: {took:?}");
+    }
+}
+
+/// A long search for an image that makes the decoder panic, or a slow one, which it prints. Off by
+/// default; run with `cargo test --release -p glass-qr --test scan -- --ignored --nocapture stress`,
+/// with `QR_STRESS` set to the number of frames.
 #[test]
 #[ignore]
 fn stress() {
@@ -370,35 +432,12 @@ fn stress() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
     let (w, h) = (320, 240);
-    let code = matrix(full_text().as_bytes(), EcLevel::L);
     let mut slowest = std::time::Duration::ZERO;
     let mut decoded = 0u64;
     for seed in 0..n {
-        let mut rng = Rng::new(seed + 1);
-        let view = View {
-            width: w,
-            height: h,
-            px_per_module: 2.0 + 4.0 * rng.unit(),
-            angle_deg: 360.0 * rng.unit(),
-            tilt: (0.004 * (rng.unit() - 0.5), 0.004 * (rng.unit() - 0.5)),
-            dark: rng.next() as u8 / 2,
-            light: 128 + rng.next() as u8 / 2,
-            noise: 30.0 * rng.unit(),
-            gradient: 200.0 * (rng.unit() - 0.5),
-        };
-        let mut frame = render(&code, &view, &mut rng);
-        // Stamps of finder patterns at random places, for wrong triples and odd geometry.
-        let field = finder_field(w, h, 7 + rng.below(40));
-        for _ in 0..rng.below(30) {
-            let (x, y) = (rng.below(w - 40), rng.below(h - 40));
-            let (bw, bh) = (rng.below(40), rng.below(40));
-            for row in y..y + bh {
-                frame[row * w + x..row * w + x + bw]
-                    .copy_from_slice(&field[row * w + x..row * w + x + bw]);
-            }
-        }
-        let t = std::time::Instant::now();
+        let frame = stress_frame(seed, w, h);
         let f = Frame::new(&frame, w, h, w).unwrap();
+        let t = std::time::Instant::now();
         let hit = std::panic::catch_unwind(|| matches!(Scanner::new().scan(f), Scan::Setup(_)));
         let took = t.elapsed();
         match hit {

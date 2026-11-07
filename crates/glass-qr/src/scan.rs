@@ -5,22 +5,22 @@
 //! in a dim scene. `quircs` holds at most 32 finder patterns and 8 grids, and read more in the dim
 //! and noisy cases tried. It was weaker only below 3 pixels per module.
 //!
-//! **The time for a frame has no useful bound.** `quircs` cannot be interrupted, and its search for
-//! the alignment pattern takes about 100 steps per pixel of a module's estimated area, an estimate
-//! that wrong finder patterns can make far larger than the frame. In 30000 random synthetic
-//! frames of 320x240, one took 5 s on the host this way, against about a millisecond for most.
+//! **Time:** `quircs` is vendored with one fix (`vendor/quircs/VENDORED.md`): its search for the
+//! alignment pattern ran about 100 steps per pixel of a module's estimated area, which wrong finder
+//! patterns could make far larger than the frame. Before the fix, 10 of 30000 random synthetic
+//! frames of 320x240 took 0.1 to 5 s on the host; the `slow_frames` test holds them. Nothing proves
+//! there is no other slow case, and `quircs` cannot be interrupted.
 //!
 //! **A panic here ends the process.** The frame comes from the world, `quircs` has assertions, and
 //! the release profile aborts on a panic. None was found in release builds (see the `stress` test
 //! in `tests/scan.rs`), which does not prove there is none.
 //!
-//! So this belongs in the process that owns the camera, on its own thread, with the process killed
-//! when the scan's deadline passes, and not in glassd, which builds this crate without the
-//! `decoder` feature.
+//! So the camera process runs this through [`crate::worker`], in a process of its own that it kills
+//! at a deadline, and glassd builds this crate without the `decoder` feature.
 //!
-//! The text of a code is wiped when dropped, as a best effort. This code cannot wipe the frame,
-//! which belongs to the caller, nor the copy of it that [`Scanner`] holds in black and white until
-//! the next frame or its end, nor what `quircs` left in memory it has freed.
+//! The text of a code is wiped when dropped, as a best effort. Not wiped: the frame, which belongs to
+//! the caller; the black-and-white copy `quircs` keeps of the last frame until the next one or its
+//! end; what `quircs` left in memory it has freed. The worker's process ending frees all of them.
 
 use quircs::Quirc;
 use zeroize::Zeroizing;
@@ -38,8 +38,8 @@ pub const MAX_CODES: usize = 4;
 #[derive(Clone, Copy)]
 pub struct Frame<'a> {
     data: &'a [u8],
-    width: usize,
-    height: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
     stride: usize,
 }
 
@@ -60,6 +60,17 @@ pub enum FrameError {
     ShortBuffer,
 }
 
+/// Whether a frame of this size is taken, before any buffer is made for it.
+pub fn check_size(width: usize, height: usize) -> Result<(), FrameError> {
+    if width < MIN_SIDE
+        || height < MIN_SIDE
+        || width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS)
+    {
+        return Err(FrameError::Size);
+    }
+    Ok(())
+}
+
 impl<'a> Frame<'a> {
     /// A frame of `height` rows, each starting `stride` bytes after the last. The last row need
     /// not have its padding.
@@ -69,12 +80,7 @@ impl<'a> Frame<'a> {
         height: usize,
         stride: usize,
     ) -> Result<Frame<'a>, FrameError> {
-        if width < MIN_SIDE
-            || height < MIN_SIDE
-            || width.checked_mul(height).is_none_or(|n| n > MAX_PIXELS)
-        {
-            return Err(FrameError::Size);
-        }
+        check_size(width, height)?;
         if stride < width {
             return Err(FrameError::Stride);
         }
@@ -92,6 +98,15 @@ impl<'a> Frame<'a> {
             stride,
         })
     }
+
+    /// The rows, without their padding.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = &'a [u8]> {
+        let width = self.width;
+        self.data
+            .chunks(self.stride)
+            .take(self.height)
+            .map(move |row| &row[..width])
+    }
 }
 
 /// What a frame held.
@@ -101,12 +116,32 @@ pub enum Scan {
     /// Codes that are not valid setup codes, and the reason for the last one. Keep scanning: a
     /// link on a poster in view must not end the scan.
     Refused(SetupError),
-    /// The text of the first valid setup code, which [`setup::parse`] accepts.
+    /// Two different valid setup codes. Neither is offered: a sticker next to the real code must
+    /// not be able to win by being read first. Keep scanning, and say why nothing is offered.
+    Ambiguous,
+    /// The text of the one valid setup code in view, which [`setup::parse`] accepts.
     Setup(Zeroizing<Vec<u8>>),
 }
 
-/// Reads frames, one at a time. It keeps its buffers from one frame to the next, so make one per
-/// scanning session rather than one per frame.
+/// What a frame's codes add up to.
+pub(crate) fn decide(texts: Vec<Zeroizing<Vec<u8>>>) -> Scan {
+    let mut result = Scan::NoCode;
+    let mut found: Option<Zeroizing<Vec<u8>>> = None;
+    for text in texts {
+        match setup::parse(&text) {
+            Ok(_) => match &found {
+                Some(first) if **first != *text => return Scan::Ambiguous,
+                Some(_) => {}
+                None => found = Some(text),
+            },
+            Err(e) => result = Scan::Refused(e),
+        }
+    }
+    found.map_or(result, Scan::Setup)
+}
+
+/// Reads frames, one at a time, in this process. It keeps its buffers from one frame to the next,
+/// so make one per scanning session rather than one per frame.
 #[derive(Default)]
 pub struct Scanner {
     quirc: Quirc,
@@ -122,20 +157,19 @@ impl Scanner {
     /// The texts of up to [`MAX_CODES`] codes in the frame, of at most [`MAX_TEXT_BYTES`]. A code
     /// that does not decode, or with a longer text, is left out.
     pub fn read_codes(&mut self, frame: Frame<'_>) -> Vec<Zeroizing<Vec<u8>>> {
-        let Frame {
-            data,
-            width,
-            height,
-            stride,
-        } = frame;
-        let pixels = if stride == width {
-            &data[..width * height]
+        let (width, height) = (frame.width, frame.height);
+        let pixels = if frame.stride == width {
+            &frame.data[..width * height]
         } else {
+            let n = width * height;
+            if self.tight.capacity() < n {
+                // A new buffer rather than a larger one, so that the old one is wiped as it goes
+                // instead of left behind by a reallocation.
+                self.tight = Zeroizing::new(Vec::with_capacity(n));
+            }
             self.tight.clear();
-            // Reserved first, so that it does not move and leave copies behind.
-            self.tight.reserve(width * height);
-            for row in data.chunks(stride).take(height) {
-                self.tight.extend_from_slice(&row[..width]);
+            for row in frame.rows() {
+                self.tight.extend_from_slice(row);
             }
             &self.tight[..]
         };
@@ -149,15 +183,8 @@ impl Scanner {
             .collect()
     }
 
-    /// Looks for a setup code in the frame. A frame with both takes the setup code.
+    /// Looks for a setup code in the frame. See [`Scan`] for a frame with several codes.
     pub fn scan(&mut self, frame: Frame<'_>) -> Scan {
-        let mut result = Scan::NoCode;
-        for text in self.read_codes(frame) {
-            match setup::parse(&text) {
-                Ok(_) => return Scan::Setup(text),
-                Err(e) => result = Scan::Refused(e),
-            }
-        }
-        result
+        decide(self.read_codes(frame))
     }
 }

@@ -16,13 +16,19 @@
 //!
 //! - **Wi-Fi** is all or nothing: SSID and auth together, a password if and only if the network
 //!   is not open. A code cannot ask for a secured network and leave it to be joined as open.
-//! - **SSID:** shown to the user to decide on, so nothing that can make the text look like
-//!   something else: no control or invisible characters, no bidirectional overrides, no white
-//!   space at the ends. An SSID that is not UTF-8 cannot be offered.
+//! - **SSID:** UTF-8 with no control character. It is joined as it is, but the offer shows it
+//!   through [`display_ssid`], which writes as an escape every character that could look like
+//!   another or like nothing. An SSID that is not UTF-8 cannot be offered.
 //! - **Password:** the rules of `wpa_supplicant_conf` in glassd, which writes it. A test in glassd
 //!   holds the two together.
 //! - **Companion address:** a numeric socket address in a private or link-local range, because a
 //!   code should not be able to send the Glass to a server on the internet.
+//!
+//! - **Seed:** mixed into the Glass's pool, never trusted: see [`MixOnlySeed`].
+//!
+//! The offer shows everything a code would change: the network and how it is secured, the
+//! companion it would dial, and whether it pairs a new companion. A hostile code is one the user
+//! could tell from the real one only by these.
 //!
 //! Errors say what was wrong and never hold any of the content, so they are safe to log.
 
@@ -30,7 +36,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// What comes before the version.
 pub const PREFIX: &str = "omg-setup:";
@@ -49,7 +55,7 @@ pub const TAG_WIFI_PASSWORD: u8 = 3;
 pub const TAG_WIFI_HIDDEN: u8 = 4;
 /// The companion's address as text, such as `192.168.1.20:7700`.
 pub const TAG_COMPANION_ADDR: u8 = 5;
-/// Random bytes for the Glass's pool, exactly [`SEED_BYTES`].
+/// Bytes to mix into the Glass's pool, exactly [`SEED_BYTES`]. Never credited: see [`MixOnlySeed`].
 pub const TAG_SEED: u8 = 6;
 /// The pairing code, [`MIN_PAIRING_CODE`] to [`MAX_PAIRING_CODE`] of `A-Za-z0-9_-`.
 pub const TAG_PAIRING_CODE: u8 = 7;
@@ -58,7 +64,7 @@ pub const TAG_PAIRING_CODE: u8 = 7;
 pub const MAX_SSID_BYTES: usize = 32;
 /// A WPA3 password is at most this long. The standard sets no limit; a QR needs one.
 pub const MAX_SAE_PASSWORD_BYTES: usize = 128;
-/// Size of a seed: 256 bits, what glassd asks of a seed it trusts.
+/// Size of a seed from a code.
 pub const SEED_BYTES: usize = 32;
 /// The shortest pairing code.
 pub const MIN_PAIRING_CODE: usize = 6;
@@ -126,13 +132,20 @@ impl std::fmt::Display for SetupError {
 
 impl std::error::Error for SetupError {}
 
-/// What the launcher may see: enough to ask the user, and no secret.
+/// What the launcher may see: everything the code would change, and no secret. The launcher shows
+/// all of it before the user's tap, so that a hostile code differs from the real one on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupOffer {
-    /// The network it would join, if any. Checked for safe display.
+    /// The network it would join, as [`display_ssid`] writes it. Show it as it is.
     pub wifi_ssid: Option<String>,
+    /// How that network is secured. [`WifiAuth::Open`] is worth saying.
+    pub wifi_auth: Option<WifiAuth>,
+    /// The companion it would dial.
+    pub companion_addr: Option<SocketAddr>,
+    /// The code pairs a new companion: it carries a pairing code. Say so plainly, because it
+    /// changes who the Glass trusts.
+    pub pairs_new_companion: bool,
     pub has_seed: bool,
-    pub has_pairing_code: bool,
 }
 
 /// A network from a setup code, to apply after the user has confirmed.
@@ -161,7 +174,7 @@ impl std::fmt::Debug for WifiNetwork<'_> {
 pub struct Setup {
     wifi: Option<Wifi>,
     companion_addr: Option<SocketAddr>,
-    seed: Option<Zeroizing<[u8; SEED_BYTES]>>,
+    seed: Option<MixOnlySeed>,
     pairing_code: Option<Zeroizing<String>>,
 }
 
@@ -174,15 +187,21 @@ struct Wifi {
 
 impl std::fmt::Debug for Setup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Setup")
-            .field("wifi", &self.wifi())
-            .field("companion_addr", &self.companion_addr)
-            .field("seed", &self.seed.as_ref().map(|_| "<secret>"))
-            .field(
-                "pairing_code",
-                &self.pairing_code.as_ref().map(|_| "<secret>"),
-            )
-            .finish()
+        f.debug_tuple("Setup").field(&self.offer()).finish()
+    }
+}
+
+/// Bytes from a setup code for the Glass's random pool. **They are not entropy:** they travel in the
+/// open on a screen, and a hostile code chooses them. Write them to `/dev/urandom` without crediting
+/// them, which can only add to the pool. They never stand in for glassd's wait for
+/// `MIN_BITS_FOR_IDENTITY`, nor for its installer seed file, so a first identity never rests on
+/// them. This type offers its bytes for that one use and nothing else.
+pub struct MixOnlySeed(Zeroizing<Box<[u8]>>);
+
+impl MixOnlySeed {
+    /// The bytes to write to `/dev/urandom`, uncredited.
+    pub fn bytes_to_mix_uncredited(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -190,9 +209,11 @@ impl Setup {
     /// The view for the launcher.
     pub fn offer(&self) -> SetupOffer {
         SetupOffer {
-            wifi_ssid: self.wifi.as_ref().map(|w| w.ssid.clone()),
+            wifi_ssid: self.wifi.as_ref().map(|w| display_ssid(&w.ssid)),
+            wifi_auth: self.wifi.as_ref().map(|w| w.auth),
+            companion_addr: self.companion_addr,
+            pairs_new_companion: self.pairing_code.is_some(),
             has_seed: self.seed.is_some(),
-            has_pairing_code: self.pairing_code.is_some(),
         }
     }
 
@@ -209,13 +230,76 @@ impl Setup {
         self.companion_addr
     }
 
-    pub fn seed(&self) -> Option<&[u8; SEED_BYTES]> {
-        self.seed.as_deref()
+    /// See [`MixOnlySeed`]: not entropy.
+    pub fn seed(&self) -> Option<&MixOnlySeed> {
+        self.seed.as_ref()
     }
 
     pub fn pairing_code(&self) -> Option<&str> {
         self.pairing_code.as_ref().map(|c| c.as_str())
     }
+
+    /// The one text that gives this setup: [`parse`] of it gives the same setup back.
+    pub fn to_text(&self) -> Zeroizing<String> {
+        let mut body = Zeroizing::new(Vec::with_capacity(MAX_TEXT_BYTES));
+        let mut field = |tag: u8, value: &[u8]| {
+            body.push(tag);
+            body.push(value.len() as u8);
+            body.extend_from_slice(value);
+        };
+        if let Some(w) = &self.wifi {
+            field(TAG_WIFI_SSID, w.ssid.as_bytes());
+            let auth = match w.auth {
+                WifiAuth::Open => 0,
+                WifiAuth::Wep => 1,
+                WifiAuth::WpaPsk => 2,
+                WifiAuth::Wpa3Sae => 3,
+            };
+            field(TAG_WIFI_AUTH, &[auth]);
+            if let Some(p) = &w.password {
+                field(TAG_WIFI_PASSWORD, p.as_bytes());
+            }
+            if w.hidden {
+                field(TAG_WIFI_HIDDEN, &[1]);
+            }
+        }
+        if let Some(a) = self.companion_addr {
+            field(TAG_COMPANION_ADDR, a.to_string().as_bytes());
+        }
+        if let Some(s) = &self.seed {
+            field(TAG_SEED, s.bytes_to_mix_uncredited());
+        }
+        if let Some(c) = &self.pairing_code {
+            field(TAG_PAIRING_CODE, c.as_bytes());
+        }
+        Zeroizing::new(seal(&body))
+    }
+}
+
+/// An SSID as the launcher shows it. Kept as they are: printable ASCII, and the precomposed letters
+/// and signs of Latin-1 and Latin Extended-A that the Glass font draws, less those that pass for
+/// others (no-break space, soft hyphen, long s, dotless i). Anything else, a backslash, and a space
+/// at either end are written `\u{hex}`, so that what shows is what would be joined: no combining
+/// marks, no blank or invisible characters, no other forms of the same letters.
+pub fn display_ssid(ssid: &str) -> String {
+    let last = ssid.chars().count().saturating_sub(1);
+    let mut out = String::with_capacity(ssid.len());
+    for (i, c) in ssid.chars().enumerate() {
+        let shown = match c {
+            ' ' => i != 0 && i != last,
+            '\\' => false,
+            '!'..='~' => true,
+            '\u{a0}' | '\u{ad}' | '\u{17f}' | '\u{131}' => false,
+            '\u{a1}'..='\u{17f}' => true,
+            _ => false,
+        };
+        if shown {
+            out.push(c);
+        } else {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        }
+    }
+    out
 }
 
 /// CRC-32 (IEEE). Small and slow on purpose: it runs once, over at most [`MAX_TEXT_BYTES`].
@@ -370,23 +454,7 @@ fn parse_ssid(value: &[u8]) -> Option<String> {
         return None;
     }
     let s = str::from_utf8(value).ok()?;
-    let safe = s.chars().all(|c| !c.is_control() && !is_invisible(c))
-        && !s.starts_with(char::is_whitespace)
-        && !s.ends_with(char::is_whitespace);
-    safe.then(|| s.to_owned())
-}
-
-/// Characters that draw nothing or reorder the text around them: Unicode's format characters
-/// (category Cf) and the line and paragraph separators, plus the invisible fillers that are not
-/// in that category. Rust's `is_control` is category Cc only.
-fn is_invisible(c: char) -> bool {
-    matches!(c as u32,
-        0x00ad | 0x034f | 0x061c | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x180b..=0x180f
-        | 0x0600..=0x0605 | 0x06dd | 0x070f | 0x0890 | 0x0891 | 0x08e2
-        | 0x200b..=0x200f | 0x2028..=0x202e | 0x2060..=0x206f | 0x3164
-        | 0xfe00..=0xfe0f | 0xfeff | 0xffa0 | 0xfff0..=0xfffb
-        | 0x110bd | 0x110cd | 0x13430..=0x1343f | 0x1bca0..=0x1bca3
-        | 0x1d173..=0x1d17a | 0xe0000..=0xe0fff)
+    (!s.chars().any(char::is_control)).then(|| s.to_owned())
 }
 
 fn parse_auth(value: &[u8]) -> Option<WifiAuth> {
@@ -451,14 +519,13 @@ fn parse_addr(value: &[u8]) -> Option<SocketAddr> {
     (local && addr.port() != 0 && addr.to_string() == text).then_some(addr)
 }
 
-fn parse_seed(value: &[u8]) -> Option<Zeroizing<[u8; SEED_BYTES]>> {
-    let mut seed = Zeroizing::new(<[u8; SEED_BYTES]>::try_from(value).ok()?);
-    // All one byte is a broken generator or a hand-made code, not randomness.
-    if seed.iter().all(|&b| b == seed[0]) {
-        seed.zeroize();
+/// Exactly its size, copied straight to the heap so that it never moves. All one byte is refused
+/// as a sign of a broken generator; that is no test of randomness, nor meant as one.
+fn parse_seed(value: &[u8]) -> Option<MixOnlySeed> {
+    if value.len() != SEED_BYTES || value.iter().all(|&b| b == value[0]) {
         return None;
     }
-    Some(seed)
+    Some(MixOnlySeed(Zeroizing::new(value.into())))
 }
 
 fn parse_pairing_code(value: &[u8]) -> Option<Zeroizing<String>> {

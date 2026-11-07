@@ -728,10 +728,10 @@ fn the_pairing_mode_ends_by_itself_and_stops_whoever_was_on_the_way() {
 }
 
 #[test]
-fn an_expired_window_counts_even_before_the_timer_has_its_turn() {
+fn an_expired_window_is_seen_when_the_next_phone_is_accepted() {
     let mut b = Bench::new();
     b.glass.pairing_until_ms = Some(0);
-    // No pairing_tick, as right after a resume: reading is enough.
+    // No pairing_tick: accepting the connection is enough.
     let why = refused(&mut b, None);
     assert!(why.contains("NotPaired"), "{why}");
     assert!(!b.glass.paired());
@@ -863,31 +863,130 @@ fn plain_glass(root: &Path) -> Companion {
     Companion::new(&root.join("g"), DeviceState::default(), None, false).unwrap()
 }
 
-#[test]
-fn pairing_over_tcp_needs_no_window_as_before() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut glass = plain_glass(tmp.path());
-    let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
-    peer.hello(&mut glass);
-    peer.pair_request(&mut glass, "pc");
-    peer.pair_result(&mut glass);
-    assert_eq!(glass.paired_name(), Some("pc"));
+impl RawPeer {
+    /// The whole takeover in one write, as an attacker would send it, before the Glass reads.
+    fn takeover(&mut self, glass: &mut Companion, name: &str) -> Vec<Event> {
+        let hello = Frame::Hello(omg_protocol::Hello {
+            protocol_version: omg_protocol::PROTOCOL_VERSION,
+            role: omg_protocol::Role::Companion,
+            app_version: "x".into(),
+            device_name: "x".into(),
+            identity_pub: self.identity.public_b64(),
+            capabilities: vec![capability::SESSION_CRYPTO.to_string()],
+        });
+        let request = Frame::PairRequest(omg_protocol::PairRequest {
+            companion_name: name.into(),
+            companion_pub: self.identity.public_b64(),
+            nonce: "AAAA".into(),
+            bootstrap_token: None,
+        });
+        let result = Frame::PairResult(omg_protocol::PairResult {
+            ok: true,
+            message: String::new(),
+        });
+        let mut bytes = Vec::new();
+        for f in [&hello, &request, &result] {
+            bytes.extend(omg_protocol::frame_bytes(f).unwrap());
+        }
+        self.stream.write_all(&bytes).unwrap();
+        glass.on_readable(self.id)
+    }
+}
+
+fn refused_not_paired(peer: &mut RawPeer) -> bool {
+    matches!(
+        peer.last_frame(),
+        Frame::Error(e) if e.code == omg_protocol::ErrorCode::NotPaired
+            && e.message.contains("pairing mode is off")
+    )
 }
 
 #[test]
-fn the_three_frames_of_the_takeover_bond_nothing_over_ble() {
+fn the_three_frames_of_the_takeover_bond_nothing_on_any_transport() {
+    for transport in [Transport::Ble, Transport::WifiTcp, Transport::BtRfcomm] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut glass = plain_glass(tmp.path());
+        let mut stranger = raw_peer(&mut glass, transport);
+        stranger.takeover(&mut glass, "stranger");
+        assert!(!glass.paired(), "bonded over {transport:?}");
+        assert_eq!(
+            glass.conn_fds().len(),
+            0,
+            "still connected over {transport:?}"
+        );
+        // The words are on the wire. omg-core reduces them to the code, for the app's own.
+        assert!(refused_not_paired(&mut stranger), "{transport:?}");
+        // Nothing is stored either.
+        assert!(!plain_glass(tmp.path()).paired());
+    }
+}
+
+#[test]
+fn pairing_over_tcp_needs_the_window_too() {
     let tmp = tempfile::tempdir().unwrap();
     let mut glass = plain_glass(tmp.path());
-    let mut stranger = raw_peer(&mut glass, Transport::Ble);
-    stranger.hello(&mut glass);
-    assert_eq!(glass.conn_fds().len(), 0, "still connected after Hello");
-    // The words are on the wire. omg-core reduces them to the code, for the app to put in its own.
-    assert!(matches!(
-        stranger.last_frame(),
-        Frame::Error(e) if e.code == omg_protocol::ErrorCode::NotPaired
-            && e.message.contains("pairing mode is off")
-    ));
+    let mut early = raw_peer(&mut glass, Transport::WifiTcp);
+    early.takeover(&mut glass, "pc");
     assert!(!glass.paired());
+
+    glass.open_pairing_window(0).unwrap();
+    let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
+    peer.takeover(&mut glass, "pc");
+    assert_eq!(glass.paired_name(), Some("pc"));
+    assert_eq!(glass.pairing_left_ms(), None, "one phone per opening");
+}
+
+#[test]
+fn right_after_forgetting_the_bond_nobody_pairs_without_the_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    raw_peer(&mut glass, Transport::WifiTcp).takeover(&mut glass, "owner");
+    assert!(glass.paired());
+    let (_, cleared) = glass.unpair();
+    cleared.unwrap();
+    let mut stranger = raw_peer(&mut glass, Transport::WifiTcp);
+    stranger.takeover(&mut glass, "stranger");
+    assert!(!glass.paired());
+    assert!(refused_not_paired(&mut stranger));
+}
+
+#[test]
+fn a_window_that_expired_is_seen_on_the_first_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    // Connected while the window was open: its link was told it may pair.
+    let mut peer = raw_peer(&mut glass, Transport::Ble);
+    glass.pairing_until_ms = Some(0);
+    // No pairing_tick and no accept, as right after a resume: only the read.
+    let events = peer.takeover(&mut glass, "late");
+    assert!(events.contains(&Event::PairingChanged), "{events:?}");
+    assert!(!glass.paired());
+    assert!(refused_not_paired(&mut peer));
+    assert_eq!(glass.pairing_left_ms(), None);
+}
+
+#[test]
+fn a_bond_that_cannot_be_stored_ends_the_link_and_closes_the_window() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    let dir = tmp.path().join("g");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
+    let events = peer.takeover(&mut glass, "phone");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!glass.paired(), "a bond in memory only");
+    assert!(!glass.connected());
+    assert_eq!(glass.conn_fds().len(), 0);
+    assert_eq!(glass.pairing_left_ms(), None, "the window stayed open");
+    assert!(events.contains(&Event::PairingChanged), "{events:?}");
+    assert!(matches!(
+        peer.last_frame(),
+        Frame::Error(e) if e.code == omg_protocol::ErrorCode::Internal
+    ));
 }
 
 #[test]
@@ -917,6 +1016,7 @@ fn a_window_that_closes_stops_a_pairing_under_way_at_every_step() {
 fn a_link_older_than_the_bond_cannot_replace_it() {
     let tmp = tempfile::tempdir().unwrap();
     let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
     // A stranger gets ready and waits, on a transport that needs no window.
     let mut stranger = raw_peer(&mut glass, Transport::WifiTcp);
     stranger.hello(&mut glass);
@@ -931,8 +1031,6 @@ fn a_link_older_than_the_bond_cannot_replace_it() {
     stranger.pair_result(&mut glass);
     assert_eq!(glass.paired_name(), Some("owner"), "the bond was replaced");
     assert_eq!(glass.conn_fds().len(), 1, "the stranger is still here");
-    assert!(matches!(
-        stranger.last_frame(),
-        Frame::Error(e) if e.code == omg_protocol::ErrorCode::UnknownPeer
-    ));
+    // The bond closed the window, which stops it first. Were the window open, the bond would.
+    assert!(refused_not_paired(&mut stranger));
 }

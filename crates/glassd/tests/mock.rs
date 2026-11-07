@@ -1332,6 +1332,21 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
     };
     let snap: CompanionState = state(&f).unwrap();
     assert!(snap.snapshot && !snap.paired && !snap.phone_connected);
+    assert_eq!(snap.pairing_until_us, 0);
+
+    // The owner opens the pairing mode: a first pairing needs it, on TCP too.
+    launcher
+        .send(Body2::CompanionPairingWindow(
+            glass_api::proto::CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            },
+        ))
+        .unwrap();
+    launcher
+        .recv_until(T, |f| state(f).is_some_and(|s| s.pairing_until_us > 0))
+        .unwrap()
+        .expect("the pairing mode did not open");
 
     // Connect a TCP companion and run the Glass-role handshake from the companion side.
     let stream = {

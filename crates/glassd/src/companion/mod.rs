@@ -202,7 +202,7 @@ pub struct Companion {
     conns: BTreeMap<ConnId, Conn>,
     active: Option<ConnId>,
     next_id: ConnId,
-    /// A first pairing over BLE may happen until this time ([`boot_ms`]). Never stored: a restart
+    /// A first pairing, over any transport, may happen until this time ([`boot_ms`]). Never stored: a restart
     /// closes it.
     pairing_until_ms: Option<u64>,
     /// The note queue. `None` if it could not be opened: the link works, without notes.
@@ -544,7 +544,7 @@ impl Companion {
         // Also for handshakes under way.
         let open = until_ms.is_some();
         for c in self.conns.values_mut() {
-            c.link.set_pairing_enabled(may_pair(c.transport, open));
+            c.link.set_pairing_enabled(open);
         }
         events.push(Event::PairingChanged);
     }
@@ -651,7 +651,7 @@ impl Companion {
         let id = self.next_id;
         self.next_id += 1;
         let mut link = Link::new(identity, bond, self.device.clone());
-        link.set_pairing_enabled(may_pair(transport, self.pairing_until_ms.is_some()));
+        link.set_pairing_enabled(self.pairing_until_ms.is_some());
         if self.notes.is_some() {
             link.advertise(omg_protocol::capability::NOTES_SYNC);
         }
@@ -945,7 +945,18 @@ impl Companion {
                         None => Err(CompanionError::Store("no store".into())),
                     };
                     if let Err(e) = saved {
+                        // A bond that would not outlive a restart is no bond: the phone would keep
+                        // one the Glass forgets, and the window would stay open behind it.
                         warn!("companion: cannot persist the bond ({e})");
+                        let refusal = Frame::Error(ErrorMsg {
+                            code: ErrorCode::Internal,
+                            message: "the Glass cannot store the bond".into(),
+                        });
+                        self.queue_frames(id, vec![refusal]);
+                        self.flush(id, events);
+                        self.drop_conn(id, "the bond could not be stored", events);
+                        self.set_pairing_window(None, events);
+                        continue;
                     } else {
                         info!("companion: paired with {:?}", rec.peer_name);
                         // One phone per opening.
@@ -1038,12 +1049,6 @@ impl Companion {
             events.push(Event::Disconnected);
         }
     }
-}
-
-/// Whether an unbonded peer may pair over `transport`. Anyone in radio range reaches BLE, so there
-/// it takes the owner opening the pairing mode. The other transports are as they were: open.
-fn may_pair(transport: Transport, window_open: bool) -> bool {
-    window_open || transport != Transport::Ble
 }
 
 fn log_bond(store: &Store) {

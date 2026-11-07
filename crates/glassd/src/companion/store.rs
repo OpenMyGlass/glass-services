@@ -111,15 +111,17 @@ impl Store {
     }
 
     /// Records a newly bonded companion and persists.
+    /// On a failure nothing changes, in memory either.
     pub fn set_paired(&mut self, record: PairingRecord) -> Result<(), CompanionError> {
-        self.paired = Some(record);
-        self.save()
+        let before = self.paired.replace(record);
+        self.save().inspect_err(|_| self.paired = before)
     }
 
     /// Forgets the bonded companion (unpair) and persists.
+    /// On a failure nothing changes, in memory either.
     pub fn clear_paired(&mut self) -> Result<(), CompanionError> {
-        self.paired = None;
-        self.save()
+        let before = self.paired.take();
+        self.save().inspect_err(|_| self.paired = before)
     }
 
     fn save(&self) -> Result<(), CompanionError> {

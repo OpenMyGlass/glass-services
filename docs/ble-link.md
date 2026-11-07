@@ -61,7 +61,7 @@ Deep sleep depends on UART2 idling. What changes:
 
 ## Limits, on purpose
 
-- **First pairing over BLE takes the pairing mode** the owner opens on the Glass ([`api.md`](api.md), "Pairing mode"). Without it a phone is refused with the reason, and the mode needs a launcher card. Until the launcher has one, pair once over TCP: the bond then works over BLE. TCP and RFCOMM stay open, trust on first use. Inside the window the first phone wins, and no code is compared yet.
+- **First pairing over BLE takes the pairing mode** the owner opens on the Glass ([`api.md`](api.md), "Pairing mode"). Without it a phone is refused with the reason, on BLE as on TCP and RFCOMM. Until the launcher has its card, the `companion-pairing` example of `glass-api` opens the mode. Inside the window the first phone wins, and no code is compared yet.
 - One phone at a time. A central that does not subscribe goes after 30 s, and one that does not finish the handshake after 30 s, because a connected stranger stops the advertising. A stranger coming back again and again can still keep the owner out. A peer that breaks the rules (an L2CAP PDU over the limit, more than 32 answers waiting for the radio) has its link cut, and the engine writes at most 20 log lines per 10 s.
 - A lost controller ends the process, and glassd treats that as any other death of the engine: a command unanswered for 5 s, a UART that takes no bytes for 5 s, a link not ended 40 s after `Disconnect`, or more than 64 garbage bytes in a minute.
 - The address is static and random, kept in `<state-dir>/ble-address`, so the Glass can be recognised by anyone in range.

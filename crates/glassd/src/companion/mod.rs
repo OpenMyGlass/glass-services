@@ -181,6 +181,11 @@ enum Rng {
     Failed,
 }
 
+/// The message of the `ERROR_CODE_UNAVAILABLE` that refuses a pairing mode because the link
+/// is down for good (no randomness, or the identity could not be stored). A contract of
+/// docs/api.md ("Pairing mode"): the launcher tells it from "already bonded" by this text.
+pub const LINK_DISABLED: &str = "the companion link is disabled";
+
 /// The companion-link service: listeners, the persistent bond, and the live connections.
 pub struct Companion {
     /// `None` until a first identity has been generated.
@@ -553,7 +558,7 @@ impl Companion {
     /// limited. Opening it again starts the time again. The error says why it stays closed.
     pub fn open_pairing_window(&mut self, duration_ms: u32) -> Result<Vec<Event>, String> {
         if matches!(self.rng, Rng::Failed) {
-            return Err("the companion link is disabled".into());
+            return Err(LINK_DISABLED.into());
         }
         // A bonded Glass refuses any other phone: there is nothing the window could do.
         if self.paired() {

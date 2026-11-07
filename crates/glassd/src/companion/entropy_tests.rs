@@ -259,3 +259,30 @@ fn tcp_can_be_closed_for_a_while_with_its_connections_and_opened_again() {
     c.set_tcp_closed(false);
     assert_eq!(c.listener_fds().len(), 1);
 }
+
+/// The refusal that docs/api.md promises, word for word: the launcher shows "the phone link is
+/// disabled" for it, and "a phone is already paired" for the other UNAVAILABLE.
+#[test]
+fn a_link_that_cannot_come_up_refuses_the_pairing_mode_in_the_documented_words() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    pool.seed();
+    let state = d.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // No identity can be stored, so the link stays down.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(state.join("probe"), b"").is_ok() {
+        eprintln!("skipped: running as root, the directory stays writable");
+        return;
+    }
+    let mut c = glass(&state, &pool.path);
+    assert!(!state_file(&state).exists());
+    assert!(c.listener_fds().is_empty());
+    assert_eq!(super::LINK_DISABLED, "the companion link is disabled");
+    assert_eq!(
+        c.open_pairing_window(0).err().as_deref(),
+        Some(super::LINK_DISABLED)
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+}

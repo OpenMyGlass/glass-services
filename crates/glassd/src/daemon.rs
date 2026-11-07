@@ -3308,36 +3308,141 @@ mod tests {
                 open: true,
                 duration_ms: 0,
             });
-            let mut watcher = connect();
-            assert_eq!(until(&mut watcher), 0, "the snapshot");
+            // Whether the mode is open now: frames on one connection keep their order, but a
+            // disconnection and another connection's frames do not, so let glassd see it
+            // first, then ask a new client for its snapshot.
+            let is_open = || {
+                std::thread::sleep(Duration::from_millis(300));
+                let mut c = connect();
+                until(&mut c) > 0
+            };
+            // A client that has sent a request and seen its result.
+            let sent = |c: &mut glass_api::Client, req: &client_frame::Body, open: bool| {
+                c.send(req.clone()).unwrap();
+                while (until(c) > 0) != open {}
+            };
 
             // The opener goes: the mode closes.
             let mut launcher = connect();
-            assert_eq!(until(&mut launcher), 0);
-            launcher.send(open.clone()).unwrap();
-            assert!(until(&mut watcher) > 0);
+            assert_eq!(until(&mut launcher), 0, "the snapshot");
+            sent(&mut launcher, &open, true);
             drop(launcher);
-            assert_eq!(until(&mut watcher), 0, "closed with its opener");
+            assert!(!is_open(), "closed with its opener");
 
             // Another client goes: the mode stays open.
             let mut launcher = connect();
-            assert_eq!(until(&mut launcher), 0);
-            launcher.send(open).unwrap();
-            assert!(until(&mut watcher) > 0);
+            until(&mut launcher);
+            sent(&mut launcher, &open, true);
             let mut other = connect();
             assert!(until(&mut other) > 0);
             drop(other);
-            // Nothing changes: closing it now, by its opener, is the next state anyone sees.
-            launcher
-                .send(client_frame::Body::CompanionPairingWindow(
-                    CompanionPairingWindow {
-                        open: false,
-                        duration_ms: 0,
-                    },
-                ))
-                .unwrap();
-            assert_eq!(until(&mut watcher), 0);
+            assert!(is_open(), "not closed by a client that did not open it");
+
+            // A third client opens it again.
+            let mut closer = connect();
+            until(&mut closer);
+            let mut third = connect();
+            until(&mut third);
+            sent(&mut third, &open, true);
+            drop(launcher);
+            assert!(is_open(), "the first opener no longer holds it");
+
+            // A second opener takes over: the first one going leaves it open, the second
+            // one going closes it.
+            sent(&mut closer, &open, true);
+            drop(third);
+            assert!(is_open(), "the earlier opener no longer holds it");
+            drop(closer);
+            assert!(!is_open(), "closed with the last opener");
         });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+    }
+
+    /// A close from any client clears the opener, so nothing is left to close later.
+    #[test]
+    fn a_close_from_another_client_clears_the_opener() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionPairingWindow, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let (opened_tx, opened) = std::sync::mpsc::channel::<()>();
+        let (closed_tx, closed) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let connect = || {
+                let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+                c.subscribe(&[Topic::Companion]).unwrap();
+                c
+            };
+            let window = |open| {
+                client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                    open,
+                    duration_ms: 0,
+                })
+            };
+            let until = |c: &mut glass_api::Client| match c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::CompanionState(_)))
+                })
+                .unwrap()
+                .unwrap()
+                .body
+            {
+                Some(service_frame::Body::CompanionState(s)) => s.pairing_until_us,
+                _ => unreachable!(),
+            };
+            let poke = || client_frame::Body::GetState(glass_api::proto::GetState {});
+            let mut launcher = connect();
+            assert_eq!(until(&mut launcher), 0);
+            launcher.send(window(true)).unwrap();
+            assert!(until(&mut launcher) > 0);
+            opened_tx.send(()).unwrap();
+            // Wakes the daemon from its poll, so it looks at the signal now.
+            launcher.send(poke()).unwrap();
+            let mut other = connect();
+            assert!(until(&mut other) > 0);
+            other.send(window(false)).unwrap();
+            assert_eq!(until(&mut other), 0);
+            // The launcher also has the answer to its poke, from before the close.
+            while until(&mut launcher) != 0 {}
+            closed_tx.send(()).unwrap();
+            launcher.send(poke()).unwrap();
+            // Both stay connected until the daemon has been looked at.
+            done.recv().unwrap();
+        });
+        // A client that failed sends no signal: stop waiting for it then.
+        let step_until = |daemon: &mut Daemon, rx: &std::sync::mpsc::Receiver<()>| {
+            use std::sync::mpsc::TryRecvError;
+            loop {
+                match rx.try_recv() {
+                    Ok(()) => break,
+                    Err(TryRecvError::Disconnected) => panic!("the client failed"),
+                    // Its clients going wake the poll if it fails.
+                    Err(TryRecvError::Empty) => daemon.step().unwrap(),
+                }
+            }
+        };
+        step_until(&mut daemon, &opened);
+        assert!(daemon.pairing_opener.is_some());
+        step_until(&mut daemon, &closed);
+        assert_eq!(daemon.pairing_opener, None, "a close by another client");
+        done_tx.send(()).unwrap();
         while !client.is_finished() {
             daemon.step().unwrap();
         }

@@ -995,10 +995,11 @@ impl Daemon {
                 Some(t.mono_us + wait_ms * 1000)
             }),
             self.companion.as_ref().and_then(|c| {
+                let t = now();
                 let wait_ms = c
                     .handshake_next_deadline()?
-                    .saturating_sub(companion::now_ms());
-                Some(now().mono_us + wait_ms * 1000)
+                    .saturating_sub(t.boot_us / 1000);
+                Some(t.mono_us + wait_ms * 1000)
             }),
             self.radio
                 .as_ref()

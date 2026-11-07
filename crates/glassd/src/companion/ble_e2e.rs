@@ -549,7 +549,7 @@ fn a_peer_that_says_nothing_is_dropped_and_advertising_comes_back() {
     }
     b.glass_step();
     let at = b.glass.handshake_next_deadline().unwrap();
-    assert!(at > super::now_ms());
+    assert!(at > super::boot_ms());
     assert!(b.glass.handshake_tick().is_empty());
     for c in b.glass.conns.values_mut() {
         c.handshake_by_ms = Some(0);
@@ -642,7 +642,7 @@ fn a_tcp_peer_that_says_nothing_is_dropped_too() {
     let (mut glass, port, _socket) = glass_with_tcp_and_ble(tmp.path());
     let _peer = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     accept_until(&mut glass, Transport::WifiTcp, 1);
-    assert!(glass.handshake_next_deadline().unwrap() > super::now_ms());
+    assert!(glass.handshake_next_deadline().unwrap() > super::boot_ms());
     assert!(glass.handshake_tick().is_empty());
     assert_eq!(glass.conn_fds().len(), 1, "before its time");
     for c in glass.conns.values_mut() {
@@ -1033,4 +1033,16 @@ fn a_link_older_than_the_bond_cannot_replace_it() {
     assert_eq!(glass.conn_fds().len(), 1, "the stranger is still here");
     // The bond closed the window, which stops it first. Were the window open, the bond would.
     assert!(refused_not_paired(&mut stranger));
+}
+
+#[test]
+fn the_handshake_deadline_is_on_the_boot_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let before = super::boot_ms();
+    let _peer = raw_peer(&mut glass, Transport::WifiTcp);
+    let at = glass.handshake_next_deadline().unwrap();
+    // The wall clock is decades ahead of the boot clock: a wall-clock deadline would be there.
+    assert!(at >= before + super::HANDSHAKE_MS);
+    assert!(at <= super::boot_ms() + super::HANDSHAKE_MS);
 }

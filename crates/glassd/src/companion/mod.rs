@@ -61,7 +61,7 @@ const HANDSHAKE_MS: u64 = 30_000;
 pub const PAIRING_WINDOW_DEFAULT_MS: u32 = 120_000;
 pub const PAIRING_WINDOW_MAX_MS: u32 = 300_000;
 
-/// The pairing window's clock. It keeps running through a suspend, so a window cannot outlast its
+/// The clock of the pairing window and of the handshake deadline. It keeps running through a suspend, so a window cannot outlast its
 /// time asleep, and nothing a phone can change moves it, unlike the wall clock.
 fn boot_ms() -> u64 {
     crate::daemon::now().boot_us / 1000
@@ -157,7 +157,7 @@ struct Conn {
     out: Vec<u8>,
     transport: Transport,
     closing: bool,
-    /// A peer that has not finished the handshake goes at this wall-clock time.
+    /// A peer that has not finished the handshake goes at this time ([`boot_ms`]).
     handshake_by_ms: Option<u64>,
 }
 
@@ -346,14 +346,15 @@ impl Companion {
         }
     }
 
-    /// When [`Companion::handshake_tick`] should next run (wall clock, ms).
+    /// When [`Companion::handshake_tick`] should next run ([`crate::daemon::Now::boot_us`], in ms):
+    /// the wall clock can be moved, by the phone too, and would keep a silent peer.
     pub fn handshake_next_deadline(&self) -> Option<u64> {
         self.conns.values().filter_map(|c| c.handshake_by_ms).min()
     }
 
     /// Drops the peers that did not finish the handshake in time.
     pub fn handshake_tick(&mut self) -> Vec<Event> {
-        let now = now_ms();
+        let now = boot_ms();
         let late: Vec<ConnId> = self
             .conns
             .iter()
@@ -665,7 +666,7 @@ impl Companion {
                 out: Vec::new(),
                 transport,
                 closing: false,
-                handshake_by_ms: Some(now_ms() + HANDSHAKE_MS),
+                handshake_by_ms: Some(boot_ms() + HANDSHAKE_MS),
             },
         );
         // Drive the Hello that start() queued against the now-inserted connection.

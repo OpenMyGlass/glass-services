@@ -147,6 +147,7 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             log(&format!("bring-up failed: {e}"));
+            discard_output(uart.fd());
             return ExitCode::FAILURE;
         }
     };
@@ -157,7 +158,7 @@ fn main() -> ExitCode {
         controller.acl_len,
         controller.acl_credits
     ));
-    let tty = uart.into_file();
+    let mut tty = uart.into_file();
     let engine = Engine::new(
         &args.name,
         address,
@@ -165,17 +166,19 @@ fn main() -> ExitCode {
         controller.acl_credits,
         start.elapsed().as_millis() as u64,
     );
-    match run(engine, tty, &args.socket, start) {
+    match run(engine, &mut tty, &args.socket, start) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log(&e);
+            discard_output(tty.as_raw_fd());
             ExitCode::FAILURE
         }
     }
 }
 
 /// The one loop. It sleeps in `poll` until the UART, the session or a one-shot deadline needs it.
-fn run(mut engine: Engine, mut tty: fs::File, socket: &Path, start: Instant) -> Result<(), String> {
+fn run(engine: Engine, tty: &mut fs::File, socket: &Path, start: Instant) -> Result<(), String> {
+    let mut engine = engine;
     let now_ms = || start.elapsed().as_millis() as u64;
     let mut session: Option<UnixStream> = None;
     // The session's far end closed, seen while there was no room to read what remains.
@@ -269,9 +272,7 @@ fn run(mut engine: Engine, mut tty: fs::File, socket: &Path, start: Instant) -> 
             // SAFETY: reading into a buffer of the given length, from standard input.
             let got = unsafe { libc::read(0, b.as_mut_ptr().cast(), b.len()) };
             if got <= 0 {
-                // TCIOFLUSH so that closing the port does not wait for a chip that went away.
-                // SAFETY: on our own descriptor.
-                unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIOFLUSH) };
+                discard_output(tty.as_raw_fd());
                 log("stopping");
                 return Ok(());
             }
@@ -330,6 +331,13 @@ fn run(mut engine: Engine, mut tty: fs::File, socket: &Path, start: Instant) -> 
             engine.session_closed(now);
         }
     }
+}
+
+/// So that closing the port does not wait for a chip that went away: with bytes queued, the kernel
+/// holds the close for up to `closing_wait`, 30 s by default.
+fn discard_output(fd: std::os::fd::RawFd) {
+    // SAFETY: on our own descriptor.
+    unsafe { libc::tcflush(fd, libc::TCIOFLUSH) };
 }
 
 fn connect(socket: &Path) -> std::io::Result<UnixStream> {

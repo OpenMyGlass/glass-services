@@ -487,3 +487,120 @@ fn a_well_behaved_peer_never_gets_near_the_answer_limit() {
     }
     assert!(b.radio.connected());
 }
+
+/// Takes what the engine wrote, as a controller that has gone silent would.
+fn swallow(b: &mut Bench) {
+    let out = b.engine.hci_output().to_vec();
+    b.engine.hci_written(out.len());
+}
+
+#[test]
+fn a_command_with_no_answer_is_fatal_at_its_deadline() {
+    let mut e = Engine::new("t", [1, 2, 3, 4, 5, 0xC6], ACL_LEN, CREDITS, 1000);
+    let out = e.hci_output().len();
+    e.hci_written(out);
+    assert_eq!(e.next_deadline(), Some(1000 + COMMAND_TIMEOUT_MS));
+    e.tick(1000 + COMMAND_TIMEOUT_MS - 1);
+    assert_eq!(e.fatal(), None);
+    e.tick(1000 + COMMAND_TIMEOUT_MS);
+    assert!(e.fatal().unwrap().contains("did not answer"));
+}
+
+#[test]
+fn an_answered_command_leaves_no_deadline() {
+    let mut b = Bench::new();
+    // Only the slowing of the advertising is left.
+    assert_eq!(b.engine.next_deadline(), Some(FAST_ADV_FOR_MS));
+    b.now = 1_000_000;
+    b.engine.tick(b.now);
+    b.settle();
+    assert_eq!(b.engine.next_deadline(), None);
+    b.engine.tick(b.now + 10 * COMMAND_TIMEOUT_MS);
+    assert_eq!(b.engine.fatal(), None);
+}
+
+#[test]
+fn a_uart_that_takes_nothing_is_fatal() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    // No command in flight: only the stream's bytes are waiting for the UART.
+    b.engine.session_data(&data(20), b.now);
+    assert!(!b.engine.hci_output().is_empty());
+    b.engine.tick(OUTPUT_STALL_MS - 1);
+    // Part of it moves: that buys time.
+    b.engine.hci_written(1);
+    b.engine.tick(2 * OUTPUT_STALL_MS - 2);
+    assert_eq!(b.engine.fatal(), None, "it moved a moment ago");
+    b.engine.tick(2 * OUTPUT_STALL_MS - 1);
+    assert!(b.engine.fatal().unwrap().contains("took no bytes"));
+}
+
+#[test]
+fn a_link_that_is_never_confirmed_ended_is_fatal() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    // Nothing left to send, so glassd closing cuts the link at once.
+    b.engine.session_closed(b.now);
+    // The controller takes the Disconnect, says it started, and then nothing more.
+    swallow(&mut b);
+    let mut status = vec![hci::H4_EVENT, hci::EV_COMMAND_STATUS, 4, 0, 1];
+    status.extend_from_slice(&hci::OP_DISCONNECT.to_le_bytes());
+    b.engine.on_hci(&status, b.now);
+    assert_eq!(b.engine.next_deadline(), Some(CUT_TIMEOUT_MS));
+    b.engine.tick(CUT_TIMEOUT_MS - 1);
+    assert_eq!(b.engine.fatal(), None);
+    b.engine.tick(CUT_TIMEOUT_MS);
+    assert!(b.engine.fatal().unwrap().contains("did not end the link"));
+}
+
+#[test]
+fn a_cut_that_the_controller_refuses_is_fatal_at_once() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.session_closed(b.now);
+    swallow(&mut b);
+    let event = [
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0x0C,
+        0x40,
+        0,
+        0x13,
+    ];
+    b.engine.on_hci(&event, b.now);
+    assert!(b.engine.fatal().unwrap().contains("could not end the link"));
+}
+
+#[test]
+fn a_failed_disconnect_nobody_asked_for_is_only_logged() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.take_logs();
+    let event = [
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0x0C,
+        0x40,
+        0,
+        0x13,
+    ];
+    b.engine.on_hci(&event, b.now);
+    assert_eq!(b.engine.fatal(), None);
+    assert_eq!(b.engine.take_logs().len(), 1);
+    assert!(b.radio.connected());
+}
+
+#[test]
+fn a_lost_byte_is_survived_and_a_stream_of_garbage_is_not() {
+    let mut b = Bench::new();
+    b.engine.on_hci(&[0x7F; DESYNC_MAX as usize], b.now);
+    assert_eq!(b.engine.fatal(), None);
+    // A new window forgives what came before.
+    b.now = DESYNC_WINDOW_MS;
+    b.engine.on_hci(&[0x7F; DESYNC_MAX as usize], b.now);
+    assert_eq!(b.engine.fatal(), None);
+    b.engine.on_hci(&[0x7F; 1], b.now);
+    assert!(b.engine.fatal().unwrap().contains("no packet"));
+}

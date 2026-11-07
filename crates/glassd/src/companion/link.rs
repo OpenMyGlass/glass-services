@@ -11,7 +11,8 @@
 //! 1. [`Link::start`] sends our `Hello`.
 //! 2. On the peer `Hello`: protocol-version check, then authorize — already bonded + same key
 //!    is a reuse; already bonded + different key is rejected with `Error{UnknownPeer}`;
-//!    unbonded runs the one-time pairing (`PairRequest` -> `PairAccept` -> `PairResult`).
+//!    unbonded runs the one-time pairing (`PairRequest` -> `PairAccept` -> `PairResult`), if
+//!    pairing is permitted right now: [`Link::set_pairing_enabled`].
 //! 3. Mutual auth: each side signs `"openmyglass-companion-auth-v1" || nonce`.
 //! 4. Key exchange (`omg_core::secure`, shared with the companion): from here on nothing but sealed
 //!    frames count, and everything we send is sealed by [`Link::encode`].
@@ -33,6 +34,9 @@ use omg_core::secure::{
 use super::identity::{Identity, decode_nonce, verify_challenge};
 use super::now_ms;
 use super::store::{PairingRecord, record};
+
+/// What a peer hears when it tries to pair and may not. A phone shows it: the owner can act on it.
+const PAIRING_OFF: &str = "pairing mode is off: turn it on on the Glass, then try again";
 
 /// What the device reports in `Status`/`BatteryStatus`. The daemon keeps this in step with the
 /// real hardware (battery from `/sys/class/power_supply`, locale from the settings, radios from
@@ -200,7 +204,8 @@ impl Link {
         self.capabilities.push(capability.to_string());
     }
 
-    /// Permits or forbids a first pairing with an unbonded peer (the setup window).
+    /// Permits or forbids a first pairing with an unbonded peer (the setup window). This counts at
+    /// every step of the pairing, so a window that closes also stops one under way.
     pub fn set_pairing_enabled(&mut self, enabled: bool) {
         self.pairing_enabled = enabled;
     }
@@ -384,11 +389,7 @@ impl Link {
             return;
         }
         if !self.pairing_enabled {
-            self.error(
-                out,
-                ErrorCode::NotPaired,
-                "no pairing and new pairing not permitted",
-            );
+            self.error(out, ErrorCode::NotPaired, PAIRING_OFF);
             return;
         }
         // Unbonded: wait for the companion's PairRequest (Glass accepts a one-time pairing).
@@ -396,6 +397,10 @@ impl Link {
     }
 
     fn on_pair_request(&mut self, frame: Frame, out: &mut Vec<Out>) {
+        if !self.pairing_enabled {
+            self.error(out, ErrorCode::NotPaired, PAIRING_OFF);
+            return;
+        }
         match frame {
             Frame::PairRequest(req)
                 if self
@@ -428,6 +433,10 @@ impl Link {
     }
 
     fn on_pair_result(&mut self, frame: Frame, out: &mut Vec<Out>) {
+        if !self.pairing_enabled {
+            self.error(out, ErrorCode::NotPaired, PAIRING_OFF);
+            return;
+        }
         let Phase::AwaitingPairResult(rec) = &self.phase else {
             return;
         };

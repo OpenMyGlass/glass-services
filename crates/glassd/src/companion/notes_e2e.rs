@@ -16,8 +16,11 @@ use omg_protocol::{Frame, FrameDecoder, capability};
 use super::link::DeviceState;
 use super::{Companion, ConnId, Event};
 
+/// With the pairing mode open, for a first pairing. A bonded Glass refuses to open it.
 fn glass(dir: &Path) -> Companion {
-    Companion::new(dir, DeviceState::default(), None, false).unwrap()
+    let mut c = Companion::new(dir, DeviceState::default(), None, false).unwrap();
+    let _ = c.open_pairing_window(0);
+    c
 }
 
 /// The phone: handshake and note driver on a socket it owns, as an app would.

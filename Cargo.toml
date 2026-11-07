@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor"]
-members = ["crates/glass-api", "crates/glass-gesture", "crates/glass-evdev", "crates/glass-head", "crates/glass-hub", "crates/glass-qr", "crates/glassd"]
+members = ["crates/glass-api", "crates/glass-gesture", "crates/glass-evdev", "crates/glass-head", "crates/glass-hub", "crates/glass-qr", "crates/glassd", "crates/omg-bled"]
 
 [workspace.package]
 version = "0.1.0"

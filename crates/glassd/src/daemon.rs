@@ -14,14 +14,15 @@ use crate::radio::Radio;
 use crate::screen::{Change, Now, ScreenPolicy};
 use crate::settings_store::SettingsStore;
 use crate::touch::{ScreenOffInput, Step, TouchGate};
+use crate::wifi_setup::{self, Finished, WifiSetup};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
     CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
     CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, Locale,
-    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
-    client_frame, dictation_state, service_frame,
+    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource,
+    WifiSetupPhase, WifiSetupState, Wink, client_frame, dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -108,6 +109,9 @@ pub struct Options {
     pub iio_dev: Option<PathBuf>,
     /// Which peers may connect (docs/api.md, "Who may connect").
     pub peers: PeerPolicy,
+    /// The uids, besides glassd's own, that may act for the owner (docs/api.md, "Privileged
+    /// clients"): the launcher's, if it runs as another. Never an app's.
+    pub privileged_uids: Vec<u32>,
     /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
     /// touches into navigation keys (docs/api.md, "Android glue").
     pub grab_touchpad: bool,
@@ -123,6 +127,9 @@ pub struct Options {
     pub companion_tcp_port: Option<u16>,
     /// Advertise and accept the Bluetooth RFCOMM companion link (needs the `linux-bt` feature).
     pub companion_bt: bool,
+    /// Run `omg-bled` and take the phone link over BLE (`None`: no BLE). Needs `radio` and
+    /// `companion`.
+    pub ble: Option<BleOptions>,
     /// Where the companion link learns that the random pool is seeded (`/dev/random`).
     pub companion_rng_device: PathBuf,
     /// Where to read the battery for the companion `BatteryStatus`/`Status`.
@@ -193,6 +200,21 @@ pub struct Daemon {
     /// passed by Android's init.
     owns_socket: bool,
     peers: PeerPolicy,
+    privileged_uids: Vec<u32>,
+    /// The session was active at the last look: TCP is closed for it, and suspend is held off.
+    wifi_setup_was_active: bool,
+    /// The random pool passed the test once in this process. It drains afterwards, as reads take
+    /// from it, but the `getrandom` crate does not need it to pass again. A restarted glassd tests
+    /// again: the kernel keeps its pool across a restart, so it passes again unless drained.
+    wifi_setup_pool_ok: bool,
+    /// Who changed the Wi-Fi wish during a session: see [`WishDuringSetup`].
+    wifi_wish: WishDuringSetup,
+    /// Readable when a termination signal came in: see [`catch_termination`].
+    term_fd: Option<RawFd>,
+    terminating: bool,
+    /// The client that last opened the pairing mode: when it disconnects, the mode closes, so
+    /// a launcher that crashed or lost its connection does not leave it open behind it.
+    pairing_opener: Option<ClientId>,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -217,6 +239,8 @@ pub struct Daemon {
     store: Option<SettingsStore>,
     /// Wi-Fi / Bluetooth control (`None`: this build does not manage the radios, e.g. Android).
     radio: Option<Radio>,
+    /// Setting up Wi-Fi from a browser (`None`: no radio control, or nowhere to store a network).
+    wifi_setup: Option<WifiSetup>,
     /// The idle -> suspend decision (always present; inert when the back end is absent).
     power_policy: PowerPolicy,
     /// How long off the head, for the wake alarm and the power-off.
@@ -269,6 +293,175 @@ fn sync_attr(
             false
         }
     }
+}
+
+/// How to run the BLE engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BleOptions {
+    /// The `omg-bled` program.
+    pub engine: PathBuf,
+    /// The Bluetooth firmware patch on the image. A vendor file: it is not in any repository.
+    pub firmware: PathBuf,
+    /// The Unix socket the engine connects to for each phone session.
+    pub socket: PathBuf,
+}
+
+/// BLE, if it was asked for and can run: glassd must hold the radios and the link, and the engine
+/// must be on the image. Otherwise Bluetooth stays as it is without it.
+fn usable_ble(opts: &Options) -> Option<BleOptions> {
+    let ble = opts.ble.as_ref()?;
+    if !opts.radio || !opts.companion {
+        warn!("companion: BLE needs --radio on and --companion on");
+        return None;
+    }
+    if !ble.engine.exists() {
+        warn!("companion: no BLE engine at {}", ble.engine.display());
+        return None;
+    }
+    Some(ble.clone())
+}
+
+fn ble_command(ble: &BleOptions, opts: &Options) -> Vec<std::ffi::OsString> {
+    let state_dir = opts
+        .state_dir
+        .clone()
+        .unwrap_or_else(crate::settings_store::default_state_dir);
+    vec![
+        ble.engine.clone().into(),
+        "--socket".into(),
+        ble.socket.clone().into(),
+        "--state-dir".into(),
+        state_dir.into(),
+        "--firmware".into(),
+        ble.firmware.clone().into(),
+    ]
+}
+
+/// Whether a peer with `uid` may act for the owner: glassd's own uid, and those it was given.
+/// Holds only as far as uids differ: on an image that runs everything as root, everything is.
+fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    uid == unsafe { libc::geteuid() } || allowed.contains(&uid)
+}
+
+/// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
+const CAP_COMPANION_BLE: &str = "companion-ble";
+
+/// Whether a session that joined its network may turn `wifi_enabled` on: not if the owner turned
+/// it off while the session ran, which would be undoing the owner's last word.
+#[derive(Debug, Default)]
+struct WishDuringSetup {
+    last: bool,
+    turned_off: bool,
+}
+
+impl WishDuringSetup {
+    fn session_started(&mut self) {
+        self.turned_off = false;
+    }
+
+    fn changed(&mut self, in_setup: bool, wish: bool) {
+        if in_setup && self.last && !wish {
+            self.turned_off = true;
+        }
+        self.last = wish;
+    }
+
+    fn joined_turns_wifi_on(&self) -> bool {
+        !self.turned_off
+    }
+}
+
+/// The write end of the pipe that [`catch_termination`] returns the other end of.
+static TERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_termination(_: libc::c_int) {
+    let fd = TERM_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: `write` may be called from a signal handler; the byte is a live local.
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// From now on `SIGTERM` and `SIGINT` make the returned descriptor readable instead of ending the
+/// process at once, for [`Daemon::watch_termination`]. By a pipe, and not a flag, because the daemon
+/// can be blocked in `poll` with no timeout and the signal can come just before it gets there.
+pub fn catch_termination() -> io::Result<RawFd> {
+    let mut fds = [0; 2];
+    // SAFETY: a live array of two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    TERM_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler above does only what a handler may.
+        if unsafe { libc::signal(signal, on_termination as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fds[0])
+}
+
+/// The session's language, as the launcher's.
+fn wifi_setup_lang(locale: Option<i32>) -> wifi_setup::http::Lang {
+    use wifi_setup::http::Lang;
+    match locale.and_then(|v| Locale::try_from(v).ok()) {
+        Some(Locale::It) => Lang::It,
+        Some(Locale::Fr) => Lang::Fr,
+        Some(Locale::Es) => Lang::Es,
+        _ => Lang::En,
+    }
+}
+
+/// How a Wi-Fi setup session is wired: for real, or with `--mock` on the loopback interface with
+/// stand-in files and a short join. `None` if the stand-ins cannot be made.
+fn wifi_setup_config(opts: &Options, state_dir: &Path) -> Option<wifi_setup::Config> {
+    use wifi_setup::ap::{AP_IP, ApPaths};
+    use wifi_setup::portal::Binding;
+    let wifi_conf = state_dir.join(crate::radio::WIFI_CONF_FILE);
+    if !opts.mock {
+        return Some(wifi_setup::Config {
+            paths: ApPaths::system(),
+            binding: Binding {
+                device: opts.wifi_iface.clone(),
+                ip: AP_IP,
+                port: 80,
+            },
+            wifi_conf,
+            timeouts: wifi_setup::Timeouts::default(),
+            assume_enabled: false,
+        });
+    }
+    let (firmware_param, stock_firmware) = (
+        state_dir.join("mock-firmware-path"),
+        state_dir.join("mock-firmware"),
+    );
+    std::fs::create_dir_all(state_dir).ok()?;
+    std::fs::write(&firmware_param, "").ok()?;
+    std::fs::write(&stock_firmware, "").ok()?;
+    Some(wifi_setup::Config {
+        paths: ApPaths {
+            run_dir: state_dir.join("mock-ap"),
+            firmware_param,
+            stock_firmware,
+        },
+        binding: Binding {
+            device: "lo".into(),
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            port: 0,
+        },
+        wifi_conf,
+        timeouts: wifi_setup::Timeouts {
+            settle_us: 10_000,
+            enable_us: 1_000_000,
+            session_us: 600_000_000,
+            flush_us: 100_000,
+            join_us: 500_000,
+        },
+        assume_enabled: true,
+    })
 }
 
 /// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
@@ -641,7 +834,9 @@ impl Daemon {
             cfg.scroll_min_step = v;
         }
         let store = opts.state_dir.as_ref().map(SettingsStore::new);
-        let settings = match &store {
+        let ble = usable_ble(opts);
+        let first_run = store.as_ref().is_some_and(|st| !st.path().exists());
+        let mut settings = match &store {
             Some(st) => st.load().unwrap_or_else(|e| {
                 warn!(
                     "cannot read {}: {e}; using the defaults",
@@ -651,6 +846,12 @@ impl Daemon {
             }),
             None => settings_rules::defaults(),
         };
+        // On BLE the phone reaches the Glass through Bluetooth, so that is what a new Glass does,
+        // on an image that asks for it. After that it is the owner's setting like any other. The
+        // radio being on bonds nobody: first pairing over BLE takes the owner's pairing mode.
+        if ble.is_some() && first_run {
+            settings.bluetooth_enabled = Some(true);
+        }
         let policy = ScreenPolicy::new(t, settings.screen_timeout_ms.unwrap_or(120_000));
         let (glasshub, camera_dev, power_dev, imu) = if opts.mock {
             (None, None, None, None)
@@ -677,11 +878,19 @@ impl Daemon {
         } else {
             opts.radio.then(|| {
                 let radio = Radio::system(opts.wifi_iface.clone());
-                match &opts.state_dir {
+                let radio = match &opts.state_dir {
                     Some(dir) => radio.with_wifi_conf(dir.join(crate::radio::WIFI_CONF_FILE)),
+                    None => radio,
+                };
+                match &ble {
+                    Some(b) => radio.with_ble_engine(ble_command(b, opts)),
                     None => radio,
                 }
             })
+        };
+        let wifi_setup = match (&radio, &opts.state_dir) {
+            (Some(_), Some(dir)) => wifi_setup_config(opts, dir).map(WifiSetup::new),
+            _ => None,
         };
         // The energy-policy back end: recorded with --mock (never touches the host's power
         // sysfs), real otherwise when --power is on. Android leaves power to the framework.
@@ -730,7 +939,12 @@ impl Daemon {
                 opts.companion_bt,
                 &opts.companion_rng_device,
             ) {
-                Ok(c) => Some(c),
+                Ok(mut c) => {
+                    if let Some(b) = &ble {
+                        c.set_ble_socket(b.socket.clone());
+                    }
+                    Some(c)
+                }
                 Err(e) => {
                     warn!("companion: disabled ({e})");
                     None
@@ -756,6 +970,9 @@ impl Daemon {
             if radio.is_some() {
                 c.push("radio");
             }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
+            }
             if power.is_some() {
                 c.push("power");
             }
@@ -780,6 +997,9 @@ impl Daemon {
             }
             if radio.is_some() {
                 c.push("radio");
+            }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
             }
             if power.is_some() {
                 c.push("power");
@@ -816,6 +1036,13 @@ impl Daemon {
             socket_path: opts.socket.clone(),
             owns_socket,
             peers: opts.peers.clone(),
+            privileged_uids: opts.privileged_uids.clone(),
+            wifi_setup_was_active: false,
+            wifi_setup_pool_ok: false,
+            wifi_wish: WishDuringSetup::default(),
+            term_fd: None,
+            terminating: false,
+            pairing_opener: None,
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -837,6 +1064,7 @@ impl Daemon {
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
             radio,
+            wifi_setup,
             power_policy,
             off_head,
             suspend_offset_us: None,
@@ -854,6 +1082,7 @@ impl Daemon {
         };
         if d.companion.is_some() {
             d.battery_deadline = Some(now().mono_us);
+            d.publish_link_pairing();
         }
         // A previous run may have left the touchpad asleep.
         if d.mock.is_none() {
@@ -873,9 +1102,15 @@ impl Daemon {
             d.wear.on_head(),
             d.policy.screen(),
         );
+        // A session left by a daemon that died must not outlive it: its access point goes first.
+        if let (Some(w), Some(r)) = (&mut d.wifi_setup, &mut d.radio) {
+            let u = w.cleanup_stale(r, now().mono_us);
+            d.wifi_setup_update(u);
+        }
         // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
         // off by default and a prior run's state does not leak in.
         let s = d.settings();
+        d.wifi_wish.last = s.wifi_enabled.unwrap_or(false);
         d.apply_radio(&s);
         // Start the energy policy: runtime-PM auto, arm wake sources, take the wakelock, and set
         // the active (screen-on) cpufreq profile. Best effort; inert without a back end.
@@ -887,9 +1122,29 @@ impl Daemon {
 
     /// Runs forever (until a fatal error).
     pub fn run(&mut self) -> io::Result<()> {
-        loop {
-            self.step()?;
+        let mut result = Ok(());
+        while !self.terminating {
+            if let Err(e) = self.step() {
+                result = Err(e);
+                break;
+            }
         }
+        if result.is_ok() {
+            info!("exiting on a signal");
+        }
+        // On an error too: the access point must not outlive the daemon. Only what the session
+        // started is stopped; normal Wi-Fi stays as it is, so that a restart over SSH keeps the
+        // link, and one left running is dealt with at the next start.
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            w.shutdown(r);
+        }
+        result
+    }
+
+    /// `run` returns, after ending what must not outlive the daemon, when `fd` is readable. See
+    /// [`catch_termination`].
+    pub fn watch_termination(&mut self, fd: RawFd) {
+        self.term_fd = Some(fd);
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -914,6 +1169,10 @@ impl Daemon {
                 }),
             self.hub.next_deadline(),
             self.battery_deadline,
+            self.wifi_setup.as_ref().and_then(WifiSetup::next_deadline),
+            self.radio
+                .as_ref()
+                .and_then(Radio::association_next_deadline),
             self.companion.as_ref().and_then(|c| {
                 // Wall clock to the monotonic base, and never a busy loop.
                 let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
@@ -923,6 +1182,22 @@ impl Daemon {
                 let wait_ms = c.rng_next_deadline()?.saturating_sub(companion::now_ms());
                 Some(now().mono_us + wait_ms * 1000)
             }),
+            self.companion.as_ref().and_then(|c| {
+                let t = now();
+                let wait_ms = c.pairing_next_deadline()?.saturating_sub(t.boot_us / 1000);
+                Some(t.mono_us + wait_ms * 1000)
+            }),
+            self.companion.as_ref().and_then(|c| {
+                let t = now();
+                let wait_ms = c
+                    .handshake_next_deadline()?
+                    .saturating_sub(t.boot_us / 1000);
+                Some(t.mono_us + wait_ms * 1000)
+            }),
+            self.radio
+                .as_ref()
+                .and_then(Radio::ble_next_deadline)
+                .map(|ms| ms * 1000),
         ]
         .into_iter()
         .flatten()
@@ -966,6 +1241,9 @@ impl Daemon {
             CompanionRng,
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
+            BleEngine,
+            WifiSetup,
+            Terminate,
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -1027,6 +1305,17 @@ impl Daemon {
                 add(fd, ev, Src::CompanionConn(id));
             }
         }
+        if let Some(fd) = self.radio.as_ref().and_then(Radio::ble_fd) {
+            add(fd, libc::POLLIN, Src::BleEngine);
+        }
+        if let Some(w) = &self.wifi_setup {
+            for (fd, events) in w.fds() {
+                add(fd, events, Src::WifiSetup);
+            }
+        }
+        if let Some(fd) = self.term_fd {
+            add(fd, libc::POLLIN, Src::Terminate);
+        }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -1059,7 +1348,14 @@ impl Daemon {
             }
             match src {
                 Src::Listener => self.accept(),
+                Src::Terminate => self.terminating = true,
                 Src::Touchpad => self.read_touchpad(),
+                Src::WifiSetup => {
+                    let t = now().mono_us;
+                    if let Some(u) = self.wifi_setup.as_mut().map(|w| w.on_ready(pfd.fd, t)) {
+                        self.wifi_setup_update(u);
+                    }
+                }
                 Src::Stdin => self.read_stdin(),
                 Src::Key(id) => self.read_key(id),
                 Src::DonDoff => {
@@ -1104,9 +1400,29 @@ impl Daemon {
                     }
                     self.companion_events(events);
                 }
+                Src::BleEngine => {
+                    if let Some(radio) = &mut self.radio {
+                        radio.on_ble_event(now().mono_us / 1000);
+                    }
+                    self.sync_ble_capability();
+                }
             }
         }
         Ok(())
+    }
+
+    /// The capability says what the engine does now. A client reads it in its `Welcome`.
+    fn sync_ble_capability(&mut self) {
+        let running = self.radio.as_ref().is_some_and(Radio::ble_running);
+        let shown = self
+            .hub
+            .capabilities()
+            .iter()
+            .any(|c| c == CAP_COMPANION_BLE);
+        if running != shown {
+            self.hub.set_capability(CAP_COMPANION_BLE, running);
+            info!("companion: BLE {}", if running { "up" } else { "down" });
+        }
     }
 
     fn timers(&mut self, t: Now) {
@@ -1152,6 +1468,21 @@ impl Daemon {
             .map(|c| c.rng_tick())
             .unwrap_or_default();
         self.companion_events(events);
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.handshake_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.pairing_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
+        if let Some(radio) = &mut self.radio {
+            radio.ble_tick(t.mono_us / 1000);
+        }
         // Energy policy: the deep-idle window may have elapsed (screen off long enough).
         if self.power_io.is_some()
             && let Some(PowerAction::Suspend) = self.power_policy.on_timeout(t.mono_us)
@@ -1164,13 +1495,21 @@ impl Daemon {
         if self.power_io.is_some() && self.off_head.power_off_due(t.boot_us) {
             self.power_off_if_unplugged(t);
         }
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.tick(r, t.mono_us);
+            self.wifi_setup_update(u);
+        }
+        if let Some(r) = &mut self.radio {
+            r.association_tick(t.mono_us);
+        }
         self.run_mock_commands();
     }
 
     /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
     /// desk is not found off: the wait starts again. So it does if powering off failed.
     fn power_off_if_unplugged(&mut self, t: Now) {
-        let cable = companion::battery::cable_connected(&self.power_supply);
+        let busy = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        let cable = busy || companion::battery::cable_connected(&self.power_supply);
         if !cable && let Some(power) = &mut self.power_io {
             power.power_off();
         }
@@ -1216,7 +1555,15 @@ impl Daemon {
                         continue;
                     }
                     let id = self.hub.add_client();
-                    info!("client {id} connected ({who})");
+                    let privileged =
+                        cred.is_some_and(|(uid, _)| is_privileged(uid, &self.privileged_uids));
+                    if privileged {
+                        self.hub.allow_privileged(id);
+                    }
+                    info!(
+                        "client {id} connected ({who}{})",
+                        if privileged { ", privileged" } else { "" }
+                    );
                     self.conns.insert(
                         id,
                         Conn {
@@ -1303,6 +1650,14 @@ impl Daemon {
         self.policy.client_gone(now(), id);
         self.head_requests.remove(&id);
         self.effects(fx);
+        if self.pairing_opener == Some(id) {
+            self.pairing_opener = None;
+            if let Some(c) = &mut self.companion {
+                info!("companion: client {id} that opened the pairing mode is gone: closing it");
+                let events = c.close_pairing_window();
+                self.companion_events(events);
+            }
+        }
     }
 
     fn flush(&mut self, t: Now) {
@@ -1354,6 +1709,7 @@ impl Daemon {
                     }
                 }
                 Effect::SettingsChanged(s) => self.settings_changed(&s),
+                Effect::WifiSetup { start } => self.wifi_setup_request(start),
                 Effect::Head { client, request } => {
                     self.head_requests
                         .insert(client, (request.relative_look_up, request.nudge));
@@ -1386,6 +1742,14 @@ impl Daemon {
                         None => companion::notes::refused_speak(&speak),
                     };
                     self.companion_events(events);
+                }
+                Effect::CompanionPairingWindow {
+                    client,
+                    seq,
+                    request,
+                } => self.companion_pairing_window(client, seq, request),
+                Effect::CompanionForgetBond { client, seq } => {
+                    self.companion_forget_bond(client, seq)
                 }
             }
         }
@@ -1823,6 +2187,7 @@ impl Daemon {
                 // settings_changed pushes the result back to the companion.
                 E::SettingsSet(s) => self.apply_settings_change(settings_from_companion(&s)),
                 E::Note(event) => self.publish(service_frame::Body::NoteEvent(event)),
+                E::PairingChanged => self.publish_link_pairing(),
                 E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
                     to_proto_notification(n),
                 )),
@@ -1900,6 +2265,61 @@ impl Daemon {
             None => Vec::new(),
         };
         self.companion_events(events);
+    }
+
+    fn refuse_client(&mut self, client: ClientId, code: ErrorCode, message: &str, seq: u32) {
+        let frame = glass_api::hub::error(code, message, seq);
+        self.effects(vec![Effect::Send(client, frame)]);
+    }
+
+    fn companion_pairing_window(
+        &mut self,
+        client: ClientId,
+        seq: u32,
+        request: glass_api::proto::CompanionPairingWindow,
+    ) {
+        let Some(c) = &mut self.companion else {
+            let code = ErrorCode::Unsupported;
+            return self.refuse_client(client, code, "glassd does not hold the phone link", seq);
+        };
+        if !request.open {
+            self.pairing_opener = None;
+            let events = c.close_pairing_window();
+            return self.companion_events(events);
+        }
+        match c.open_pairing_window(request.duration_ms) {
+            Ok(events) => {
+                self.pairing_opener = Some(client);
+                self.companion_events(events)
+            }
+            Err(why) => self.refuse_client(client, ErrorCode::Unavailable, &why, seq),
+        }
+    }
+
+    fn companion_forget_bond(&mut self, client: ClientId, seq: u32) {
+        let Some(c) = &mut self.companion else {
+            let code = ErrorCode::Unsupported;
+            return self.refuse_client(client, code, "glassd does not hold the phone link", seq);
+        };
+        let (events, cleared) = c.unpair();
+        self.companion_events(events);
+        if let Err(e) = cleared {
+            let why = format!("the bond is still on disk: {e}");
+            self.refuse_client(client, ErrorCode::Unavailable, &why, seq);
+        }
+    }
+
+    /// Tells the launcher about the bond and the pairing mode. These exist with no provider
+    /// registered, and with no phone connected.
+    fn publish_link_pairing(&mut self) {
+        let Some(c) = &self.companion else { return };
+        let until_us = c
+            .pairing_left_ms()
+            .map_or(0, |left| now().mono_us + left * 1000);
+        let paired = c.paired();
+        let name = c.paired_name().unwrap_or_default().to_string();
+        let fx = self.hub.set_link_pairing(paired, name, until_us);
+        self.effects(fx);
     }
 
     /// A companion authenticated: register as the hub's companion provider (if not already) and
@@ -2002,6 +2422,13 @@ impl Daemon {
             "companion: QR ssid {:?} addr {:?}",
             boot.ssid, boot.companion_addr
         );
+        // The radio is the setup session's: joining from here would run a supplicant beside its
+        // access point, and the session would then restore the radio over it. The QR can be
+        // scanned again once the session is over.
+        if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+            warn!("companion: QR ignored while a Wi-Fi setup session runs");
+            return;
+        }
         if let Some(radio) = &mut self.radio {
             match companion::bootstrap::wpa_supplicant_conf(
                 &boot.ssid,
@@ -2021,7 +2448,9 @@ impl Daemon {
         }
         if let Some(addr) = &boot.companion_addr {
             match &mut self.companion {
-                Some(c) => match c.connect_tcp(addr) {
+                // The owner scanned the QR, which is meant for a first pairing: this one
+                // connection may pair. A bonded Glass keeps its bond all the same.
+                Some(c) => match c.dial_to_pair(addr) {
                     Ok(events) => self.companion_events(events),
                     Err(e) => warn!("companion: cannot dial {addr} ({e})"),
                 },
@@ -2244,12 +2673,22 @@ impl Daemon {
 
     /// Applies and stores changed settings.
     fn settings_changed(&mut self, s: &Settings) {
+        let in_setup = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        self.wifi_wish
+            .changed(in_setup, s.wifi_enabled.unwrap_or(false));
         if let Some(ms) = s.screen_timeout_ms {
             self.policy.set_timeout(ms);
         }
         let detection = s.on_head_detection_enabled.unwrap_or(false) && self.hub_present();
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
+        // Airplane mode and the setting going off end a session; the radio follows when it has.
+        if !s.wifi_setup_ap_enabled.unwrap_or(false) || s.airplane_mode.unwrap_or(false) {
+            let t = now().mono_us;
+            if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+                self.wifi_setup_request_stop(t);
+            }
+        }
         self.apply_radio(s);
         self.apply_power(s);
         // Keep the companion's reported UI language in step (idempotent; pushes LocaleChanged to
@@ -2273,6 +2712,92 @@ impl Daemon {
         }
     }
 
+    /// A client asked to start or stop a Wi-Fi setup session.
+    fn wifi_setup_request(&mut self, start: bool) {
+        let t = now().mono_us;
+        if !start {
+            self.wifi_setup_request_stop(t);
+            return;
+        }
+        let s = self.settings();
+        let ctx = wifi_setup::Context {
+            enabled: s.wifi_setup_ap_enabled.unwrap_or(false),
+            airplane: s.airplane_mode.unwrap_or(false),
+            // The companion's gate when it runs; the same test without it, for an owner who has
+            // no phone and runs with --companion off.
+            pool_ready: {
+                self.wifi_setup_pool_ok = self.wifi_setup_pool_ok
+                    || self.mock.is_some()
+                    || self.companion.as_ref().is_some_and(|c| c.rng_ready())
+                    || companion::entropy::ready_for_a_secret();
+                self.wifi_setup_pool_ok
+            },
+            lang: wifi_setup_lang(s.locale),
+        };
+        let u = match (&mut self.wifi_setup, &mut self.radio) {
+            (Some(w), Some(r)) => w.start(r, ctx, t),
+            _ => wifi_setup::Update {
+                state: Some(WifiSetupState {
+                    phase: WifiSetupPhase::Failed as i32,
+                    error: wifi_setup::ERR_NO_TOOLS.into(),
+                    ..Default::default()
+                }),
+                finished: None,
+            },
+        };
+        self.wifi_setup_update(u);
+    }
+
+    fn wifi_setup_request_stop(&mut self, t: u64) {
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.stop(r, t);
+            self.wifi_setup_update(u);
+        }
+    }
+
+    /// Acts on what the session says: the system stays up while it runs, and at its end the radio
+    /// goes back to the settings, or the settings follow the network that worked.
+    fn wifi_setup_update(&mut self, u: wifi_setup::Update) {
+        let active = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        self.power_policy.set_held(active);
+        if active != self.wifi_setup_was_active {
+            self.wifi_setup_was_active = active;
+            if active {
+                self.wifi_wish.session_started();
+            }
+            if active && let Some(power) = &mut self.power_io {
+                power.stay_awake();
+            }
+            let events = match &mut self.companion {
+                Some(c) => c.set_tcp_closed(active),
+                None => Vec::new(),
+            };
+            self.companion_events(events);
+        }
+        if let Some(state) = u.state {
+            self.publish(service_frame::Body::WifiSetupState(state));
+        }
+        match u.finished {
+            Some(Finished::Joined) => {
+                if self.wifi_wish.joined_turns_wifi_on() {
+                    self.apply_settings_change(Settings {
+                        wifi_enabled: Some(true),
+                        ..Default::default()
+                    });
+                } else {
+                    // Joined and stored, but the owner turned Wi-Fi off meanwhile: that stands.
+                    let s = self.settings();
+                    self.apply_radio(&s);
+                }
+            }
+            Some(Finished::Restore) => {
+                let s = self.settings();
+                self.apply_radio(&s);
+            }
+            None => {}
+        }
+    }
+
     /// Drives the radios to match the settings. Airplane mode forces both off while keeping the
     /// per-radio wishes, which are restored when it is turned off.
     fn apply_radio(&mut self, s: &Settings) {
@@ -2281,6 +2806,7 @@ impl Daemon {
         };
         let (wifi, bluetooth) = effective_radio(s);
         radio.apply(wifi, bluetooth);
+        self.sync_ble_capability();
     }
 
     /// Applies the energy-policy settings: update the idle -> suspend decision and re-apply the
@@ -2515,12 +3041,14 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
             companion: false,
             companion_tcp_port: None,
             companion_bt: false,
+            ble: None,
             companion_rng_device: crate::companion::entropy::RANDOM_DEVICE.into(),
             power_supply: crate::companion::battery::DEFAULT_ROOT.into(),
             energy: false,
@@ -2541,6 +3069,131 @@ mod tests {
         s.on_head_detection_enabled = Some(on);
         d.hub.set_settings_source(s);
         d.settings_changed(&s);
+    }
+
+    fn ble_opts(d: &Path, ble: Option<BleOptions>) -> Options {
+        Options {
+            socket: d.join("glassd.sock"),
+            mock: true,
+            device: None,
+            device_name: TOUCHPAD_NAME.into(),
+            invert_x: false,
+            invert_y: false,
+            tap_slop: None,
+            swipe_min_travel: None,
+            scroll_min_step: None,
+            screen_off_input: ScreenOffInput::Touches,
+            glasshub: None,
+            gaze_params: None,
+            camera: Source::Off,
+            power: Source::Off,
+            touchpad_sysfs: None,
+            state_dir: Some(d.join("state")),
+            iio: None,
+            iio_dev: None,
+            peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
+            grab_touchpad: false,
+            radio: true,
+            wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
+            companion: true,
+            companion_tcp_port: None,
+            companion_bt: false,
+            ble,
+            companion_rng_device: crate::companion::entropy::RANDOM_DEVICE.into(),
+            power_supply: d.join("no-power-supply"),
+            energy: false,
+            power_paths: PowerPaths::default(),
+        }
+    }
+
+    #[test]
+    fn a_new_glass_with_ble_has_bluetooth_on_and_the_owner_s_choice_stays() {
+        let d = tempfile::tempdir().unwrap();
+        let engine = d.path().join("engine");
+        std::fs::write(&engine, "").unwrap();
+        let ble = BleOptions {
+            engine,
+            firmware: d.path().join("fw"),
+            socket: d.path().join("ble.sock"),
+        };
+        let opts = ble_opts(d.path(), Some(ble.clone()));
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(true));
+        let mut s = daemon.settings();
+        s.bluetooth_enabled = Some(false);
+        daemon.settings_changed(&s);
+        daemon.hub.set_settings_source(s);
+        drop(daemon);
+        std::fs::remove_file(d.path().join("glassd.sock")).ok();
+        let daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(false));
+        drop(daemon);
+
+        // Without the engine on the image, or not asked for: Bluetooth as it always was.
+        let e = tempfile::tempdir().unwrap();
+        std::fs::remove_file(d.path().join("glassd.sock")).ok();
+        let missing = BleOptions {
+            engine: e.path().join("absent"),
+            ..ble
+        };
+        let daemon = Daemon::new(
+            &ble_opts(e.path(), Some(missing)),
+            Box::new(crate::display::LoggingDisplay),
+        )
+        .unwrap();
+        assert_eq!(daemon.settings().bluetooth_enabled, Some(false));
+    }
+
+    /// With a shell script as the engine, through the daemon's own loop.
+    #[test]
+    fn the_capability_is_there_only_while_the_engine_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::new(
+            &ble_opts(d.path(), None),
+            Box::new(crate::display::LoggingDisplay),
+        )
+        .unwrap();
+        let has = |daemon: &Daemon| {
+            daemon
+                .hub
+                .capabilities()
+                .iter()
+                .any(|c| c == CAP_COMPANION_BLE)
+        };
+        assert!(!has(&daemon));
+        let script = format!(
+            "cd {}; echo ready; while [ ! -e die ]; do sleep 0.01; done",
+            d.path().display()
+        );
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        daemon.radio = Some(Radio::recording("wlan0", log.clone()).with_ble_engine(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+        ]));
+        let mut s = daemon.settings();
+        s.bluetooth_enabled = Some(true);
+        daemon.settings_changed(&s);
+        assert!(!has(&daemon), "not before it says it is up");
+
+        let until = |daemon: &mut Daemon, want: bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(10);
+            while has(daemon) != want {
+                assert!(std::time::Instant::now() < end, "timed out");
+                daemon.step().unwrap();
+            }
+        };
+        until(&mut daemon, true);
+        std::fs::write(d.path().join("die"), "").unwrap();
+        until(&mut daemon, false);
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "rfkill block bluetooth"),
+            "a dead engine leaves the chip on"
+        );
     }
 
     /// The boot this exists for: the random pool is not seeded and no identity is stored.
@@ -2571,12 +3224,14 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
             companion: true,
             companion_tcp_port: Some(0),
             companion_bt: false,
+            ble: None,
             companion_rng_device: pool.path.clone(),
             power_supply: d.join("no-power-supply"),
             energy: false,
@@ -2607,6 +3262,323 @@ mod tests {
         daemon.step().unwrap();
         assert!(identity.exists());
         assert_eq!(daemon.companion.as_ref().unwrap().listener_fds().len(), 1);
+    }
+
+    /// A launcher that goes away with the pairing mode open does not leave it open; another
+    /// client that goes away leaves it as it is.
+    #[test]
+    fn the_pairing_mode_closes_when_the_client_that_opened_it_goes() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionPairingWindow, ServiceFrame, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let connect = || {
+                let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+                c.subscribe(&[Topic::Companion]).unwrap();
+                c
+            };
+            let until = |c: &mut glass_api::Client| {
+                let f: ServiceFrame = c
+                    .recv_until(wait, |f| {
+                        matches!(f.body, Some(service_frame::Body::CompanionState(_)))
+                    })
+                    .unwrap()
+                    .unwrap();
+                match f.body {
+                    Some(service_frame::Body::CompanionState(s)) => s.pairing_until_us,
+                    _ => unreachable!(),
+                }
+            };
+            let open = client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            });
+            // Whether the mode is open now: frames on one connection keep their order, but a
+            // disconnection and another connection's frames do not, so let glassd see it
+            // first, then ask a new client for its snapshot.
+            let is_open = || {
+                std::thread::sleep(Duration::from_millis(300));
+                let mut c = connect();
+                until(&mut c) > 0
+            };
+            // A client that has sent a request and seen its result.
+            let sent = |c: &mut glass_api::Client, req: &client_frame::Body, open: bool| {
+                c.send(req.clone()).unwrap();
+                while (until(c) > 0) != open {}
+            };
+
+            // The opener goes: the mode closes.
+            let mut launcher = connect();
+            assert_eq!(until(&mut launcher), 0, "the snapshot");
+            sent(&mut launcher, &open, true);
+            drop(launcher);
+            assert!(!is_open(), "closed with its opener");
+
+            // Another client goes: the mode stays open.
+            let mut launcher = connect();
+            until(&mut launcher);
+            sent(&mut launcher, &open, true);
+            let mut other = connect();
+            assert!(until(&mut other) > 0);
+            drop(other);
+            assert!(is_open(), "not closed by a client that did not open it");
+
+            // A third client opens it again.
+            let mut closer = connect();
+            until(&mut closer);
+            let mut third = connect();
+            until(&mut third);
+            sent(&mut third, &open, true);
+            drop(launcher);
+            assert!(is_open(), "the first opener no longer holds it");
+
+            // A second opener takes over: the first one going leaves it open, the second
+            // one going closes it.
+            sent(&mut closer, &open, true);
+            drop(third);
+            assert!(is_open(), "the earlier opener no longer holds it");
+            drop(closer);
+            assert!(!is_open(), "closed with the last opener");
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+    }
+
+    /// A close from any client clears the opener, so nothing is left to close later.
+    #[test]
+    fn a_close_from_another_client_clears_the_opener() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionPairingWindow, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let (opened_tx, opened) = std::sync::mpsc::channel::<()>();
+        let (closed_tx, closed) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let connect = || {
+                let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+                c.subscribe(&[Topic::Companion]).unwrap();
+                c
+            };
+            let window = |open| {
+                client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                    open,
+                    duration_ms: 0,
+                })
+            };
+            let until = |c: &mut glass_api::Client| match c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::CompanionState(_)))
+                })
+                .unwrap()
+                .unwrap()
+                .body
+            {
+                Some(service_frame::Body::CompanionState(s)) => s.pairing_until_us,
+                _ => unreachable!(),
+            };
+            let poke = || client_frame::Body::GetState(glass_api::proto::GetState {});
+            let mut launcher = connect();
+            assert_eq!(until(&mut launcher), 0);
+            launcher.send(window(true)).unwrap();
+            assert!(until(&mut launcher) > 0);
+            opened_tx.send(()).unwrap();
+            // Wakes the daemon from its poll, so it looks at the signal now.
+            launcher.send(poke()).unwrap();
+            let mut other = connect();
+            assert!(until(&mut other) > 0);
+            other.send(window(false)).unwrap();
+            assert_eq!(until(&mut other), 0);
+            // The launcher also has the answer to its poke, from before the close.
+            while until(&mut launcher) != 0 {}
+            closed_tx.send(()).unwrap();
+            launcher.send(poke()).unwrap();
+            // Both stay connected until the daemon has been looked at.
+            done.recv().unwrap();
+        });
+        // A client that failed sends no signal: stop waiting for it then.
+        let step_until = |daemon: &mut Daemon, rx: &std::sync::mpsc::Receiver<()>| {
+            use std::sync::mpsc::TryRecvError;
+            loop {
+                match rx.try_recv() {
+                    Ok(()) => break,
+                    Err(TryRecvError::Disconnected) => panic!("the client failed"),
+                    // Its clients going wake the poll if it fails.
+                    Err(TryRecvError::Empty) => daemon.step().unwrap(),
+                }
+            }
+        };
+        step_until(&mut daemon, &opened);
+        assert!(daemon.pairing_opener.is_some());
+        step_until(&mut daemon, &closed);
+        assert_eq!(daemon.pairing_opener, None, "a close by another client");
+        done_tx.send(()).unwrap();
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+    }
+
+    /// What a launcher does for the pairing card, against the real daemon.
+    #[test]
+    fn a_client_clears_the_bond_and_opens_and_closes_the_pairing_mode() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionForgetBond, CompanionPairingWindow, ServiceFrame, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let store_path = companion::state_file(&state);
+        let mut store = companion::store::Store::create(&store_path).unwrap();
+        store
+            .set_paired(companion::store::record("key".into(), "Telefono".into()))
+            .unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+            let state = |f: ServiceFrame| match f.body {
+                Some(service_frame::Body::CompanionState(s)) => s,
+                other => panic!("{other:?}"),
+            };
+            let is_state =
+                |f: &ServiceFrame| matches!(f.body, Some(service_frame::Body::CompanionState(_)));
+            c.subscribe(&[Topic::Companion]).unwrap();
+            // Known from the start, with no phone and no provider.
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(s.paired && !s.provider);
+            assert_eq!(s.paired_name, "Telefono");
+            assert_eq!(s.pairing_until_us, 0);
+
+            let open = client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            });
+            // With a bond it would do nothing, and says so.
+            let seq = c.send(open.clone()).unwrap();
+            let f = c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::Error(_)))
+                })
+                .unwrap()
+                .unwrap();
+            let Some(service_frame::Body::Error(e)) = f.body else {
+                unreachable!()
+            };
+            assert_eq!(e.code, ErrorCode::Unavailable as i32);
+            assert_eq!(e.seq, seq);
+
+            c.send(client_frame::Body::CompanionForgetBond(
+                CompanionForgetBond {},
+            ))
+            .unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(!s.paired);
+            assert_eq!(s.paired_name, "");
+            assert_eq!(s.pairing_until_us, 0, "forgetting opens nothing");
+
+            c.send(open).unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(s.pairing_until_us > s.timestamp_us);
+
+            c.send(client_frame::Body::CompanionPairingWindow(
+                CompanionPairingWindow {
+                    open: false,
+                    duration_ms: 0,
+                },
+            ))
+            .unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert_eq!(s.pairing_until_us, 0);
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+        // Gone from the disk too.
+        let store = companion::store::Store::load(&store_path).unwrap().unwrap();
+        assert!(store.paired().is_none());
+    }
+
+    #[test]
+    fn a_glassd_that_does_not_hold_the_link_says_so() {
+        use glass_api::proto::CompanionForgetBond;
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join("glassd.sock");
+        let opts = ble_opts(d.path(), None);
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+            c.send(client_frame::Body::CompanionForgetBond(
+                CompanionForgetBond {},
+            ))
+            .unwrap();
+            let f = c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::Error(_)))
+                })
+                .unwrap()
+                .unwrap();
+            let Some(service_frame::Body::Error(e)) = f.body else {
+                unreachable!()
+            };
+            assert_eq!(e.code, ErrorCode::Unsupported as i32);
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn glassd_s_own_uid_and_the_listed_ones_are_privileged() {
+        // SAFETY: `geteuid` has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(4242);
+        assert!(is_privileged(me, &[]));
+        assert!(!is_privileged(other, &[]));
+        assert!(is_privileged(other, &[other]));
     }
 
     #[test]
@@ -2753,6 +3725,36 @@ mod tests {
         // Turning detection on again has no effect without a hub.
         detection_on(&mut d);
         assert!(!d.wear.detection());
+    }
+
+    #[test]
+    fn a_join_turns_wifi_on_unless_the_owner_turned_it_off_meanwhile() {
+        let mut w = WishDuringSetup::default();
+        // Off from the start, the usual case: the join turns it on.
+        w.changed(false, false);
+        w.session_started();
+        w.changed(true, false);
+        assert!(w.joined_turns_wifi_on());
+        // On, then off during the session.
+        w.changed(false, true);
+        w.session_started();
+        w.changed(true, true);
+        w.changed(true, false);
+        assert!(!w.joined_turns_wifi_on());
+        // A new session starts afresh; turning it off outside a session does not count.
+        w.changed(false, true);
+        w.changed(false, false);
+        w.session_started();
+        assert!(w.joined_turns_wifi_on());
+        // Off and on again during the session: once turned off, the owner's off stands, even
+        // though the last change was back on.
+        w.changed(true, true);
+        w.changed(true, false);
+        w.changed(true, true);
+        assert!(
+            !w.joined_turns_wifi_on(),
+            "turned off once: it stays the owner's"
+        );
     }
 
     #[test]

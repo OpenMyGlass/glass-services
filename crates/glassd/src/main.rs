@@ -1,4 +1,4 @@
-use glassd::daemon::{Daemon, Options, Source, TOUCHPAD_NAME};
+use glassd::daemon::{BleOptions, Daemon, Options, Source, TOUCHPAD_NAME};
 use glassd::display::{Display, FbDisplay, LoggingDisplay, TOUCHPAD_SYSFS, default_fb};
 use glassd::peers::{PACKAGES_LIST, PeerPolicy};
 use glassd::settings_store::default_state_dir;
@@ -62,6 +62,15 @@ usage: glassd [options]
                           the TCP fallback, leaving only Bluetooth)
   --companion-bt <on|off> advertise and accept the Bluetooth RFCOMM companion link (needs the
                           linux-bt build feature; default: on when built with it)
+  --companion-ble <on|off>
+                          run the BLE engine and take the phone link over BLE, with Bluetooth on
+                          by default on a new Glass (default: off). It owns the Bluetooth UART;
+                          whether the deep sleep holds with it is still to be measured
+  --ble-engine <path>     the omg-bled program (default: next to glassd)
+  --ble-firmware <path>   the Bluetooth firmware patch on the image
+                          (default /vendor/firmware/bcm4330.hcd)
+  --ble-socket <path>     the socket between glassd and the engine (default
+                          /run/glassd/ble.sock)
   --power-supply <dir>    where to read the battery (default: /sys/class/power_supply)
   --power <on|off>        run the Model B energy policy: when idle, eco cpufreq + dimmer panel +
                           peripheral runtime-PM, and (deep_sleep_enabled setting) suspend-to-RAM
@@ -79,6 +88,9 @@ usage: glassd [options]
                           system (1000) are always allowed
   --allow-package <name>  allow this Android package's uid (from --packages-list); repeatable
   --allow-uid <uid>       allow this uid; repeatable
+  --privileged-uid <uid>  a uid that may act for the owner (the pairing mode, the bond, Wi-Fi
+                          setup), as well as glassd's own: the launcher's, if it has another.
+                          Never an app's. Repeatable
   --packages-list <path>  Android's package list (default /data/system/packages.list)
   --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
                           /data/glassd on Android and /var/lib/glassd elsewhere; with
@@ -144,6 +156,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         iio: Some(glass_head::iio::DEVICES_ROOT.into()),
         iio_dev: None,
         peers: PeerPolicy::open(),
+        privileged_uids: Vec::new(),
         grab_touchpad: cfg!(target_os = "android"),
         // On Android (route 1) the framework owns the radios; on plain Linux (Model B) glassd
         // drives them.
@@ -154,6 +167,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         companion: !cfg!(target_os = "android"),
         companion_tcp_port: Some(glassd::companion::transport::DEFAULT_TCP_PORT),
         companion_bt: cfg!(feature = "linux-bt"),
+        ble: None,
         companion_rng_device: glassd::companion::entropy::RANDOM_DEVICE.into(),
         power_supply: glassd::companion::battery::DEFAULT_ROOT.into(),
         // On Android (route 1) the framework owns power; on plain Linux (Model B) glassd runs
@@ -171,6 +185,15 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     // On Android (route 1) the IMU belongs to the sensors HAL; head gestures come through
     // the glue there (milestone 3) unless --head on gives the IMU to glassd.
     let mut head = !cfg!(target_os = "android");
+    let mut ble_on = false;
+    let mut ble = BleOptions {
+        engine: std::env::current_exe()
+            .ok()
+            .and_then(|p| Some(p.parent()?.join("omg-bled")))
+            .unwrap_or_else(|| "omg-bled".into()),
+        firmware: "/vendor/firmware/bcm4330.hcd".into(),
+        socket: "/run/glassd/ble.sock".into(),
+    };
     let mut args = args.peekable();
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -273,6 +296,16 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                     v => return Err(format!("--companion-bt: unknown value {v:?}")),
                 }
             }
+            "--companion-ble" => {
+                ble_on = match value("--companion-ble")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    v => return Err(format!("--companion-ble: unknown value {v:?}")),
+                }
+            }
+            "--ble-engine" => ble.engine = PathBuf::from(value("--ble-engine")?),
+            "--ble-firmware" => ble.firmware = PathBuf::from(value("--ble-firmware")?),
+            "--ble-socket" => ble.socket = PathBuf::from(value("--ble-socket")?),
             "--power-supply" => o.power_supply = PathBuf::from(value("--power-supply")?),
             "--power" => {
                 o.energy = match value("--power")?.as_str() {
@@ -297,6 +330,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                         .map_err(|_| format!("--allow-uid: not a uid: {v:?}"))?,
                 );
             }
+            "--privileged-uid" => {
+                let v = value("--privileged-uid")?;
+                o.privileged_uids.push(
+                    v.parse()
+                        .map_err(|_| format!("--privileged-uid: not a uid: {v:?}"))?,
+                );
+            }
             "--packages-list" => packages_list = PathBuf::from(value("--packages-list")?),
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Err(String::new()),
@@ -311,6 +351,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     if !head {
         o.iio = None;
     }
+    o.ble = ble_on.then_some(ble);
     Ok(Parsed {
         opts: o,
         verbose,
@@ -375,6 +416,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    match glassd::daemon::catch_termination() {
+        Ok(fd) => d.watch_termination(fd),
+        Err(e) => glassd::log::write(format_args!("glassd: cannot catch signals: {e}")),
+    }
     match d.run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

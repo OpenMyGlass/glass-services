@@ -34,7 +34,9 @@ fn no_identity_and_no_listener_before_the_pool_is_seeded() {
     assert!(!state_file(&state).exists());
 
     // Forgetting a bond that cannot exist yet is harmless.
-    assert!(c.unpair().is_empty());
+    let (events, cleared) = c.unpair();
+    assert!(events.is_empty());
+    assert!(cleared.is_ok());
     pool.seed();
     c.on_rng_event();
     assert!(c.rng_fd().is_none());
@@ -217,4 +219,70 @@ fn no_seed_is_saved_from_a_pool_that_passed_no_test() {
     c.on_rng_event();
     assert_eq!(c.listener_fds().len(), 1);
     assert!(!state.join(super::entropy::SEED_FILE).exists());
+}
+
+#[test]
+fn tcp_can_be_closed_for_a_while_with_its_connections_and_opened_again() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    let mut c = glass(&state, &pool.path);
+
+    // Closed before the pool opens the listeners: it stays closed when it does.
+    assert!(c.set_tcp_closed(true).is_empty());
+    pool.seed();
+    c.on_rng_event();
+    assert!(c.rng_ready());
+    assert!(c.listener_fds().is_empty());
+
+    assert!(c.set_tcp_closed(false).is_empty());
+    assert_eq!(c.listener_fds().len(), 1);
+    let port = c.listeners.tcp_port().unwrap();
+    let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (_, transport) = c.listener_fds()[0];
+    for _ in 0..200 {
+        c.accept(transport);
+        if !c.conn_fds().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(c.conn_fds().len(), 1);
+
+    // Nothing is reachable on the access point.
+    c.set_tcp_closed(true);
+    assert!(c.conn_fds().is_empty(), "the connection went too");
+    assert!(c.listener_fds().is_empty());
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    drop(peer);
+
+    c.set_tcp_closed(false);
+    assert_eq!(c.listener_fds().len(), 1);
+}
+
+/// The refusal that docs/api.md promises, word for word: the launcher shows "the phone link is
+/// disabled" for it, and "a phone is already paired" for the other UNAVAILABLE.
+#[test]
+fn a_link_that_cannot_come_up_refuses_the_pairing_mode_in_the_documented_words() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    pool.seed();
+    let state = d.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // No identity can be stored, so the link stays down.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(state.join("probe"), b"").is_ok() {
+        eprintln!("skipped: running as root, the directory stays writable");
+        return;
+    }
+    let mut c = glass(&state, &pool.path);
+    assert!(!state_file(&state).exists());
+    assert!(c.listener_fds().is_empty());
+    assert_eq!(super::LINK_DISABLED, "the companion link is disabled");
+    assert_eq!(
+        c.open_pairing_window(0).err().as_deref(),
+        Some(super::LINK_DISABLED)
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
 }

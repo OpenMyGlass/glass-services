@@ -157,6 +157,8 @@ pub struct PowerPolicy {
     off_since_us: Option<u64>,
     /// Off the head: suspend without waiting for `deep_sleep`, after a shorter window.
     off_head: bool,
+    /// Something needs the system up: see [`PowerPolicy::set_held`].
+    held: bool,
     /// Just woken off the head: the window is [`WAKE_HOLD_MS`] until the next suspend.
     woken: bool,
     state: PowerState,
@@ -179,6 +181,7 @@ impl PowerPolicy {
             screen_off: false,
             off_since_us: None,
             off_head: false,
+            held: false,
             woken: false,
             state: PowerState::Active,
         }
@@ -255,7 +258,13 @@ impl PowerPolicy {
     /// Whether a suspend may be attempted (policy on, screen off, and deep sleep on or off the
     /// head).
     fn suspend_allowed(&self) -> bool {
-        self.power_saver && self.screen_off && (self.deep_sleep || self.off_head)
+        !self.held && self.power_saver && self.screen_off && (self.deep_sleep || self.off_head)
+    }
+
+    /// While held the system does not suspend, whatever the screen and the head say: something
+    /// that takes minutes and needs the radio is going on (a Wi-Fi setup session).
+    pub fn set_held(&mut self, held: bool) {
+        self.held = held;
     }
 
     fn window_ms(&self) -> u32 {
@@ -790,6 +799,18 @@ mod tests {
         assert!(p.screen_changed(101 * S, false));
         assert_eq!(p.state(), PowerState::Active);
         assert_eq!(p.next_deadline(), None);
+    }
+
+    #[test]
+    fn held_never_suspends_and_afterwards_the_window_still_counts() {
+        let mut p = policy();
+        p.set_held(true);
+        p.screen_changed(1_000, true);
+        assert_eq!(p.next_deadline(), None);
+        assert_eq!(p.on_timeout(u64::MAX / 2), None);
+        p.set_held(false);
+        assert!(p.next_deadline().is_some());
+        assert_eq!(p.on_timeout(u64::MAX / 2), Some(PowerAction::Suspend));
     }
 
     #[test]

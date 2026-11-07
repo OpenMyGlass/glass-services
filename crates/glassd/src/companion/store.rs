@@ -46,6 +46,9 @@ pub struct Store {
     path: PathBuf,
     identity: Identity,
     paired: Option<PairingRecord>,
+    /// Every save fails, for a test: a read-only directory does not stop root.
+    #[cfg(test)]
+    pub(crate) fail_saves: bool,
 }
 
 impl Store {
@@ -73,6 +76,8 @@ impl Store {
             path,
             identity,
             paired: sf.paired_peer,
+            #[cfg(test)]
+            fail_saves: false,
         }))
     }
 
@@ -90,6 +95,8 @@ impl Store {
             path,
             identity: Identity::generate(),
             paired: None,
+            #[cfg(test)]
+            fail_saves: false,
         };
         store.save()?;
         Ok(store)
@@ -111,18 +118,26 @@ impl Store {
     }
 
     /// Records a newly bonded companion and persists.
+    /// On a failure nothing changes, in memory either.
     pub fn set_paired(&mut self, record: PairingRecord) -> Result<(), CompanionError> {
-        self.paired = Some(record);
-        self.save()
+        let before = self.paired.replace(record);
+        self.save().inspect_err(|_| self.paired = before)
     }
 
     /// Forgets the bonded companion (unpair) and persists.
+    /// On a failure nothing changes, in memory either.
     pub fn clear_paired(&mut self) -> Result<(), CompanionError> {
-        self.paired = None;
-        self.save()
+        let before = self.paired.take();
+        self.save().inspect_err(|_| self.paired = before)
     }
 
     fn save(&self) -> Result<(), CompanionError> {
+        #[cfg(test)]
+        if self.fail_saves {
+            return Err(CompanionError::Store(
+                "a save that fails, for a test".into(),
+            ));
+        }
         let sf = StateFile {
             identity_secret: self.identity.secret_b64(),
             paired_peer: self.paired.clone(),

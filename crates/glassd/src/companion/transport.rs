@@ -1,11 +1,13 @@
-//! The companion-link listeners: a Bluetooth RFCOMM server (the normal, lower-power link) and
-//! a TCP accept (the fallback for a PC without Bluetooth, and the on-demand high-bandwidth
-//! path). Both hand the daemon a nonblocking byte [`Stream`] whose raw fd goes into the
+//! The companion-link listeners: a Unix socket for `omg-bled`'s BLE sessions (the everyday
+//! link), a TCP accept (photos and video, when Bluetooth fails, and a PC), and a Bluetooth RFCOMM
+//! server. All hand the daemon a nonblocking byte [`Stream`] whose raw fd goes into the
 //! single-threaded `poll` loop, exactly like the launcher socket.
 //!
-//! Bluetooth is default/preferred (it is up anyway for A2DP/HFP, and cheap for the bursty
-//! companion traffic); Wi-Fi/TCP is the fallback and the high-bandwidth path (media/OTA). The
-//! RFCOMM server advertises the clean-room OpenMyGlass service UUID
+//! BLE reaches glassd as a plain stream because `omg-bled` holds everything radio about it, in its
+//! own process: docs/ble-link.md says why. While it runs it owns the Bluetooth UART, so the
+//! kernel's Bluetooth stack, and RFCOMM with it, is not there.
+//!
+//! The RFCOMM server advertises the clean-room OpenMyGlass service UUID
 //! [`OMG_COMPANION_RFCOMM_UUID`] (**not** Google's companion UUID) and is gated behind the
 //! `linux-bt` feature so images without a guaranteed BlueZ stack stay lean; TCP always works.
 //!
@@ -15,6 +17,9 @@
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
 
 /// OpenMyGlass's own RFCOMM service UUID (clean-room; NOT Google's companion UUID). glassd is
 /// the RFCOMM server; the companion connects to it.
@@ -26,6 +31,10 @@ pub const DEFAULT_RFCOMM_CHANNEL: u8 = 23;
 /// Default TCP port for the Wi-Fi / PC fallback path.
 pub const DEFAULT_TCP_PORT: u16 = 7700;
 
+/// The kernel's send buffer on a BLE session, in bytes (the kernel doubles it). At 3 kB/s a default
+/// Unix buffer of 160 KiB would be close to a minute of queue in front of every notification.
+const BLE_SEND_BUFFER: libc::c_int = 4096;
+
 /// Which radio a connection arrived over (reported to the launcher as the link transport).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -33,6 +42,8 @@ pub enum Transport {
     BtRfcomm,
     /// Wi-Fi / TCP.
     WifiTcp,
+    /// Bluetooth LE, through `omg-bled`.
+    Ble,
 }
 
 impl Transport {
@@ -41,6 +52,7 @@ impl Transport {
         match self {
             Transport::BtRfcomm => "bt-rfcomm",
             Transport::WifiTcp => "wifi-tcp",
+            Transport::Ble => "ble",
         }
     }
 }
@@ -55,17 +67,14 @@ pub type BoxStream = Box<dyn Stream>;
 /// The companion listeners glassd polls.
 pub struct Listeners {
     tcp: Option<TcpListener>,
+    ble: Option<UnixListener>,
     #[cfg(feature = "linux-bt")]
     bt: Option<bt::RfcommListener>,
 }
 
 impl Listeners {
-    /// Binds the enabled listeners. TCP binds `0.0.0.0:port`; RFCOMM binds
-    /// [`DEFAULT_RFCOMM_CHANNEL`] when built with `linux-bt`. A listener that cannot bind is
-    /// logged and skipped (best effort), so one transport being unavailable never stops the
-    /// other.
-    pub fn bind(tcp_port: Option<u16>, bt: bool) -> Listeners {
-        let tcp = tcp_port.and_then(|port| match TcpListener::bind(("0.0.0.0", port)) {
+    fn bind_tcp(tcp_port: Option<u16>) -> Option<TcpListener> {
+        tcp_port.and_then(|port| match TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => {
                 let _ = l.set_nonblocking(true);
                 crate::info!("companion: TCP listening on 0.0.0.0:{port}");
@@ -75,7 +84,26 @@ impl Listeners {
                 crate::warn!("companion: cannot bind TCP :{port} ({e})");
                 None
             }
-        });
+        })
+    }
+
+    /// The port TCP listens on, if it does.
+    #[cfg(test)]
+    pub fn tcp_port(&self) -> Option<u16> {
+        self.tcp.as_ref()?.local_addr().ok().map(|a| a.port())
+    }
+
+    /// Closes the TCP listener, or binds it again. The others are not on the same networks.
+    pub fn set_tcp(&mut self, tcp_port: Option<u16>) {
+        self.tcp = Self::bind_tcp(tcp_port);
+    }
+
+    /// Binds the enabled listeners. TCP binds `0.0.0.0:port`; RFCOMM binds
+    /// [`DEFAULT_RFCOMM_CHANNEL`] when built with `linux-bt`. A listener that cannot bind is
+    /// logged and skipped (best effort), so one transport being unavailable never stops the
+    /// other.
+    pub fn bind(tcp_port: Option<u16>, bt: bool) -> Listeners {
+        let tcp = Self::bind_tcp(tcp_port);
         #[cfg(feature = "linux-bt")]
         let bt = bt.then(bt::RfcommListener::bind).and_then(|r| match r {
             Ok(l) => {
@@ -94,8 +122,35 @@ impl Listeners {
         let _ = bt;
         Listeners {
             tcp,
+            ble: None,
             #[cfg(feature = "linux-bt")]
             bt,
+        }
+    }
+
+    /// Opens the socket `omg-bled` connects to, for this user alone. Whoever connects speaks to
+    /// the handshake like anyone on TCP, but the path should not widen that.
+    pub fn bind_ble(&mut self, path: &Path) {
+        let bound = (|| {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            // Left by a previous run.
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            let l = UnixListener::bind(path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            l.set_nonblocking(true)?;
+            Ok(l)
+        })();
+        match bound {
+            Ok(l) => {
+                crate::info!("companion: BLE sessions on {}", path.display());
+                self.ble = Some(l);
+            }
+            Err(e) => crate::warn!("companion: cannot bind {} ({e})", path.display()),
         }
     }
 
@@ -104,6 +159,9 @@ impl Listeners {
         let mut v = Vec::new();
         if let Some(t) = &self.tcp {
             v.push((t.as_raw_fd(), Transport::WifiTcp));
+        }
+        if let Some(b) = &self.ble {
+            v.push((b.as_raw_fd(), Transport::Ble));
         }
         #[cfg(feature = "linux-bt")]
         if let Some(b) = &self.bt {
@@ -137,6 +195,26 @@ impl Listeners {
                     }
                 }
             }
+            Transport::Ble => {
+                if let Some(l) = &self.ble {
+                    loop {
+                        match l.accept() {
+                            Ok((s, _)) => {
+                                let _ = s.set_nonblocking(true);
+                                set_send_buffer(&s, BLE_SEND_BUFFER);
+                                crate::info!("companion: a phone over BLE");
+                                out.push(Box::new(s) as BoxStream);
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => {
+                                crate::warn!("companion: BLE accept ({e})");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             Transport::BtRfcomm =>
             {
                 #[cfg(feature = "linux-bt")]
@@ -146,6 +224,25 @@ impl Listeners {
             }
         }
         out
+    }
+}
+
+fn set_send_buffer(socket: &impl AsRawFd, bytes: libc::c_int) {
+    // SAFETY: a valid option value of the given size, on an open socket.
+    let r = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&bytes as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        crate::warn!(
+            "companion: cannot set the send buffer ({})",
+            io::Error::last_os_error()
+        );
     }
 }
 
@@ -306,6 +403,7 @@ mod tests {
     fn transport_strings() {
         assert_eq!(Transport::BtRfcomm.as_str(), "bt-rfcomm");
         assert_eq!(Transport::WifiTcp.as_str(), "wifi-tcp");
+        assert_eq!(Transport::Ble.as_str(), "ble");
     }
 
     #[test]
@@ -315,6 +413,23 @@ mod tests {
         // free port, so the fd is present.
         assert_eq!(l.fds().len(), 1);
         assert_eq!(l.fds()[0].1, Transport::WifiTcp);
+    }
+
+    #[test]
+    fn the_ble_socket_replaces_a_stale_one_and_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("sub/ble.sock");
+        let mut l = Listeners::bind(None, false);
+        l.bind_ble(&path);
+        assert_eq!(l.fds().len(), 1);
+        drop(l);
+        let mut l = Listeners::bind(None, false);
+        l.bind_ble(&path);
+        assert_eq!(l.fds()[0].1, Transport::Ble);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        assert_eq!(l.accept(Transport::Ble).len(), 1);
     }
 
     #[test]

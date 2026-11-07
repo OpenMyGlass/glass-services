@@ -33,9 +33,19 @@ pub const MIN_WAIT_MS: u64 = 100;
 /// never gets near this; only a bonded peer ignoring the window does, and it asks again.
 const MAX_BACKLOG: usize = 2 * 1024 * 1024;
 
-/// How to pull speech over this transport.
+/// What the Glass pulls over BLE: `omg_core`'s `LinkProfile::constrained()` as it stands from the
+/// BLE link on. Written out until the OpenMyGlass pin moves to a rev that has it. A chunk of
+/// 1 KiB keeps a waiting notification under a second behind it, at the 3 kB/s this link measured.
+const BLE_PROFILE: LinkProfile = LinkProfile {
+    chunk_len: 1024,
+    window: 2,
+    max_auto_attachment_bytes: Some(256 * 1024),
+};
+
+/// How to pull speech over this transport. Notes go the other way, and the phone chooses for them.
 pub fn profile_for(transport: Transport) -> LinkProfile {
     match transport {
+        Transport::Ble => BLE_PROFILE,
         Transport::BtRfcomm => LinkProfile::moderate(),
         Transport::WifiTcp => LinkProfile::fast(),
     }

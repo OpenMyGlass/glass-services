@@ -1,3 +1,4 @@
+#![cfg(feature = "decoder")]
 //! The decoder in its own process: answers, deadlines, kills, and giving up.
 
 mod common;
@@ -110,10 +111,10 @@ fn a_scripted_answer_in_protocol_is_taken() {
     assert!(matches!(w.scan(f), Ok(Scan::NoCode)));
     let mut w = sh("head -c 307212 >/dev/null; printf '\\005\\000\\017\\002\\000'; sleep 5");
     assert!(
-        matches!(w.scan(f), Ok(Scan::Ambiguous)),
+        matches!(w.scan(f), Ok(Scan::Unaccounted)),
         "more grids than MAX_CODES"
     );
-    // At the caps, which the protocol allows, the frame is refused as ambiguous.
+    // At the caps, which the protocol allows, the frame gives nothing.
     for answer in ["\\000\\000\\040\\002\\000", "\\000\\000\\003\\376\\377"] {
         let script = format!("head -c 307212 >/dev/null; printf '{answer}'; sleep 5");
         let mut w = Worker::new(move || {
@@ -121,7 +122,7 @@ fn a_scripted_answer_in_protocol_is_taken() {
             c.args(["-c", &script]);
             c
         });
-        assert!(matches!(w.scan(f), Ok(Scan::Ambiguous)), "{answer}");
+        assert!(matches!(w.scan(f), Ok(Scan::Unaccounted)), "{answer}");
     }
 }
 

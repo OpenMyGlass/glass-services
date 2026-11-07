@@ -1,3 +1,4 @@
+#![cfg(feature = "decoder")]
 //! Generated QR codes through the decoder, from clean to as bad as a dim handheld view, and frames
 //! built to be awkward. All pixels here are synthetic: none of this says how the real camera does.
 
@@ -64,11 +65,58 @@ fn a_tilted_page() {
             noise: 5.0,
             ..View::plain()
         };
-        // One of these views, with one noise seed, gives a fourth finder pattern from the code's own
-        // modules, and the rule against stray patterns then refuses that frame. Over a few frames,
-        // as a scan sees them, each view is read.
-        let read = (3..8).filter(|&seed| read_with(&view, seed)).count();
-        assert!(read >= 3, "{tilt:?}: {read} of 5");
+        // One of these views, with one noise seed, gives a fourth finder pattern from the code's
+        // own modules, and that frame is skipped. A scan of 5 frames, through Session, still offers.
+        let code = matrix(full_text().as_bytes(), EcLevel::M);
+        let frames = (3..8).map(|seed| render(&code, &view, &mut Rng::new(seed)));
+        assert!(
+            offered_within(frames, view.width, view.height).is_some(),
+            "{tilt:?}"
+        );
+    }
+}
+
+/// Feeds frames through a Scanner and a Session; the number of frames it took to offer the real
+/// code, if it did.
+fn offered_within(frames: impl Iterator<Item = Vec<u8>>, w: usize, h: usize) -> Option<usize> {
+    let mut scanner = Scanner::new();
+    let mut session = Session::new();
+    for (i, frame) in frames.enumerate() {
+        match session.feed(scanner.scan(Frame::new(&frame, w, h, w).unwrap())) {
+            SessionStep::Offer(t) => {
+                assert_eq!(&t[..], full_text().as_bytes());
+                return Some(i + 1);
+            }
+            SessionStep::Refused => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Noise that makes many frames Unaccounted, as at the bench's harder settings, slows a scan of
+/// one real code down but must not end it.
+#[test]
+fn a_noisy_scan_of_one_real_code_still_finishes() {
+    let code = matrix(full_text().as_bytes(), EcLevel::M);
+    for (ppm, noise) in [(5.0, 30.0), (4.0, 20.0)] {
+        for run in 0..3u64 {
+            let frames = (0..30u64).map(|i| {
+                let mut rng = Rng::new(1000 * run + i + 1);
+                let view = View {
+                    px_per_module: ppm,
+                    noise,
+                    angle_deg: 360.0 * rng.unit(),
+                    ..View::plain()
+                };
+                render(&code, &view, &mut rng)
+            });
+            let n = offered_within(frames, 640, 480);
+            assert!(
+                n.is_some(),
+                "{ppm} px, noise {noise}, run {run}: no offer in 30 frames"
+            );
+        }
     }
 }
 
@@ -273,10 +321,10 @@ fn junk_codes_cannot_crowd_out_the_real_one() {
         assert!(matches!(Scanner::new().scan(f), Scan::Ambiguous));
     }
     // Even junk alone beside the real code: a grid that gives no text could be a code hidden, so
-    // the frame is refused.
+    // the frame gives nothing; but nothing else was read, so it does not end the scan.
     let frame = grid_of_codes(&[j, r, j]);
     let f = Frame::new(&frame, 1280, 720, 1280).unwrap();
-    assert!(matches!(Scanner::new().scan(f), Scan::Ambiguous));
+    assert!(matches!(Scanner::new().scan(f), Scan::Unaccounted));
 }
 
 #[test]
@@ -593,6 +641,7 @@ fn outcome(frame: &[u8]) -> &'static str {
         Scan::Setup(t) if t[..] == *full_text().as_bytes() => "real",
         Scan::Setup(_) => "HOSTILE",
         Scan::Ambiguous => "ambiguous",
+        Scan::Unaccounted => "unaccounted",
         Scan::NoCode => "nocode",
         Scan::Refused(_) => "refused",
     }
@@ -611,7 +660,13 @@ fn a_row_of_finder_patterns_cannot_hide_the_real_code() {
                 lone_finder(f, 10 + i * 40, 330, 4);
             }
         });
-        assert_eq!(outcome(&frame), "ambiguous", "{lone} lone finder patterns");
+        // Ambiguous when both codes are still read, Unaccounted when the row hides the real one;
+        // never an offer.
+        let got = outcome(&frame);
+        assert!(
+            matches!(got, "ambiguous" | "unaccounted"),
+            "{lone} lone: {got}"
+        );
     }
 }
 
@@ -664,7 +719,8 @@ fn a_frame_that_uses_up_the_region_labels_is_refused() {
         glass_qr::scan::DECODER_MAX_REGIONS,
         "labels used up"
     );
-    assert_eq!(outcome(&frame), "ambiguous");
+    let got = outcome(&frame);
+    assert!(matches!(got, "ambiguous" | "unaccounted"), "{got}");
 }
 
 fn setup_scan(text: &str) -> Scan {
@@ -733,6 +789,33 @@ fn a_session_that_ever_sees_two_setup_codes_is_refused() {
     assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Refused));
 }
 
+/// An unaccounted frame neither adds to the streak, nor resets it, nor counts towards the gap,
+/// nor ends the scan.
+#[test]
+fn a_session_skips_unaccounted_frames() {
+    let real = full_text();
+    let mut s = Session::new();
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(1)
+    ));
+    for _ in 0..3 * MAX_FRAMES_BETWEEN {
+        assert!(matches!(
+            s.feed(Scan::Unaccounted),
+            SessionStep::Scanning(Scan::Unaccounted)
+        ));
+    }
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(2)
+    ));
+    assert!(matches!(
+        s.feed(Scan::Unaccounted),
+        SessionStep::Scanning(_)
+    ));
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Offer(_)));
+}
+
 /// One stray finder pattern up and left of the real code's top-left corner: `quircs` puts it in a
 /// triple with two of the real code's, and the real code is lost while the hostile one is read.
 /// These are the positions where the review's proof of concept got the hostile code offered, every
@@ -755,12 +838,14 @@ fn a_stray_finder_pattern_cannot_steal_the_real_code() {
         let frame = hostile_band_real(|f| lone_finder(f, x, y, 3));
         let f = Frame::new(&frame, W, H, W).unwrap();
         let codes = Scanner::new().read_codes(f);
+        // The attack still works on the decoder: only the hostile code is read.
         assert_eq!(
             (codes.grids, codes.texts.len(), codes.capstones),
             (2, 1, 7),
             "the stray at ({x},{y}) still steals"
         );
-        assert_eq!(outcome(&frame), "ambiguous", "stray at ({x},{y})");
+        assert_eq!(&codes.texts[0][..], hostile_text().as_bytes());
+        assert_eq!(outcome(&frame), "unaccounted", "stray at ({x},{y})");
     }
 }
 

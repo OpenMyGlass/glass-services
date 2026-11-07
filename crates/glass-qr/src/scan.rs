@@ -31,7 +31,7 @@ use crate::setup::{self, MAX_TEXT_BYTES, SetupError};
 pub const MAX_PIXELS: usize = 1280 * 720;
 /// The smallest side of a frame: version 1 of a QR code at one pixel per module.
 pub const MIN_SIDE: usize = 21;
-/// Codes in one frame at most, read or not. A frame with more is refused as [`Scan::Ambiguous`]:
+/// Codes in one frame at most, read or not. A frame with more gives nothing ([`Scan::Unaccounted`]):
 /// codes that cannot be read must not crowd a real one out.
 pub const MAX_CODES: usize = 4;
 /// The most grids `quircs` reports for a frame; it ignores any more. A frame where it reached this
@@ -49,7 +49,7 @@ pub const DECODER_MAX_REGIONS: usize = 65_534;
 /// is a frame built to hide something, or too busy to trust; it was chosen, not measured on real
 /// scenes. The Glass scene test should record, for each frame, the finder patterns, grids, texts
 /// and regions that [`Scanner::read_codes`] reports, with a setup code in view and without, in an
-/// ordinary room: they decide this margin and how often the rules in [`Scan::Ambiguous`] cost a
+/// ordinary room: they decide this margin and how often the rules in [`Scan::Unaccounted`] cost a
 /// frame.
 pub const MAX_CAPSTONES_EXPLAINED: usize = 3 * MAX_CODES + 8;
 
@@ -135,10 +135,13 @@ pub enum Scan {
     /// Codes that are not valid setup codes, and the reason for the last one. Keep scanning: a
     /// link on a poster in view must not end the scan.
     Refused(SetupError),
-    /// Nothing offered, because the frame may hide a code. A sticker next to the real code must
-    /// not win by being read first, nor by crowding the real code out of the decoder. So:
+    /// Two different valid setup codes, both read. This is evidence of a second code, so
+    /// [`Session`] ends the scan. A valid setup code next to a readable code of another kind, a link
+    /// say, is not: that frame, if all else adds up, gives the setup code.
+    Ambiguous,
+    /// Nothing offered from this frame, because it may hide a code; but no second setup code was
+    /// read. [`Session`] skips it. Any of:
     ///
-    /// - two different valid setup codes;
     /// - more than [`MAX_CODES`] codes, read or not;
     /// - [`DECODER_MAX_CAPSTONES`] finder patterns, the most `quircs` keeps, so it may have
     ///   dropped some; or more than [`MAX_CAPSTONES_EXPLAINED`];
@@ -147,11 +150,15 @@ pub enum Scan {
     ///   (it did not decode, or its text was too long): a stray finder pattern next to a real code
     ///   can take one of the real code's into a wrong triple and so lose it.
     ///
-    /// So a setup code is offered only from a frame where every finder pattern is in a grid and
-    /// every grid was read. Clutter that makes stray finder patterns, or a link next to a code
-    /// that cannot be read, then costs frames; the Glass scene test should count how many.
+    /// Ordinary noise does this too, for example a fourth finder pattern made by the code's own
+    /// modules, which is why it only skips the frame.
     ///
-    /// Not caught here, and accepted:
+    /// **Why skipping is safe.** Each rule here is a way for a real code to go unread. If it goes
+    /// unread anyway, the frame is skipped and gives nothing. If the attempt fails and both codes are
+    /// read, the frame is [`Scan::Ambiguous`] and the scan ends. So a hostile code is offered only
+    /// from frames where it is the one code and everything adds up: the case accepted below.
+    ///
+    /// Not caught by any rule, and accepted:
     ///
     /// - a real code that `quircs` does not see at all (blurred, too small, out of view) beside a
     ///   hostile one it reads;
@@ -159,9 +166,9 @@ pub enum Scan {
     ///   frame) turns the real code to all black or all white while the hostile one stays readable,
     ///   for example a bright hostile code next to a dim real one.
     ///
-    /// Then only the hostile code is in view, as far as this code can tell. See [`Session`] for
-    /// what that leads to.
-    Ambiguous,
+    /// Then only the hostile code is in view, as far as this code can tell, and only the offer
+    /// screen stops it: see [`Session`].
+    Unaccounted,
     /// The text of the one valid setup code in view, which [`setup::parse`] accepts.
     Setup(Zeroizing<Vec<u8>>),
 }
@@ -180,33 +187,35 @@ pub struct Codes {
 
 /// What a frame's codes add up to.
 pub(crate) fn decide(codes: Codes) -> Scan {
-    if codes.grids > MAX_CODES
+    // A second setup code first: it is evidence, whatever else the frame holds.
+    let mut found: Option<&Zeroizing<Vec<u8>>> = None;
+    let mut refused = None;
+    for text in &codes.texts {
+        match setup::parse(text) {
+            Ok(_) => match found {
+                Some(first) if **first != **text => return Scan::Ambiguous,
+                Some(_) => {}
+                None => found = Some(text),
+            },
+            Err(e) => refused = Some(e),
+        }
+    }
+    let over_limits = codes.grids > MAX_CODES
         || codes.capstones >= DECODER_MAX_CAPSTONES
         || codes.capstones > MAX_CAPSTONES_EXPLAINED
-        || codes.regions >= DECODER_MAX_REGIONS
-    {
-        return Scan::Ambiguous;
-    }
+        || codes.regions >= DECODER_MAX_REGIONS;
     // With a setup code in view, every finder pattern must belong to a grid and every grid must
     // have been read: a finder pattern left over, or a grid that did not decode, may be a real code
     // whose finder pattern a stray one took into a wrong triple.
     let accounted = codes.capstones == 3 * codes.grids && codes.grids == codes.texts.len();
-    if !accounted && codes.texts.iter().any(|t| setup::parse(t).is_ok()) {
-        return Scan::Ambiguous;
+    if over_limits || (found.is_some() && !accounted) {
+        return Scan::Unaccounted;
     }
-    let mut result = Scan::NoCode;
-    let mut found: Option<Zeroizing<Vec<u8>>> = None;
-    for text in codes.texts {
-        match setup::parse(&text) {
-            Ok(_) => match &found {
-                Some(first) if **first != *text => return Scan::Ambiguous,
-                Some(_) => {}
-                None => found = Some(text),
-            },
-            Err(e) => result = Scan::Refused(e),
-        }
+    match (found, refused) {
+        (Some(text), _) => Scan::Setup(text.clone()),
+        (None, Some(e)) => Scan::Refused(e),
+        (None, None) => Scan::NoCode,
     }
-    found.map_or(result, Scan::Setup)
 }
 
 /// Reads frames, one at a time, in this process. It keeps its buffers from one frame to the next,
@@ -271,7 +280,8 @@ impl Scanner {
 
 /// Frames that must show the same setup text before it is offered.
 pub const FRAMES_TO_AGREE: usize = 3;
-/// Frames that may pass between two of those, read or not, before the count starts again.
+/// Frames without a setup code ([`Scan::NoCode`], [`Scan::Refused`]) that may pass between two of
+/// those before the count starts again. [`Scan::Unaccounted`] frames do not count.
 pub const MAX_FRAMES_BETWEEN: usize = 5;
 
 /// What a scan has come to, so far.
@@ -290,11 +300,12 @@ pub enum SessionStep {
 
 /// One scan's frames, judged together. A single frame cannot tell a real code that is hard to
 /// read from one that is not there, so the scan offers a text only once [`FRAMES_TO_AGREE`] frames
-/// have shown it, not more than [`MAX_FRAMES_BETWEEN`] frames apart, and refuses for good as soon
-/// as any frame shows another setup code, or is [`Scan::Ambiguous`].
+/// have shown it, with at most [`MAX_FRAMES_BETWEEN`] frames without a setup code between two of
+/// them, and refuses for good as soon as any frame shows another setup code, or is
+/// [`Scan::Ambiguous`]. [`Scan::Unaccounted`] frames are skipped: see there why that is safe.
 ///
 /// **What it does not close:** a hostile code shown alone, or beside a real code the decoder never
-/// sees (see [`Scan::Ambiguous`]), for 3 frames is offered. Only the offer screen stops it: it must
+/// sees (see [`Scan::Unaccounted`]), for 3 frames is offered. Only the offer screen stops it: it must
 /// show the SSID, the companion's address, whether the code pairs a new companion, and wait for
 /// an explicit tap. The same goes for a compromised worker: the counts it reports protect nothing
 /// then, and only [`setup::parse`] in the camera process and the offer screen stand.
@@ -318,6 +329,10 @@ impl Session {
             return SessionStep::Refused;
         }
         match scan {
+            // Not evidence of anything, nor of the code's absence: the streak stands, and the frame
+            // does not count towards the gap. Resetting the streak would let ordinary noise stall a
+            // scan; a second setup code, the one thing that should stop it, makes Ambiguous instead.
+            Scan::Unaccounted => SessionStep::Scanning(Scan::Unaccounted),
             Scan::Ambiguous => {
                 self.end();
                 SessionStep::Refused

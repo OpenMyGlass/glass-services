@@ -1,3 +1,4 @@
+#![cfg(feature = "decoder")]
 //! With SIGPIPE at its default, which ends the process, a write to a dead worker must still be
 //! only an error. In a test binary of its own, because it changes the disposition process-wide.
 

@@ -7,7 +7,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use glass_qr::scan::{Frame, Scan, Scanner};
+use glass_qr::scan::{Frame, Scan, Scanner, Session, SessionStep};
 use qrcode::EcLevel;
 
 /// Median, and the slowest, of `runs`.
@@ -166,6 +166,49 @@ fn main() {
                 read += usize::from(matches!(Scanner::new().scan(f), Scan::Setup(_)));
             }
             print!(" {read:>6}");
+        }
+        println!();
+    }
+
+    println!(
+        "\n# scans through Session, 640x480, random angle: offered of 20, median frames to offer"
+    );
+    println!(
+        "{:>9} {:>12} {:>12} {:>12}",
+        "px/module", "n=0", "n=20", "n=30"
+    );
+    for ppm in [3.0, 4.0, 5.0] {
+        print!("{ppm:>9}");
+        for noise in [0.0, 20.0, 30.0] {
+            let mut took = Vec::new();
+            for run in 0..20u64 {
+                let mut scanner = Scanner::new();
+                let mut session = Session::new();
+                for i in 0..60u64 {
+                    let mut rng = Rng::new(10_000 * run + i + 1);
+                    let view = View {
+                        px_per_module: ppm,
+                        noise,
+                        angle_deg: 360.0 * rng.unit(),
+                        ..View::plain()
+                    };
+                    let frame = render(&code, &view, &mut rng);
+                    let f = Frame::new(&frame, w, h, w).unwrap();
+                    match session.feed(scanner.scan(f)) {
+                        SessionStep::Offer(_) => {
+                            took.push(i + 1);
+                            break;
+                        }
+                        SessionStep::Refused => break,
+                        _ => {}
+                    }
+                }
+            }
+            took.sort();
+            let median = took
+                .get(took.len() / 2)
+                .map_or("-".into(), |m| m.to_string());
+            print!(" {:>12}", format!("{} / {median}", took.len()));
         }
         println!();
     }

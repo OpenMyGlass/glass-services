@@ -64,6 +64,10 @@ const BLE_REAP_FIRST_MS: u64 = 100;
 const BLE_REAP_MAX_MS: u64 = 30_000;
 /// A start that finds the port still held tries again after this long.
 const BLE_PORT_BUSY_MS: u64 = 1_000;
+/// How long the daemon's loop waits for the kick. It takes a millisecond when nothing is wrong.
+const KICK_WAIT_MS: u64 = 200;
+/// How long the kick's byte gets to leave before it is thrown away.
+const KICK_DRAIN_MS: u64 = 50;
 
 /// A running `omg-bled`.
 struct BleChild {
@@ -258,6 +262,10 @@ pub struct Radio {
     bt_hci: String,
     /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
     bt_uart: Option<String>,
+    /// What the kick does, on its own thread.
+    kick_port: fn(&str),
+    /// A kick that is taking long. Until it ends it may still be at the port.
+    kicking: Option<std::thread::JoinHandle<()>>,
     /// The supplicant config to associate with when Wi-Fi is on.
     wifi_conf: Option<std::path::PathBuf>,
     /// `wpa_supplicant` and `udhcpc` were started and not stopped yet.
@@ -295,6 +303,53 @@ fn write_private(path: &std::path::Path, content: &str) -> io::Result<()> {
         .mode(0o600)
         .open(path)?
         .write_all(content.as_bytes())
+}
+
+/// The kick itself: see [`Radio::kick_bt_uart`]. Safe with the port in any state: no flow control,
+/// so that CTS cannot hold the byte, and nothing left queued, so that the close has nothing to
+/// wait for. What it leaves behind is the flow control off, and the engine sets its own.
+fn kick_port(path: &str) {
+    match send_one_byte(path) {
+        Ok(true) => info!("radio: one byte sent on {path} so that the idle port can sleep"),
+        Ok(false) => warn!("radio: the byte on {path} did not leave: deep sleep may be blocked"),
+        Err(e) => warn!("radio: cannot write to {path} ({e}): deep sleep may be blocked"),
+    }
+}
+
+/// Returns whether the byte left. Not a terminal (a test's file) is fine.
+fn send_one_byte(path: &str) -> io::Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut port = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)?;
+    let fd = port.as_raw_fd();
+    // SAFETY: termios is plain data, filled by tcgetattr before use, on a descriptor we hold.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) == 0 {
+            t.c_cflag &= !libc::CRTSCTS;
+            t.c_cflag |= libc::CLOCAL;
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+    }
+    port.write_all(&[0])?;
+    let end = Instant::now() + Duration::from_millis(KICK_DRAIN_MS);
+    loop {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ fills one int.
+        let r = unsafe { libc::ioctl(fd, libc::TIOCOUTQ as _, &mut queued) };
+        if r != 0 || queued == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= end {
+            // SAFETY: on a descriptor we hold.
+            unsafe { libc::tcflush(fd, libc::TCOFLUSH) };
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn run_system(program: &str, args: &[&str]) -> io::Result<Outcome> {
@@ -349,6 +404,8 @@ impl Radio {
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
             bt_uart: None,
+            kick_port,
+            kicking: None,
             wifi_conf: None,
             associating: false,
             ble: None,
@@ -504,6 +561,7 @@ impl Radio {
     /// Whether something may still hold the Bluetooth port.
     fn ble_port_busy(&self) -> bool {
         self.ble.as_ref().is_some_and(|b| b.leaving.is_some())
+            || self.kicking.as_ref().is_some_and(|k| !k.is_finished())
     }
 
     /// Powers the chip and starts the engine. With the port still held neither happens yet, so that
@@ -606,9 +664,11 @@ impl Radio {
     /// boots), and that keeps the CORE power domain out of deep sleep. After one transmitted byte
     /// it went back to 3 and stayed there through later block/unblock cycles. The chip is off,
     /// so nothing receives the byte.
+    ///
+    /// An engine that failed its bring-up has left its settings on the port, and it is not known
+    /// what CTS does with the chip off. So [`kick_port`] drops the flow control, and it runs on its
+    /// own thread, so that whatever the kernel does with this port cannot stop the daemon's loop.
     fn kick_bt_uart(&mut self) {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         // It stays due: an engine on its way out still owns the port.
         if self.ble_port_busy() {
             return;
@@ -616,14 +676,24 @@ impl Radio {
         let Some(path) = self.bt_uart.take() else {
             return;
         };
-        let r = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(&path)
-            .and_then(|mut f| f.write_all(&[0]));
-        match r {
-            Ok(()) => info!("radio: one byte sent on {path} so that the idle port can sleep"),
-            Err(e) => warn!("radio: cannot write to {path} ({e}): deep sleep may be blocked"),
+        let kick = self.kick_port;
+        let thread = std::thread::Builder::new()
+            .name("bt-kick".into())
+            .spawn(move || kick(&path));
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("radio: cannot kick the Bluetooth port ({e}): deep sleep may be blocked");
+                return;
+            }
+        };
+        let end = Instant::now() + Duration::from_millis(KICK_WAIT_MS);
+        while !thread.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !thread.is_finished() {
+            warn!("radio: the Bluetooth port is slow to take a byte: not waiting for it");
+            self.kicking = Some(thread);
         }
     }
 
@@ -1167,6 +1237,92 @@ mod tests {
         std::fs::write(d.path().join("go"), "").unwrap();
         until_reaped(&mut r);
         assert_eq!(r.ble_next_deadline(), None, "a timer stayed");
+    }
+
+    #[test]
+    fn the_kick_turns_off_the_flow_control_a_failed_bring_up_left_and_the_byte_leaves() {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain calls on the descriptor just opened.
+        let (master, slave) = unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK);
+            assert!(m >= 0);
+            assert_eq!(libc::grantpt(m), 0);
+            assert_eq!(libc::unlockpt(m), 0);
+            let mut name = [0 as libc::c_char; 128];
+            assert_eq!(libc::ptsname_r(m, name.as_mut_ptr(), name.len()), 0);
+            let path = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_str()
+                .unwrap()
+                .to_string();
+            (std::fs::File::from_raw_fd(m), path)
+        };
+        // Held open, so that the terminal's settings last from one open to the next.
+        let holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&slave)
+            .unwrap();
+        // SAFETY: termios is plain data, filled by tcgetattr before use.
+        let flags = |set: bool| unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(holder.as_raw_fd(), &mut t), 0);
+            if set {
+                libc::cfmakeraw(&mut t);
+                t.c_cflag |= libc::CRTSCTS;
+                assert_eq!(libc::tcsetattr(holder.as_raw_fd(), libc::TCSANOW, &t), 0);
+            }
+            t.c_cflag
+        };
+        assert_ne!(flags(true) & libc::CRTSCTS, 0);
+
+        assert!(send_one_byte(&slave).unwrap());
+
+        assert_eq!(flags(false) & libc::CRTSCTS, 0, "flow control left on");
+        let mut got = [9u8; 4];
+        assert_eq!((&master).read(&mut got).unwrap(), 1);
+        assert_eq!(got[0], 0);
+    }
+
+    #[test]
+    fn a_kick_the_kernel_holds_stops_neither_the_loop_nor_the_order_of_things() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LET_GO: AtomicBool = AtomicBool::new(false);
+        let (r, log, _d) = {
+            let d = tempfile::tempdir().unwrap();
+            let (r, log) = recording();
+            let command = engine_script(d.path(), "cat >/dev/null");
+            (r.with_ble_engine(command), log, d)
+        };
+        let mut r = r;
+        r.bt_uart = Some("unused".into());
+        r.kick_port = |_| {
+            while !LET_GO.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let t = Instant::now();
+        r.set_bluetooth(false);
+        assert!(t.elapsed() < Duration::from_secs(2), "the loop waited");
+        cmds(&log);
+
+        // The engine must not meet a kick at the port: the chip waits with it.
+        r.set_bluetooth(true);
+        assert!(cmds(&log).is_empty(), "started with a kick at the port");
+        assert_eq!(r.ble_fd(), None);
+        let at = r.ble_next_deadline().unwrap();
+        r.ble_tick(at);
+        assert!(cmds(&log).is_empty());
+
+        LET_GO.store(true, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(10);
+        while r.ble_port_busy() {
+            assert!(Instant::now() < end, "timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let at = r.ble_next_deadline().unwrap();
+        r.ble_tick(at);
+        assert_eq!(cmds(&log), vec!["rfkill unblock bluetooth"]);
+        r.set_bluetooth(false);
     }
 
     #[test]

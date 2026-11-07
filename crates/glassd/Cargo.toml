@@ -32,4 +32,6 @@ linux-bt = []
 # For the companion-link integration test, to craft wire frames the way a real companion does.
 omg-protocol.workspace = true
 omg-core.workspace = true
+# To hold the setup QR's validation and the supplicant config together, without the decoder.
+glass-qr = { path = "../glass-qr", default-features = false }
 tempfile = "3"

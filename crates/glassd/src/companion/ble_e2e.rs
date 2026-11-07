@@ -549,3 +549,96 @@ fn a_finished_handshake_has_no_deadline_left() {
     let _phone = pair(&mut b);
     assert_eq!(b.glass.handshake_next_deadline(), None);
 }
+
+/// A Glass with TCP and BLE, and how to reach each.
+fn glass_with_tcp_and_ble(root: &Path) -> (Companion, u16, PathBuf) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let socket = root.join("ble.sock");
+    let mut glass =
+        Companion::new(&root.join("g"), DeviceState::default(), Some(port), false).unwrap();
+    glass.set_ble_socket(socket.clone());
+    (glass, port, socket)
+}
+
+/// Accepts until `want` connections are there, or says what it got.
+fn accept_until(glass: &mut Companion, transport: Transport, want: usize) {
+    let start = Instant::now();
+    while glass.conn_fds().len() < want && start.elapsed() < Duration::from_secs(5) {
+        glass.accept(transport);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(glass.conn_fds().len(), want);
+}
+
+#[test]
+fn idle_tcp_peers_cannot_lock_the_phone_out_of_ble() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut glass, port, socket) = glass_with_tcp_and_ble(tmp.path());
+    let _peers: Vec<_> = (0..5)
+        .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    accept_until(&mut glass, Transport::WifiTcp, 3);
+    // The other two knocked and were turned away.
+    for _ in 0..50 {
+        glass.accept(Transport::WifiTcp);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(glass.conn_fds().len(), 3);
+
+    let _phone = UnixStream::connect(&socket).unwrap();
+    accept_until(&mut glass, Transport::Ble, 4);
+}
+
+#[test]
+fn without_ble_tcp_keeps_all_its_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut glass = Companion::new(
+        &tmp.path().join("g"),
+        DeviceState::default(),
+        Some(port),
+        false,
+    )
+    .unwrap();
+    let _peers: Vec<_> = (0..4)
+        .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    accept_until(&mut glass, Transport::WifiTcp, 4);
+}
+
+#[test]
+fn a_tcp_peer_that_says_nothing_is_dropped_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut glass, port, _socket) = glass_with_tcp_and_ble(tmp.path());
+    let _peer = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    accept_until(&mut glass, Transport::WifiTcp, 1);
+    assert!(glass.handshake_next_deadline().unwrap() > super::now_ms());
+    assert!(glass.handshake_tick().is_empty());
+    assert_eq!(glass.conn_fds().len(), 1, "before its time");
+    for c in glass.conns.values_mut() {
+        c.handshake_by_ms = Some(0);
+    }
+    assert!(glass.handshake_tick().is_empty());
+    assert_eq!(glass.conn_fds().len(), 0);
+    assert_eq!(glass.handshake_next_deadline(), None);
+}
+
+#[test]
+fn a_dial_has_the_same_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass =
+        Companion::new(&tmp.path().join("g"), DeviceState::default(), None, false).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .connect_tcp(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    assert!(glass.handshake_next_deadline().is_some());
+}

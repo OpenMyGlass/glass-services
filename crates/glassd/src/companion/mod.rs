@@ -45,10 +45,14 @@ pub type ConnId = u64;
 const READ_BUDGET: usize = 64 * 1024;
 /// Most connections in flight at once (a bonded companion plus a few probing strangers).
 const MAX_CONNS: usize = 4;
-/// How long a BLE peer has to finish the handshake, about 800 bytes each way. One connected
-/// stranger stops the advertising, so one that says nothing must not stay. Generous for a link
-/// that was measured to stall for 3.6 s.
-const BLE_HANDSHAKE_MS: u64 = 30_000;
+/// With BLE on, connections over anything else stop this far below [`MAX_CONNS`], so that nobody on
+/// the network can keep the phone's everyday link out.
+const BLE_RESERVED_CONNS: usize = 1;
+/// How long a peer has to finish the handshake, about 800 bytes each way, on any transport. A peer
+/// that says nothing must not keep a connection: one connected stranger on BLE stops the
+/// advertising. Generous for a BLE link that was measured to stall for 3.6 s. The handshake waits
+/// for no person at either end.
+const HANDSHAKE_MS: u64 = 30_000;
 
 /// Current wall-clock in milliseconds since the Unix epoch (matches the companion's `now_ms`).
 pub fn now_ms() -> u64 {
@@ -138,7 +142,7 @@ struct Conn {
     out: Vec<u8>,
     transport: Transport,
     closing: bool,
-    /// A BLE peer that has not finished the handshake goes at this wall-clock time.
+    /// A peer that has not finished the handshake goes at this wall-clock time.
     handshake_by_ms: Option<u64>,
 }
 
@@ -330,7 +334,7 @@ impl Companion {
         self.conns.values().filter_map(|c| c.handshake_by_ms).min()
     }
 
-    /// Drops the BLE peers that did not finish the handshake in time.
+    /// Drops the peers that did not finish the handshake in time.
     pub fn handshake_tick(&mut self) -> Vec<Event> {
         let now = now_ms();
         let late: Vec<ConnId> = self
@@ -505,7 +509,7 @@ impl Companion {
     pub fn accept(&mut self, transport: Transport) -> Vec<Event> {
         let mut events = Vec::new();
         for stream in self.listeners.accept(transport) {
-            if self.conns.len() >= MAX_CONNS {
+            if self.conns_full_for(transport) {
                 warn!(
                     "companion: too many connections; dropping a new {}",
                     transport.as_str()
@@ -515,6 +519,18 @@ impl Companion {
             self.add_conn(stream, transport, &mut events);
         }
         events
+    }
+
+    fn conns_full_for(&self, transport: Transport) -> bool {
+        if transport == Transport::Ble || self.ble_socket.is_none() {
+            return self.conns.len() >= MAX_CONNS;
+        }
+        let others = self
+            .conns
+            .values()
+            .filter(|c| c.transport != Transport::Ble)
+            .count();
+        others >= MAX_CONNS - BLE_RESERVED_CONNS
     }
 
     /// Dials a companion over TCP (the QR bootstrap connect path), then starts the handshake.
@@ -566,7 +582,7 @@ impl Companion {
                 out: Vec::new(),
                 transport,
                 closing: false,
-                handshake_by_ms: (transport == Transport::Ble).then(|| now_ms() + BLE_HANDSHAKE_MS),
+                handshake_by_ms: Some(now_ms() + HANDSHAKE_MS),
             },
         );
         // Drive the Hello that start() queued against the now-inserted connection.

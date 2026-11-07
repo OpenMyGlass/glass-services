@@ -18,3 +18,4 @@ pub mod rtc;
 pub mod screen;
 pub mod settings_store;
 pub mod touch;
+pub mod wifi_setup;

@@ -9,7 +9,8 @@ use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
     ClientFrame, CompanionPairingWindow, CompanionState, ErrorCode, FocusState, HeadRequest, Hello,
     LocationStatus, NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings,
-    Topic, WearState, Welcome, client_frame, location_status, screen_request, service_frame,
+    Topic, WearState, Welcome, WifiSetupState, client_frame, location_status, screen_request,
+    service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -62,6 +63,8 @@ pub enum Effect {
     },
     /// A client asked to forget the bonded phone. Answered in the same way.
     CompanionForgetBond { client: ClientId, seq: u32 },
+    /// A client asked to start or stop a Wi-Fi setup session.
+    WifiSetup { start: bool },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -118,6 +121,7 @@ pub mod settings_rules {
             // Radios off by default: on Model B the companion is the gateway over Bluetooth and
             // Wi-Fi is brought up on demand (big transfers / fallback); see docs/api.md.
             wifi_enabled: Some(false),
+            wifi_setup_ap_enabled: Some(false),
             bluetooth_enabled: Some(false),
             airplane_mode: Some(false),
             // Unset until someone chooses: the launcher then shows its first-run language picker,
@@ -174,6 +178,9 @@ pub mod settings_rules {
         // radio wish is kept here and restored when airplane_mode goes off.
         if let Some(v) = change.wifi_enabled {
             current.wifi_enabled = Some(v);
+        }
+        if let Some(v) = change.wifi_setup_ap_enabled {
+            current.wifi_setup_ap_enabled = Some(v);
         }
         if let Some(v) = change.bluetooth_enabled {
             current.bluetooth_enabled = Some(v);
@@ -245,6 +252,8 @@ pub struct Hub {
     screen: Option<ScreenState>,
     wear: Option<WearState>,
     settings: Option<Settings>,
+    /// The last Wi-Fi setup state: has the access point's password while it is up.
+    wifi_setup: Option<WifiSetupState>,
     relay: Relay,
     /// The time set by the owner ([`Hub::set_time`]); `None`: `CLOCK_MONOTONIC`.
     time: Option<u64>,
@@ -279,6 +288,7 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::Button(_) => Topic::Button,
         B::Location(_) | B::LocationStatus(_) => Topic::Location,
         B::NoteEvent(_) => Topic::Notes,
+        B::WifiSetupState(_) => Topic::WifiSetup,
         B::CompanionState(_) | B::CompanionNotification(_) | B::CompanionNotificationRemoved(_) => {
             Topic::Companion
         }
@@ -304,6 +314,7 @@ impl Hub {
             screen: None,
             wear: None,
             settings: None,
+            wifi_setup: None,
             relay: Relay::default(),
             time: None,
         }
@@ -513,6 +524,7 @@ impl Hub {
                 for t in s.topics {
                     match Topic::try_from(t) {
                         Ok(Topic::Unspecified) | Err(_) => {}
+                        Ok(Topic::WifiSetup) if !state.privileged => {}
                         Ok(t) if !topics.contains(&t) => topics.push(t),
                         Ok(_) => {}
                     }
@@ -539,7 +551,10 @@ impl Hub {
                     error(ErrorCode::Unsupported, "no settings store", seq),
                 )),
                 Some(current) => {
-                    if let Some(change) = s.settings {
+                    if let Some(mut change) = s.settings {
+                        if !state.privileged {
+                            change.wifi_setup_ap_enabled = None;
+                        }
                         settings_rules::merge(current, &change);
                     }
                     let applied = *current;
@@ -720,6 +735,16 @@ impl Hub {
             Some(B::CompanionForgetBond(_)) => {
                 fx.push(Effect::CompanionForgetBond { client: id, seq })
             }
+            Some(B::WifiSetup(r)) => {
+                if state.privileged {
+                    fx.push(Effect::WifiSetup { start: r.start });
+                } else {
+                    fx.push(Effect::Send(
+                        id,
+                        error(ErrorCode::Denied, "Wi-Fi setup is for the launcher", seq),
+                    ));
+                }
+            }
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {
@@ -782,6 +807,12 @@ impl Hub {
                     snapshot: true,
                     ..self.relay.companion_state()
                 })),
+                Topic::WifiSetup => self.wifi_setup.as_ref().map(|s| {
+                    service_frame::Body::WifiSetupState(WifiSetupState {
+                        snapshot: true,
+                        ..s.clone()
+                    })
+                }),
                 _ => None,
             };
             if let Some(b) = body {
@@ -867,6 +898,7 @@ impl Hub {
             service_frame::Body::ScreenState(s) => self.screen = Some(s.clone()),
             service_frame::Body::WearState(w) => self.wear = Some(*w),
             service_frame::Body::Settings(s) => self.settings = Some(*s),
+            service_frame::Body::WifiSetupState(s) => self.wifi_setup = Some(s.clone()),
             _ => {}
         }
         if topic == Topic::Gesture {
@@ -932,6 +964,72 @@ mod tests {
             seq: 0,
             body: Some(body),
         }
+    }
+
+    #[test]
+    fn only_an_allowed_client_touches_wifi_setup() {
+        use crate::proto::{WifiSetupRequest, WifiSetupState};
+        let mut hub = Hub::new("t", &[]);
+        hub.set_settings_source(settings_rules::defaults());
+        let (app, launcher) = (hub.add_client(), hub.add_client());
+        hub.allow_privileged(launcher);
+        for id in [app, launcher] {
+            hub.on_frame(id, hello_frame(1));
+            hub.on_frame(id, sub(&[Topic::WifiSetup]));
+        }
+        let ask = cf(C::WifiSetup(WifiSetupRequest { start: true }));
+        let fx = hub.on_frame(app, ask.clone());
+        assert!(!fx.iter().any(|e| matches!(e, Effect::WifiSetup { .. })));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::Send(_, ServiceFrame { body: Some(service_frame::Body::Error(er)) })
+                if er.code == ErrorCode::Denied as i32
+        )));
+        let fx = hub.on_frame(launcher, ask);
+        assert!(matches!(fx[0], Effect::WifiSetup { start: true }));
+
+        // The password goes to only one of them.
+        let fx = hub.publish(ServiceFrame {
+            body: Some(service_frame::Body::WifiSetupState(WifiSetupState {
+                password: "secret".into(),
+                ..Default::default()
+            })),
+        });
+        assert_eq!(fx.len(), 1);
+        assert!(matches!(fx[0], Effect::Send(to, _) if to == launcher));
+        // Nor in a snapshot.
+        for (id, frames) in [(app, 0), (launcher, 1)] {
+            let fx = hub.on_frame(id, sub(&[Topic::WifiSetup]));
+            let n = fx
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Effect::Send(
+                            _,
+                            ServiceFrame {
+                                body: Some(service_frame::Body::WifiSetupState(_))
+                            }
+                        )
+                    )
+                })
+                .count();
+            assert_eq!(n, frames);
+        }
+
+        // The setting stays as it is for the one, and with it other changes go through.
+        let set = cf(C::SetSettings(SetSettings {
+            settings: Some(Settings {
+                wifi_setup_ap_enabled: Some(true),
+                wifi_enabled: Some(true),
+                ..Default::default()
+            }),
+        }));
+        hub.on_frame(app, set.clone());
+        assert_eq!(hub.settings().unwrap().wifi_setup_ap_enabled, Some(false));
+        assert_eq!(hub.settings().unwrap().wifi_enabled, Some(true));
+        hub.on_frame(launcher, set);
+        assert_eq!(hub.settings().unwrap().wifi_setup_ap_enabled, Some(true));
     }
 
     fn hello_frame(v: u32) -> ClientFrame {

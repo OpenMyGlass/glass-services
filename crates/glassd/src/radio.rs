@@ -38,6 +38,9 @@ pub const DEFAULT_WIFI_IFACE: &str = "wlan0";
 pub const DEFAULT_BT_HCI: &str = "hci0";
 /// The supplicant config's name in the state directory. It holds the network's password.
 pub const WIFI_CONF_FILE: &str = "wifi.conf";
+/// How often, and how many times, `wpa_supplicant` is tried again when it would not start.
+const ASSOC_RETRY_US: u64 = 2_000_000;
+const ASSOC_MAX_FAILURES: u32 = 5;
 const WPA_PID_FILE: &str = "/var/run/glassd-wpa_supplicant.pid";
 const DHCP_PID_FILE: &str = "/var/run/glassd-udhcpc.pid";
 /// The UART the Bluetooth chip is wired to.
@@ -251,6 +254,23 @@ pub struct Outcome {
     pub stdout: String,
 }
 
+/// The command line of a running process, by pid, with its arguments joined by spaces; `None` if
+/// there is no such process. Injected so the tests can say what runs.
+pub type Processes = Box<dyn Fn(&str) -> Option<String> + Send>;
+
+fn system_processes(pid: &str) -> Option<String> {
+    let raw = std::fs::read(std::path::Path::new("/proc").join(pid).join("cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&raw).replace('\0', " "))
+}
+
+/// The whole numbers in a pid file: nothing else may become an argument of `kill`.
+pub(crate) fn pids_in(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Runs a system command `program args...`. An `Err` means the process could not be run at all
 /// (the tool is absent); `Ok` with `ok = false` means it ran and failed.
 pub type Runner = Box<dyn FnMut(&str, &[&str]) -> io::Result<Outcome> + Send>;
@@ -258,6 +278,10 @@ pub type Runner = Box<dyn FnMut(&str, &[&str]) -> io::Result<Outcome> + Send>;
 /// Switches the Wi-Fi and Bluetooth radios.
 pub struct Radio {
     run: Runner,
+    procs: Processes,
+    /// Where `wpa_supplicant` and `udhcpc` write their pids.
+    wpa_pid: std::path::PathBuf,
+    dhcp_pid: std::path::PathBuf,
     wifi_iface: String,
     bt_hci: String,
     /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
@@ -272,6 +296,11 @@ pub struct Radio {
     associating: bool,
     /// Owns Bluetooth when set: see the module docs.
     ble: Option<BleEngine>,
+    /// A Wi-Fi setup session owns the interface: the settings do not drive it for now.
+    wifi_held: bool,
+    /// `wpa_supplicant` refused to start this many times in a row, and the next try's time.
+    assoc_failures: u32,
+    assoc_retry_at_us: Option<u64>,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -436,10 +465,52 @@ impl Radio {
         self
     }
 
+    /// Reads what runs through `procs` instead of `/proc`, and keeps the pid files in `dir`.
+    pub fn with_processes(mut self, procs: Processes, dir: &std::path::Path) -> Radio {
+        self.procs = procs;
+        self.wpa_pid = dir.join("glassd-wpa_supplicant.pid");
+        self.dhcp_pid = dir.join("glassd-udhcpc.pid");
+        self
+    }
+
+    /// The pids in `file` of processes still running with `marker` in their command line. A pid
+    /// file outlives its process, and the pid can be another process's by now.
+    pub(crate) fn live_pids(&self, file: &std::path::Path, marker: &str) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Vec::new();
+        };
+        pids_in(&text)
+            .into_iter()
+            .filter(|p| (self.procs)(p).is_some_and(|c| c.contains(marker)))
+            .collect()
+    }
+
+    /// Sends `signal` to the live processes of these pid files. Returns whether there were any.
+    pub(crate) fn signal_pid_files(
+        &mut self,
+        signal: &str,
+        files: &[(&std::path::Path, &str)],
+    ) -> bool {
+        let pids: Vec<String> = files
+            .iter()
+            .flat_map(|(f, marker)| self.live_pids(f, marker))
+            .collect();
+        if pids.is_empty() {
+            return false;
+        }
+        let mut args = vec![signal];
+        args.extend(pids.iter().map(String::as_str));
+        self.step("kill", &args);
+        true
+    }
+
     /// A radio with a custom runner.
     pub fn with_runner(wifi_iface: impl Into<String>, run: Runner) -> Radio {
         Radio {
             run,
+            procs: Box::new(system_processes),
+            wpa_pid: WPA_PID_FILE.into(),
+            dhcp_pid: DHCP_PID_FILE.into(),
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
             bt_uart: None,
@@ -448,6 +519,9 @@ impl Radio {
             wifi_conf: None,
             associating: false,
             ble: None,
+            wifi_held: false,
+            assoc_failures: 0,
+            assoc_retry_at_us: None,
             wifi_on: None,
             bt_on: None,
         }
@@ -619,8 +693,22 @@ impl Radio {
         r
     }
 
-    /// Runs one command; logs and returns false if the tool is absent or the command failed.
-    fn step(&mut self, program: &str, args: &[&str]) -> bool {
+    /// The Wi-Fi interface's name.
+    pub(crate) fn wifi_iface(&self) -> &str {
+        &self.wifi_iface
+    }
+
+    /// Runs one command for its output; `None` if the tool is absent or the command failed.
+    pub(crate) fn query(&mut self, program: &str, args: &[&str]) -> Option<String> {
+        match (self.run)(program, args) {
+            Ok(o) if o.ok => Some(o.stdout),
+            _ => None,
+        }
+    }
+
+    /// Runs one command; logs and returns false if the tool is absent or the command failed. The
+    /// arguments are logged then, so a secret never goes in them.
+    pub(crate) fn step(&mut self, program: &str, args: &[&str]) -> bool {
         match (self.run)(program, args) {
             Ok(o) if o.ok => true,
             Ok(o) => {
@@ -651,6 +739,7 @@ impl Radio {
             self.start_association();
             r
         } else {
+            self.forget_association_failures();
             self.stop_association();
             self.step("ip", &["link", "set", &iface, "down"]);
             self.step("rfkill", &["block", "wifi"])
@@ -739,7 +828,7 @@ impl Radio {
     /// Brings both radios to the wanted state, writing only what changed since the last call.
     /// `wifi` and `bluetooth` are the effective states (airplane mode already folded in).
     pub fn apply(&mut self, wifi: bool, bluetooth: bool) {
-        if self.wifi_on != Some(wifi) {
+        if !self.wifi_held && self.wifi_on != Some(wifi) {
             self.set_wifi(wifi);
         }
         if self.bt_on != Some(bluetooth) {
@@ -774,7 +863,8 @@ impl Radio {
         }
         let iface = self.wifi_iface.clone();
         let conf_arg = conf.to_string_lossy().into_owned();
-        self.step(
+        let pid_arg = self.wpa_pid.to_string_lossy().into_owned();
+        let started = self.step(
             "wpa_supplicant",
             &[
                 "-B",
@@ -785,31 +875,124 @@ impl Radio {
                 "-c",
                 &conf_arg,
                 "-P",
-                WPA_PID_FILE,
+                &pid_arg,
             ],
         );
+        // An old one that is still going holds the control socket, and this one exits at once.
+        // One that an earlier run left (a crash, an update, an exit) is not ours to know of but
+        // by its pid file: it goes, and the next try comes after it has.
+        if !started {
+            if self.kill_association_by_files() {
+                warn!("radio: stopped a supplicant left by an earlier run");
+            }
+            self.assoc_failures += 1;
+            return;
+        }
+        self.assoc_failures = 0;
+        self.assoc_retry_at_us = None;
         // Through a shell, with the output closed: the runner waits for its pipe to close, and
         // udhcpc stays in the foreground until it has a lease.
-        let dhcp = format!("udhcpc -b -i {iface} -p {DHCP_PID_FILE} >/dev/null 2>&1 &");
+        let dhcp = format!(
+            "udhcpc -b -i {iface} -p {} >/dev/null 2>&1 &",
+            self.dhcp_pid.display()
+        );
         self.step("sh", &["-c", &dhcp]);
         self.associating = true;
         info!("radio: joining Wi-Fi on {iface}");
     }
 
-    fn stop_association(&mut self) {
-        if !std::mem::take(&mut self.associating) {
+    /// A Wi-Fi setup session takes the interface: [`Radio::apply`] leaves Wi-Fi alone for now.
+    pub(crate) fn hold_wifi(&mut self) {
+        self.wifi_held = true;
+        self.forget_association_failures();
+    }
+
+    fn forget_association_failures(&mut self) {
+        self.assoc_failures = 0;
+        self.assoc_retry_at_us = None;
+    }
+
+    /// When [`Radio::association_tick`] next has work (`CLOCK_MONOTONIC` µs).
+    pub fn association_next_deadline(&self) -> Option<u64> {
+        self.assoc_retry_at_us
+    }
+
+    /// Tries `wpa_supplicant` again if it refused to start, a few times.
+    pub fn association_tick(&mut self, now_us: u64) {
+        if self.assoc_failures == 0 {
             return;
         }
-        let kill = format!("kill $(cat {WPA_PID_FILE} {DHCP_PID_FILE}) 2>/dev/null");
-        self.step("sh", &["-c", &kill]);
+        if self.assoc_failures > ASSOC_MAX_FAILURES {
+            warn!("radio: wpa_supplicant will not start: giving up");
+            self.forget_association_failures();
+            return;
+        }
+        match self.assoc_retry_at_us {
+            None => self.assoc_retry_at_us = Some(now_us + ASSOC_RETRY_US),
+            Some(at) if now_us >= at => {
+                self.assoc_retry_at_us = None;
+                self.start_association();
+                if self.assoc_failures > 0 {
+                    self.assoc_retry_at_us = Some(now_us + ASSOC_RETRY_US);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// The session gave the interface back, in an unknown state: the next [`Radio::apply`] drives
+    /// it, whatever it was before.
+    pub(crate) fn release_wifi(&mut self) {
+        self.wifi_held = false;
+        self.wifi_on = None;
+    }
+
+    /// The network tried by [`Radio::join_wifi`] works, and is now stored as `conf`.
+    pub(crate) fn finish_join(&mut self, conf: std::path::PathBuf) {
+        self.wifi_conf = Some(conf);
+        self.wifi_held = false;
+    }
+
+    /// The network tried by [`Radio::join_wifi`] did not work: back to `conf`. The radio stays
+    /// held: the supplicant has only been told to go, and a new one started before it has gone
+    /// cannot get the control socket. Wait, then [`Radio::release_wifi`].
+    pub(crate) fn abandon_join(&mut self, conf: std::path::PathBuf) {
+        self.stop_association();
+        self.forget_association_failures();
+        self.wifi_conf = Some(conf);
+    }
+
+    /// Stops the supplicant and the DHCP client, by their pid files: also those of an earlier run,
+    /// which this one did not start and would otherwise run beside.
+    pub(crate) fn stop_association(&mut self) {
+        self.associating = false;
+        self.kill_association_by_files();
+    }
+
+    fn kill_association_by_files(&mut self) -> bool {
+        let (wpa, dhcp) = (self.wpa_pid.clone(), self.dhcp_pid.clone());
+        let (wpa_s, dhcp_s) = (wpa.to_string_lossy(), dhcp.to_string_lossy());
+        self.signal_pid_files("-TERM", &[(&wpa, &wpa_s), (&dhcp, &dhcp_s)])
     }
 
     /// The Wi-Fi interface's IPv4 address, if it has one.
     pub fn wifi_ip(&mut self) -> Option<String> {
+        self.wifi_ips().into_iter().next()
+    }
+
+    /// All the Wi-Fi interface's IPv4 addresses.
+    pub fn wifi_ips(&mut self) -> Vec<String> {
         let iface = self.wifi_iface.clone();
-        let out = (self.run)("ip", &["-4", "-o", "addr", "show", &iface]).ok()?;
-        let after = out.stdout.split("inet ").nth(1)?;
-        Some(after.split(['/', ' ']).next()?.to_string()).filter(|ip| !ip.is_empty())
+        let Ok(out) = (self.run)("ip", &["-4", "-o", "addr", "show", &iface]) else {
+            return Vec::new();
+        };
+        out.stdout
+            .split("inet ")
+            .skip(1)
+            .filter_map(|after| after.split(['/', ' ']).next())
+            .filter(|ip| !ip.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// The Wi-Fi supplicant installed on the image, if glassd can see one (`wpa_supplicant` or
@@ -864,7 +1047,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let conf = d.path().join(WIFI_CONF_FILE);
         let (r, log) = with_log();
-        let mut r = r.with_wifi_conf(&conf);
+        // The supplicant runs once started: its pid file then names it.
+        let pid_dir = d.path().to_path_buf();
+        let mut r = r.with_wifi_conf(&conf).with_processes(
+            Box::new(move |pid| {
+                (pid == "4242").then(|| {
+                    pid_dir
+                        .join("glassd-wpa_supplicant.pid")
+                        .display()
+                        .to_string()
+                })
+            }),
+            d.path(),
+        );
         r.apply(true, false);
         assert!(
             !log.lock()
@@ -892,15 +1087,85 @@ mod tests {
                 .any(|c| c.contains("udhcpc -b -i wlan0") && c.ends_with('&'))
         );
 
+        std::fs::write(d.path().join("glassd-wpa_supplicant.pid"), "4242\n").unwrap();
         log.lock().unwrap().clear();
         r.apply(false, false);
         let stopped = log.lock().unwrap().clone();
+        assert!(
+            stopped.contains(&"kill -TERM 4242".to_string()),
+            "{stopped:?}"
+        );
         let kill = stopped.iter().position(|c| c.contains("kill")).unwrap();
         let down = stopped
             .iter()
             .position(|c| c.contains("link set wlan0 down"))
             .unwrap();
         assert!(kill < down);
+    }
+
+    #[test]
+    fn a_supplicant_that_will_not_start_is_tried_again_and_then_given_up() {
+        let d = tempfile::tempdir().unwrap();
+        let conf = d.path().join(WIFI_CONF_FILE);
+        std::fs::write(&conf, "network={}").unwrap();
+        let refusals = Arc::new(Mutex::new(2));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (r2, s2) = (refusals.clone(), seen.clone());
+        let mut r = Radio::with_runner(
+            "wlan0",
+            Box::new(move |p, _| {
+                s2.lock().unwrap().push(p.to_string());
+                let mut left = r2.lock().unwrap();
+                let ok = p != "wpa_supplicant" || *left == 0;
+                if p == "wpa_supplicant" && *left > 0 {
+                    *left -= 1;
+                }
+                Ok(Outcome {
+                    ok,
+                    stdout: String::new(),
+                })
+            }),
+        )
+        .with_wifi_conf(&conf);
+        let starts = |s: &Arc<Mutex<Vec<String>>>| {
+            s.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "wpa_supplicant")
+                .count()
+        };
+        r.set_wifi(true);
+        assert_eq!(starts(&seen), 1);
+        assert!(
+            !r.associating,
+            "no DHCP client for a supplicant that is not there"
+        );
+        r.association_tick(0);
+        let at = r.association_next_deadline().unwrap();
+        r.association_tick(at - 1);
+        assert_eq!(starts(&seen), 1);
+        r.association_tick(at);
+        assert_eq!(starts(&seen), 2);
+        r.association_tick(at + ASSOC_RETRY_US);
+        assert_eq!(starts(&seen), 3);
+        assert!(r.associating);
+        assert_eq!(r.association_next_deadline(), None);
+        assert!(
+            seen.lock().unwrap().iter().any(|p| p == "sh"),
+            "the DHCP client"
+        );
+
+        // It never starts: a limited number of tries, and no more deadlines.
+        *refusals.lock().unwrap() = 1000;
+        r.set_wifi(false);
+        r.set_wifi(true);
+        let mut now = 0;
+        for _ in 0..50 {
+            r.association_tick(now);
+            now += ASSOC_RETRY_US;
+        }
+        assert_eq!(r.association_next_deadline(), None);
+        assert_eq!(starts(&seen), 4 + ASSOC_MAX_FAILURES as usize);
     }
 
     #[test]

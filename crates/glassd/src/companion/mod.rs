@@ -202,6 +202,8 @@ pub struct Companion {
     ble_socket: Option<PathBuf>,
     device: DeviceState,
     listeners: Listeners,
+    /// TCP stays closed for now: see [`Companion::set_tcp_closed`].
+    tcp_closed: bool,
     conns: BTreeMap<ConnId, Conn>,
     active: Option<ConnId>,
     next_id: ConnId,
@@ -271,6 +273,7 @@ impl Companion {
             ble_socket: None,
             device,
             listeners: Listeners::bind(None, false),
+            tcp_closed: false,
             conns: BTreeMap::new(),
             active: None,
             next_id: 1,
@@ -339,6 +342,38 @@ impl Companion {
             }
         }
         Vec::new()
+    }
+
+    /// Closes the TCP listener and its connections, or opens it again. While the Glass is its own
+    /// access point, TCP would be listening on a network made for something else, where a device
+    /// could bond with an unbonded Glass. Connections have nowhere to go then in any case.
+    pub fn set_tcp_closed(&mut self, closed: bool) -> Vec<Event> {
+        let mut events = Vec::new();
+        if self.tcp_closed == closed {
+            return events;
+        }
+        self.tcp_closed = closed;
+        if closed {
+            let tcp: Vec<ConnId> = self
+                .conns
+                .iter()
+                .filter(|(_, c)| c.transport == Transport::WifiTcp)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in tcp {
+                self.drop_conn(id, "closed for Wi-Fi setup", &mut events);
+            }
+            self.listeners.set_tcp(None);
+        } else if matches!(self.rng, Rng::Ready) {
+            self.listeners.set_tcp(self.tcp_port);
+        }
+        events
+    }
+
+    /// Whether randomness may be used now: the pool passed the same gate as the identity, and the
+    /// `getrandom` crate will not block.
+    pub fn rng_ready(&self) -> bool {
+        matches!(self.rng, Rng::Ready)
     }
 
     /// When [`Companion::rng_tick`] should next run (wall clock, ms).
@@ -433,7 +468,8 @@ impl Companion {
             }
         }
         self.save_next_seed(created);
-        self.listeners = Listeners::bind(self.tcp_port, self.bt);
+        let tcp = self.tcp_port.filter(|_| !self.tcp_closed);
+        self.listeners = Listeners::bind(tcp, self.bt);
         if let Some(path) = &self.ble_socket {
             self.listeners.bind_ble(path);
         }

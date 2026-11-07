@@ -88,9 +88,9 @@ usage: glassd [options]
                           system (1000) are always allowed
   --allow-package <name>  allow this Android package's uid (from --packages-list); repeatable
   --allow-uid <uid>       allow this uid; repeatable
-  --privileged-uid <uid>  a uid that may act for the owner (the pairing mode, the bond), as
-                          well as glassd's own: the launcher's, if it has another. Never an
-                          app's. Repeatable
+  --privileged-uid <uid>  a uid that may act for the owner (the pairing mode, the bond, Wi-Fi
+                          setup), as well as glassd's own: the launcher's, if it has another.
+                          Never an app's. Repeatable
   --packages-list <path>  Android's package list (default /data/system/packages.list)
   --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
                           /data/glassd on Android and /var/lib/glassd elsewhere; with
@@ -416,6 +416,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    match glassd::daemon::catch_termination() {
+        Ok(fd) => d.watch_termination(fd),
+        Err(e) => glassd::log::write(format_args!("glassd: cannot catch signals: {e}")),
+    }
     match d.run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

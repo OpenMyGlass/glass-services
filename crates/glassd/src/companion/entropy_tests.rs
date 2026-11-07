@@ -220,3 +220,42 @@ fn no_seed_is_saved_from_a_pool_that_passed_no_test() {
     assert_eq!(c.listener_fds().len(), 1);
     assert!(!state.join(super::entropy::SEED_FILE).exists());
 }
+
+#[test]
+fn tcp_can_be_closed_for_a_while_with_its_connections_and_opened_again() {
+    let d = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(d.path());
+    let state = d.path().join("state");
+    let mut c = glass(&state, &pool.path);
+
+    // Closed before the pool opens the listeners: it stays closed when it does.
+    assert!(c.set_tcp_closed(true).is_empty());
+    pool.seed();
+    c.on_rng_event();
+    assert!(c.rng_ready());
+    assert!(c.listener_fds().is_empty());
+
+    assert!(c.set_tcp_closed(false).is_empty());
+    assert_eq!(c.listener_fds().len(), 1);
+    let port = c.listeners.tcp_port().unwrap();
+    let peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (_, transport) = c.listener_fds()[0];
+    for _ in 0..200 {
+        c.accept(transport);
+        if !c.conn_fds().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(c.conn_fds().len(), 1);
+
+    // Nothing is reachable on the access point.
+    c.set_tcp_closed(true);
+    assert!(c.conn_fds().is_empty(), "the connection went too");
+    assert!(c.listener_fds().is_empty());
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    drop(peer);
+
+    c.set_tcp_closed(false);
+    assert_eq!(c.listener_fds().len(), 1);
+}

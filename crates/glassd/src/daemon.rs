@@ -14,14 +14,15 @@ use crate::radio::Radio;
 use crate::screen::{Change, Now, ScreenPolicy};
 use crate::settings_store::SettingsStore;
 use crate::touch::{ScreenOffInput, Step, TouchGate};
+use crate::wifi_setup::{self, Finished, WifiSetup};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
     CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
     CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, Locale,
-    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
-    client_frame, dictation_state, service_frame,
+    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource,
+    WifiSetupPhase, WifiSetupState, Wink, client_frame, dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -200,6 +201,17 @@ pub struct Daemon {
     owns_socket: bool,
     peers: PeerPolicy,
     privileged_uids: Vec<u32>,
+    /// The session was active at the last look: TCP is closed for it, and suspend is held off.
+    wifi_setup_was_active: bool,
+    /// The random pool passed the test once in this process. It drains afterwards, as reads take
+    /// from it, but the `getrandom` crate does not need it to pass again. A restarted glassd tests
+    /// again: the kernel keeps its pool across a restart, so it passes again unless drained.
+    wifi_setup_pool_ok: bool,
+    /// Who changed the Wi-Fi wish during a session: see [`WishDuringSetup`].
+    wifi_wish: WishDuringSetup,
+    /// Readable when a termination signal came in: see [`catch_termination`].
+    term_fd: Option<RawFd>,
+    terminating: bool,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -224,6 +236,8 @@ pub struct Daemon {
     store: Option<SettingsStore>,
     /// Wi-Fi / Bluetooth control (`None`: this build does not manage the radios, e.g. Android).
     radio: Option<Radio>,
+    /// Setting up Wi-Fi from a browser (`None`: no radio control, or nowhere to store a network).
+    wifi_setup: Option<WifiSetup>,
     /// The idle -> suspend decision (always present; inert when the back end is absent).
     power_policy: PowerPolicy,
     /// How long off the head, for the wake alarm and the power-off.
@@ -329,6 +343,123 @@ fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
 
 /// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
 const CAP_COMPANION_BLE: &str = "companion-ble";
+
+/// Whether a session that joined its network may turn `wifi_enabled` on: not if the owner turned
+/// it off while the session ran, which would be undoing the owner's last word.
+#[derive(Debug, Default)]
+struct WishDuringSetup {
+    last: bool,
+    turned_off: bool,
+}
+
+impl WishDuringSetup {
+    fn session_started(&mut self) {
+        self.turned_off = false;
+    }
+
+    fn changed(&mut self, in_setup: bool, wish: bool) {
+        if in_setup && self.last && !wish {
+            self.turned_off = true;
+        }
+        self.last = wish;
+    }
+
+    fn joined_turns_wifi_on(&self) -> bool {
+        !self.turned_off
+    }
+}
+
+/// The write end of the pipe that [`catch_termination`] returns the other end of.
+static TERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_termination(_: libc::c_int) {
+    let fd = TERM_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: `write` may be called from a signal handler; the byte is a live local.
+        unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// From now on `SIGTERM` and `SIGINT` make the returned descriptor readable instead of ending the
+/// process at once, for [`Daemon::watch_termination`]. By a pipe, and not a flag, because the daemon
+/// can be blocked in `poll` with no timeout and the signal can come just before it gets there.
+pub fn catch_termination() -> io::Result<RawFd> {
+    let mut fds = [0; 2];
+    // SAFETY: a live array of two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    TERM_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler above does only what a handler may.
+        if unsafe { libc::signal(signal, on_termination as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fds[0])
+}
+
+/// The session's language, as the launcher's.
+fn wifi_setup_lang(locale: Option<i32>) -> wifi_setup::http::Lang {
+    use wifi_setup::http::Lang;
+    match locale.and_then(|v| Locale::try_from(v).ok()) {
+        Some(Locale::It) => Lang::It,
+        Some(Locale::Fr) => Lang::Fr,
+        Some(Locale::Es) => Lang::Es,
+        _ => Lang::En,
+    }
+}
+
+/// How a Wi-Fi setup session is wired: for real, or with `--mock` on the loopback interface with
+/// stand-in files and a short join. `None` if the stand-ins cannot be made.
+fn wifi_setup_config(opts: &Options, state_dir: &Path) -> Option<wifi_setup::Config> {
+    use wifi_setup::ap::{AP_IP, ApPaths};
+    use wifi_setup::portal::Binding;
+    let wifi_conf = state_dir.join(crate::radio::WIFI_CONF_FILE);
+    if !opts.mock {
+        return Some(wifi_setup::Config {
+            paths: ApPaths::system(),
+            binding: Binding {
+                device: opts.wifi_iface.clone(),
+                ip: AP_IP,
+                port: 80,
+            },
+            wifi_conf,
+            timeouts: wifi_setup::Timeouts::default(),
+            assume_enabled: false,
+        });
+    }
+    let (firmware_param, stock_firmware) = (
+        state_dir.join("mock-firmware-path"),
+        state_dir.join("mock-firmware"),
+    );
+    std::fs::create_dir_all(state_dir).ok()?;
+    std::fs::write(&firmware_param, "").ok()?;
+    std::fs::write(&stock_firmware, "").ok()?;
+    Some(wifi_setup::Config {
+        paths: ApPaths {
+            run_dir: state_dir.join("mock-ap"),
+            firmware_param,
+            stock_firmware,
+        },
+        binding: Binding {
+            device: "lo".into(),
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            port: 0,
+        },
+        wifi_conf,
+        timeouts: wifi_setup::Timeouts {
+            settle_us: 10_000,
+            enable_us: 1_000_000,
+            session_us: 600_000_000,
+            flush_us: 100_000,
+            join_us: 500_000,
+        },
+        assume_enabled: true,
+    })
+}
 
 /// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
 /// off, keeping the per-radio wishes so they are restored when it is turned off.
@@ -754,6 +885,10 @@ impl Daemon {
                 }
             })
         };
+        let wifi_setup = match (&radio, &opts.state_dir) {
+            (Some(_), Some(dir)) => wifi_setup_config(opts, dir).map(WifiSetup::new),
+            _ => None,
+        };
         // The energy-policy back end: recorded with --mock (never touches the host's power
         // sysfs), real otherwise when --power is on. Android leaves power to the framework.
         let power = if !opts.energy {
@@ -832,6 +967,9 @@ impl Daemon {
             if radio.is_some() {
                 c.push("radio");
             }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
+            }
             if power.is_some() {
                 c.push("power");
             }
@@ -856,6 +994,9 @@ impl Daemon {
             }
             if radio.is_some() {
                 c.push("radio");
+            }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
             }
             if power.is_some() {
                 c.push("power");
@@ -893,6 +1034,11 @@ impl Daemon {
             owns_socket,
             peers: opts.peers.clone(),
             privileged_uids: opts.privileged_uids.clone(),
+            wifi_setup_was_active: false,
+            wifi_setup_pool_ok: false,
+            wifi_wish: WishDuringSetup::default(),
+            term_fd: None,
+            terminating: false,
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -914,6 +1060,7 @@ impl Daemon {
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
             radio,
+            wifi_setup,
             power_policy,
             off_head,
             suspend_offset_us: None,
@@ -951,9 +1098,15 @@ impl Daemon {
             d.wear.on_head(),
             d.policy.screen(),
         );
+        // A session left by a daemon that died must not outlive it: its access point goes first.
+        if let (Some(w), Some(r)) = (&mut d.wifi_setup, &mut d.radio) {
+            let u = w.cleanup_stale(r, now().mono_us);
+            d.wifi_setup_update(u);
+        }
         // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
         // off by default and a prior run's state does not leak in.
         let s = d.settings();
+        d.wifi_wish.last = s.wifi_enabled.unwrap_or(false);
         d.apply_radio(&s);
         // Start the energy policy: runtime-PM auto, arm wake sources, take the wakelock, and set
         // the active (screen-on) cpufreq profile. Best effort; inert without a back end.
@@ -965,9 +1118,29 @@ impl Daemon {
 
     /// Runs forever (until a fatal error).
     pub fn run(&mut self) -> io::Result<()> {
-        loop {
-            self.step()?;
+        let mut result = Ok(());
+        while !self.terminating {
+            if let Err(e) = self.step() {
+                result = Err(e);
+                break;
+            }
         }
+        if result.is_ok() {
+            info!("exiting on a signal");
+        }
+        // On an error too: the access point must not outlive the daemon. Only what the session
+        // started is stopped; normal Wi-Fi stays as it is, so that a restart over SSH keeps the
+        // link, and one left running is dealt with at the next start.
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            w.shutdown(r);
+        }
+        result
+    }
+
+    /// `run` returns, after ending what must not outlive the daemon, when `fd` is readable. See
+    /// [`catch_termination`].
+    pub fn watch_termination(&mut self, fd: RawFd) {
+        self.term_fd = Some(fd);
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -992,6 +1165,10 @@ impl Daemon {
                 }),
             self.hub.next_deadline(),
             self.battery_deadline,
+            self.wifi_setup.as_ref().and_then(WifiSetup::next_deadline),
+            self.radio
+                .as_ref()
+                .and_then(Radio::association_next_deadline),
             self.companion.as_ref().and_then(|c| {
                 // Wall clock to the monotonic base, and never a busy loop.
                 let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
@@ -1061,6 +1238,8 @@ impl Daemon {
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
             BleEngine,
+            WifiSetup,
+            Terminate,
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -1125,6 +1304,14 @@ impl Daemon {
         if let Some(fd) = self.radio.as_ref().and_then(Radio::ble_fd) {
             add(fd, libc::POLLIN, Src::BleEngine);
         }
+        if let Some(w) = &self.wifi_setup {
+            for (fd, events) in w.fds() {
+                add(fd, events, Src::WifiSetup);
+            }
+        }
+        if let Some(fd) = self.term_fd {
+            add(fd, libc::POLLIN, Src::Terminate);
+        }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -1157,7 +1344,14 @@ impl Daemon {
             }
             match src {
                 Src::Listener => self.accept(),
+                Src::Terminate => self.terminating = true,
                 Src::Touchpad => self.read_touchpad(),
+                Src::WifiSetup => {
+                    let t = now().mono_us;
+                    if let Some(u) = self.wifi_setup.as_mut().map(|w| w.on_ready(pfd.fd, t)) {
+                        self.wifi_setup_update(u);
+                    }
+                }
                 Src::Stdin => self.read_stdin(),
                 Src::Key(id) => self.read_key(id),
                 Src::DonDoff => {
@@ -1297,13 +1491,21 @@ impl Daemon {
         if self.power_io.is_some() && self.off_head.power_off_due(t.boot_us) {
             self.power_off_if_unplugged(t);
         }
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.tick(r, t.mono_us);
+            self.wifi_setup_update(u);
+        }
+        if let Some(r) = &mut self.radio {
+            r.association_tick(t.mono_us);
+        }
         self.run_mock_commands();
     }
 
     /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
     /// desk is not found off: the wait starts again. So it does if powering off failed.
     fn power_off_if_unplugged(&mut self, t: Now) {
-        let cable = companion::battery::cable_connected(&self.power_supply);
+        let busy = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        let cable = busy || companion::battery::cable_connected(&self.power_supply);
         if !cable && let Some(power) = &mut self.power_io {
             power.power_off();
         }
@@ -1495,6 +1697,7 @@ impl Daemon {
                     }
                 }
                 Effect::SettingsChanged(s) => self.settings_changed(&s),
+                Effect::WifiSetup { start } => self.wifi_setup_request(start),
                 Effect::Head { client, request } => {
                     self.head_requests
                         .insert(client, (request.relative_look_up, request.nudge));
@@ -2203,6 +2406,13 @@ impl Daemon {
             "companion: QR ssid {:?} addr {:?}",
             boot.ssid, boot.companion_addr
         );
+        // The radio is the setup session's: joining from here would run a supplicant beside its
+        // access point, and the session would then restore the radio over it. The QR can be
+        // scanned again once the session is over.
+        if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+            warn!("companion: QR ignored while a Wi-Fi setup session runs");
+            return;
+        }
         if let Some(radio) = &mut self.radio {
             match companion::bootstrap::wpa_supplicant_conf(
                 &boot.ssid,
@@ -2447,12 +2657,22 @@ impl Daemon {
 
     /// Applies and stores changed settings.
     fn settings_changed(&mut self, s: &Settings) {
+        let in_setup = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        self.wifi_wish
+            .changed(in_setup, s.wifi_enabled.unwrap_or(false));
         if let Some(ms) = s.screen_timeout_ms {
             self.policy.set_timeout(ms);
         }
         let detection = s.on_head_detection_enabled.unwrap_or(false) && self.hub_present();
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
+        // Airplane mode and the setting going off end a session; the radio follows when it has.
+        if !s.wifi_setup_ap_enabled.unwrap_or(false) || s.airplane_mode.unwrap_or(false) {
+            let t = now().mono_us;
+            if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+                self.wifi_setup_request_stop(t);
+            }
+        }
         self.apply_radio(s);
         self.apply_power(s);
         // Keep the companion's reported UI language in step (idempotent; pushes LocaleChanged to
@@ -2473,6 +2693,92 @@ impl Daemon {
             && let Err(e) = st.save(s)
         {
             warn!("cannot store the settings in {}: {e}", st.path().display());
+        }
+    }
+
+    /// A client asked to start or stop a Wi-Fi setup session.
+    fn wifi_setup_request(&mut self, start: bool) {
+        let t = now().mono_us;
+        if !start {
+            self.wifi_setup_request_stop(t);
+            return;
+        }
+        let s = self.settings();
+        let ctx = wifi_setup::Context {
+            enabled: s.wifi_setup_ap_enabled.unwrap_or(false),
+            airplane: s.airplane_mode.unwrap_or(false),
+            // The companion's gate when it runs; the same test without it, for an owner who has
+            // no phone and runs with --companion off.
+            pool_ready: {
+                self.wifi_setup_pool_ok = self.wifi_setup_pool_ok
+                    || self.mock.is_some()
+                    || self.companion.as_ref().is_some_and(|c| c.rng_ready())
+                    || companion::entropy::ready_for_a_secret();
+                self.wifi_setup_pool_ok
+            },
+            lang: wifi_setup_lang(s.locale),
+        };
+        let u = match (&mut self.wifi_setup, &mut self.radio) {
+            (Some(w), Some(r)) => w.start(r, ctx, t),
+            _ => wifi_setup::Update {
+                state: Some(WifiSetupState {
+                    phase: WifiSetupPhase::Failed as i32,
+                    error: wifi_setup::ERR_NO_TOOLS.into(),
+                    ..Default::default()
+                }),
+                finished: None,
+            },
+        };
+        self.wifi_setup_update(u);
+    }
+
+    fn wifi_setup_request_stop(&mut self, t: u64) {
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.stop(r, t);
+            self.wifi_setup_update(u);
+        }
+    }
+
+    /// Acts on what the session says: the system stays up while it runs, and at its end the radio
+    /// goes back to the settings, or the settings follow the network that worked.
+    fn wifi_setup_update(&mut self, u: wifi_setup::Update) {
+        let active = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        self.power_policy.set_held(active);
+        if active != self.wifi_setup_was_active {
+            self.wifi_setup_was_active = active;
+            if active {
+                self.wifi_wish.session_started();
+            }
+            if active && let Some(power) = &mut self.power_io {
+                power.stay_awake();
+            }
+            let events = match &mut self.companion {
+                Some(c) => c.set_tcp_closed(active),
+                None => Vec::new(),
+            };
+            self.companion_events(events);
+        }
+        if let Some(state) = u.state {
+            self.publish(service_frame::Body::WifiSetupState(state));
+        }
+        match u.finished {
+            Some(Finished::Joined) => {
+                if self.wifi_wish.joined_turns_wifi_on() {
+                    self.apply_settings_change(Settings {
+                        wifi_enabled: Some(true),
+                        ..Default::default()
+                    });
+                } else {
+                    // Joined and stored, but the owner turned Wi-Fi off meanwhile: that stands.
+                    let s = self.settings();
+                    self.apply_radio(&s);
+                }
+            }
+            Some(Finished::Restore) => {
+                let s = self.settings();
+                self.apply_radio(&s);
+            }
+            None => {}
         }
     }
 
@@ -3218,6 +3524,36 @@ mod tests {
         // Turning detection on again has no effect without a hub.
         detection_on(&mut d);
         assert!(!d.wear.detection());
+    }
+
+    #[test]
+    fn a_join_turns_wifi_on_unless_the_owner_turned_it_off_meanwhile() {
+        let mut w = WishDuringSetup::default();
+        // Off from the start, the usual case: the join turns it on.
+        w.changed(false, false);
+        w.session_started();
+        w.changed(true, false);
+        assert!(w.joined_turns_wifi_on());
+        // On, then off during the session.
+        w.changed(false, true);
+        w.session_started();
+        w.changed(true, true);
+        w.changed(true, false);
+        assert!(!w.joined_turns_wifi_on());
+        // A new session starts afresh; turning it off outside a session does not count.
+        w.changed(false, true);
+        w.changed(false, false);
+        w.session_started();
+        assert!(w.joined_turns_wifi_on());
+        // Off and on again during the session: once turned off, the owner's off stands, even
+        // though the last change was back on.
+        w.changed(true, true);
+        w.changed(true, false);
+        w.changed(true, true);
+        assert!(
+            !w.joined_turns_wifi_on(),
+            "turned off once: it stays the owner's"
+        );
     }
 
     #[test]

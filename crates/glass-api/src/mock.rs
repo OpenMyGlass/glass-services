@@ -320,7 +320,8 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
             | Effect::Head { .. }
             | Effect::CompanionNotificationAction { .. }
             | Effect::NoteAdd(_)
-            | Effect::NoteSpeak(_) => {}
+            | Effect::NoteSpeak(_)
+            | Effect::WifiSetup { .. } => {}
             // No phone link here: answered as a glassd that does not hold it answers.
             Effect::CompanionPairingWindow { client, seq, .. }
             | Effect::CompanionForgetBond { client, seq } => {

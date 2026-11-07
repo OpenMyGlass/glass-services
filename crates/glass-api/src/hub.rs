@@ -211,6 +211,8 @@ struct ClientState {
     hello: bool,
     name: String,
     topics: Vec<Topic>,
+    /// May act for the owner: see [`Hub::allow_privileged`].
+    privileged: bool,
 }
 
 impl ClientState {
@@ -423,6 +425,15 @@ impl Hub {
         self.next_id += 1;
         self.clients.insert(id, ClientState::default());
         id
+    }
+
+    /// Lets `id` send what acts for the owner and is no app's business: the pairing mode and the
+    /// bond. Whoever can do that can bond a phone of their own. The owner of the hub decides, by
+    /// the peer's identity.
+    pub fn allow_privileged(&mut self, id: ClientId) {
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.privileged = true;
+        }
     }
 
     /// Ids of the connected clients.
@@ -695,6 +706,12 @@ impl Hub {
             }
             Some(B::NoteAdd(note)) => fx.push(Effect::NoteAdd(note)),
             Some(B::NoteSpeak(speak)) => fx.push(Effect::NoteSpeak(speak)),
+            Some(B::CompanionPairingWindow(_) | B::CompanionForgetBond(_)) if !state.privileged => {
+                fx.push(Effect::Send(
+                    id,
+                    error(ErrorCode::Denied, "pairing is for the launcher", seq),
+                ));
+            }
             Some(B::CompanionPairingWindow(request)) => fx.push(Effect::CompanionPairingWindow {
                 client: id,
                 seq,
@@ -980,6 +997,41 @@ mod tests {
             S::Error(e) => Some((ErrorCode::try_from(e.code).unwrap(), e.seq)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn only_a_privileged_client_touches_the_pairing_mode_or_the_bond() {
+        use crate::proto::{CompanionForgetBond, CompanionPairingWindow};
+        let mut hub = Hub::new("9.9", &["mock"]);
+        let app = hub.add_client();
+        let launcher = hub.add_client();
+        hub.allow_privileged(launcher);
+        hub.on_frame(app, hello_frame(1));
+        hub.on_frame(launcher, hello_frame(1));
+        let open = cf(C::CompanionPairingWindow(CompanionPairingWindow {
+            open: true,
+            duration_ms: 0,
+        }));
+        let forget = cf(C::CompanionForgetBond(CompanionForgetBond {}));
+        for ask in [open.clone(), forget.clone()] {
+            let fx = hub.on_frame(app, ask);
+            assert_eq!(fx.len(), 1, "{fx:?}");
+            assert!(matches!(
+                &fx[0],
+                Effect::Send(to, ServiceFrame { body: Some(S::Error(e)) })
+                    if *to == app && e.code == ErrorCode::Denied as i32
+            ));
+        }
+        assert!(matches!(
+            hub.on_frame(launcher, open)[..],
+            [Effect::CompanionPairingWindow { client, .. }] if client == launcher
+        ));
+        assert!(matches!(
+            hub.on_frame(launcher, forget)[..],
+            [Effect::CompanionForgetBond { client, .. }] if client == launcher
+        ));
+        // The app is still connected: the refusal is of the request, not of the peer.
+        assert!(hub.clients().any(|c| c == app));
     }
 
     #[test]

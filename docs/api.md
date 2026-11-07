@@ -25,6 +25,10 @@ Nothing in this interface depends on Android: it is the same on route 1 (open An
   The check is on by default in Android builds (`--peer-check on`) and off elsewhere, where the socket permissions decide, unless `--allow-package` or `--allow-uid` is given. A regular Android app cannot connect: it goes through the Android glue, which turns events into Android input. On Android 6.0 the SELinux policy (`android/dist/sepolicy/`) adds a `glassd` domain, a `glassd_socket` type and `connectto` rules for the glue, the launcher and the provider.
 - Peers are not authenticated beyond the socket permissions in version 1. `glassd` logs each peer's uid and pid (`SO_PEERCRED`).
 
+### Privileged clients
+
+Some requests act for the owner, and an app must not send them: `CompanionPairingWindow` and `CompanionForgetBond`, because whoever can send them can bond a phone of their own. `glassd` takes the peer's uid at connect (`SO_PEERCRED`). Only its own uid, and those given with `--privileged-uid` (repeatable: the launcher's, if it runs as another), may send them. Anyone else gets `ERROR_CODE_DENIED`, and the connection stays. This holds only as far as uids differ: **on an image that runs everything as root, everything is privileged**, so SDK apps must run under a uid of their own. `glass-api`'s `MockService` treats every client as privileged.
+
 ## Session
 
 1. The client connects and sends `Hello{api_version, client_name}`.
@@ -213,7 +217,7 @@ On Model B (plain Linux) there is no separate Glass app, so **`glassd` is the pr
   - The mode closes by itself: at the end of its time, counted through a suspend; on the first bond, so one phone per opening; on a restart of `glassd`. A pairing under way stops with it.
   - `CompanionForgetBond{}` forgets the bonded phone, ends every link and closes the mode. It opens nothing. If the bond could not be removed from the disk the answer is `ERROR_CODE_UNAVAILABLE`.
   - The result of each shows on `TOPIC_COMPANION`: `CompanionState.pairing_until_us` (on the clock of `timestamp_us`, 0 when closed), `paired` and `paired_name`, which are right from the start of `glassd`, with or without a provider. A request that changes nothing sends nothing.
-  - Both requests need the `companion-link` capability; without it the answer is `ERROR_CODE_UNSUPPORTED`. Who may send them is who may connect to the socket: there are no finer permissions on it.
+  - Both requests need the `companion-link` capability; without it the answer is `ERROR_CODE_UNSUPPORTED`. Only a [privileged client](#privileged-clients) may send them.
   - The first phone to bond during the window wins, and no code is compared yet: the launcher should show `paired_name` so that the owner can tell, and forget the bond if it is wrong.
   - BLE, TCP and RFCOMM all ask for the mode. A QR bootstrap is the owner's own act, so on an unbonded Glass it opens the mode for its dial. Before the launcher has its card, `cargo run -p glass-api --example companion-pairing -- open` opens it from any client that may.
 - **Backbone:** heartbeat (`Ping`/`Pong`), `Status`/`BatteryStatus` from `/sys/class/power_supply`, `SetLocale`→`LocaleChanged`, and notifications. `SetLocale` persists the language in `Settings.locale` (above) and publishes the change on `TOPIC_SETTINGS`, so the launcher i18n picks it up; a language change made on the Glass side (launcher picker) is pushed back to the phone as a `LocaleChanged`.

@@ -167,7 +167,7 @@ enum ErrorCode {
   ERROR_CODE_INVALID_ARGUMENT = 3;           // a known request with an invalid value
   ERROR_CODE_UNAVAILABLE = 4;                // the source exists but failed (device removed, ...)
   ERROR_CODE_NO_COMPANION = 5;               // dictation without a companion link
-  ERROR_CODE_DENIED = 6;                     // the peer is not allowed on the socket; connection closed
+  ERROR_CODE_DENIED = 6;                     // the peer is not allowed on the socket (connection closed), or not on this request (it stays)
 }
 
 message ServiceError {

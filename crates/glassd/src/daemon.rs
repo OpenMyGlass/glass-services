@@ -108,6 +108,9 @@ pub struct Options {
     pub iio_dev: Option<PathBuf>,
     /// Which peers may connect (docs/api.md, "Who may connect").
     pub peers: PeerPolicy,
+    /// The uids, besides glassd's own, that may act for the owner (docs/api.md, "Privileged
+    /// clients"): the launcher's, if it runs as another. Never an app's.
+    pub privileged_uids: Vec<u32>,
     /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
     /// touches into navigation keys (docs/api.md, "Android glue").
     pub grab_touchpad: bool,
@@ -196,6 +199,7 @@ pub struct Daemon {
     /// passed by Android's init.
     owns_socket: bool,
     peers: PeerPolicy,
+    privileged_uids: Vec<u32>,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -314,6 +318,13 @@ fn ble_command(ble: &BleOptions, opts: &Options) -> Vec<std::ffi::OsString> {
         "--firmware".into(),
         ble.firmware.clone().into(),
     ]
+}
+
+/// Whether a peer with `uid` may act for the owner: glassd's own uid, and those it was given.
+/// Holds only as far as uids differ: on an image that runs everything as root, everything is.
+fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    uid == unsafe { libc::geteuid() } || allowed.contains(&uid)
 }
 
 /// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
@@ -881,6 +892,7 @@ impl Daemon {
             socket_path: opts.socket.clone(),
             owns_socket,
             peers: opts.peers.clone(),
+            privileged_uids: opts.privileged_uids.clone(),
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -1337,7 +1349,15 @@ impl Daemon {
                         continue;
                     }
                     let id = self.hub.add_client();
-                    info!("client {id} connected ({who})");
+                    let privileged =
+                        cred.is_some_and(|(uid, _)| is_privileged(uid, &self.privileged_uids));
+                    if privileged {
+                        self.hub.allow_privileged(id);
+                    }
+                    info!(
+                        "client {id} connected ({who}{})",
+                        if privileged { ", privileged" } else { "" }
+                    );
                     self.conns.insert(
                         id,
                         Conn {
@@ -2706,6 +2726,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -2756,6 +2777,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: true,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -2887,6 +2909,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -3046,6 +3069,16 @@ mod tests {
             daemon.step().unwrap();
         }
         client.join().unwrap();
+    }
+
+    #[test]
+    fn glassd_s_own_uid_and_the_listed_ones_are_privileged() {
+        // SAFETY: `geteuid` has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(4242);
+        assert!(is_privileged(me, &[]));
+        assert!(!is_privileged(other, &[]));
+        assert!(is_privileged(other, &[other]));
     }
 
     #[test]

@@ -88,6 +88,9 @@ usage: glassd [options]
                           system (1000) are always allowed
   --allow-package <name>  allow this Android package's uid (from --packages-list); repeatable
   --allow-uid <uid>       allow this uid; repeatable
+  --privileged-uid <uid>  a uid that may act for the owner (the pairing mode, the bond), as
+                          well as glassd's own: the launcher's, if it has another. Never an
+                          app's. Repeatable
   --packages-list <path>  Android's package list (default /data/system/packages.list)
   --state-dir <dir>       where the settings are stored (default: $GLASSD_STATE_DIR, else
                           /data/glassd on Android and /var/lib/glassd elsewhere; with
@@ -153,6 +156,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         iio: Some(glass_head::iio::DEVICES_ROOT.into()),
         iio_dev: None,
         peers: PeerPolicy::open(),
+        privileged_uids: Vec::new(),
         grab_touchpad: cfg!(target_os = "android"),
         // On Android (route 1) the framework owns the radios; on plain Linux (Model B) glassd
         // drives them.
@@ -324,6 +328,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
                 allow_uids.push(
                     v.parse()
                         .map_err(|_| format!("--allow-uid: not a uid: {v:?}"))?,
+                );
+            }
+            "--privileged-uid" => {
+                let v = value("--privileged-uid")?;
+                o.privileged_uids.push(
+                    v.parse()
+                        .map_err(|_| format!("--privileged-uid: not a uid: {v:?}"))?,
                 );
             }
             "--packages-list" => packages_list = PathBuf::from(value("--packages-list")?),

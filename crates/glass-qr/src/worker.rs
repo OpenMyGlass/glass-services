@@ -125,9 +125,11 @@ impl Worker {
         read_until(&mut w.stdout, &mut counts, until)?;
         let (grids, count, capstones) = (counts[0].into(), counts[1].into(), counts[2].into());
         let regions = usize::from(u16::from_le_bytes([counts[3], counts[4]]));
+        // Each grid is made of 3 finder patterns, so fewer than that is no answer quircs gives.
         if grids > DECODER_MAX_GRIDS
             || count > grids
             || capstones > DECODER_MAX_CAPSTONES
+            || capstones < 3 * grids
             || regions > DECODER_MAX_REGIONS
         {
             return Err(io::ErrorKind::InvalidData.into());

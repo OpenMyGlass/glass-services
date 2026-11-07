@@ -47,7 +47,10 @@ pub const DECODER_MAX_REGIONS: usize = 65_534;
 /// for patterns a scene can make by chance: in the synthetic frames of the tests a code alone gives
 /// its 3 and no more, and alignment patterns, of another shape, are not counted. More than this
 /// is a frame built to hide something, or too busy to trust; it was chosen, not measured on real
-/// scenes, and the Glass scene test should check it.
+/// scenes. The Glass scene test should record, for each frame, the finder patterns, grids, texts
+/// and regions that [`Scanner::read_codes`] reports, with a setup code in view and without, in an
+/// ordinary room: they decide this margin and how often the rules in [`Scan::Ambiguous`] cost a
+/// frame.
 pub const MAX_CAPSTONES_EXPLAINED: usize = 3 * MAX_CODES + 8;
 
 /// One luma plane, 8 bits per pixel. Printing one shows its size, not what the camera saw.
@@ -139,12 +142,25 @@ pub enum Scan {
     /// - more than [`MAX_CODES`] codes, read or not;
     /// - [`DECODER_MAX_CAPSTONES`] finder patterns, the most `quircs` keeps, so it may have
     ///   dropped some; or more than [`MAX_CAPSTONES_EXPLAINED`];
-    /// - [`DECODER_MAX_REGIONS`] dark regions, the most it labels, so it may have stopped looking.
+    /// - [`DECODER_MAX_REGIONS`] dark regions, the most it labels, so it may have stopped looking;
+    /// - with a valid setup code in view, a finder pattern in no grid, or a grid that was not read
+    ///   (it did not decode, or its text was too long): a stray finder pattern next to a real code
+    ///   can take one of the real code's into a wrong triple and so lose it.
     ///
-    /// Not caught here: a real code that cannot be read (blurred, or a stray finder pattern next to
-    /// it taking one of its own into a wrong triple) beside a hostile one that can. [`Session`]
-    /// refuses a scan that ever sees two different setup codes, and the offer screen shows all a
-    /// code would change, which is then what stops it.
+    /// So a setup code is offered only from a frame where every finder pattern is in a grid and
+    /// every grid was read. Clutter that makes stray finder patterns, or a link next to a code
+    /// that cannot be read, then costs frames; the Glass scene test should count how many.
+    ///
+    /// Not caught here, and accepted:
+    ///
+    /// - a real code that `quircs` does not see at all (blurred, too small, out of view) beside a
+    ///   hostile one it reads;
+    /// - a frame lit or printed so that `quircs`'s one global threshold (Otsu's, over the whole
+    ///   frame) turns the real code to all black or all white while the hostile one stays readable,
+    ///   for example a bright hostile code next to a dim real one.
+    ///
+    /// Then only the hostile code is in view, as far as this code can tell. See [`Session`] for
+    /// what that leads to.
     Ambiguous,
     /// The text of the one valid setup code in view, which [`setup::parse`] accepts.
     Setup(Zeroizing<Vec<u8>>),
@@ -169,6 +185,13 @@ pub(crate) fn decide(codes: Codes) -> Scan {
         || codes.capstones > MAX_CAPSTONES_EXPLAINED
         || codes.regions >= DECODER_MAX_REGIONS
     {
+        return Scan::Ambiguous;
+    }
+    // With a setup code in view, every finder pattern must belong to a grid and every grid must
+    // have been read: a finder pattern left over, or a grid that did not decode, may be a real code
+    // whose finder pattern a stray one took into a wrong triple.
+    let accounted = codes.capstones == 3 * codes.grids && codes.grids == codes.texts.len();
+    if !accounted && codes.texts.iter().any(|t| setup::parse(t).is_ok()) {
         return Scan::Ambiguous;
     }
     let mut result = Scan::NoCode;
@@ -269,6 +292,12 @@ pub enum SessionStep {
 /// read from one that is not there, so the scan offers a text only once [`FRAMES_TO_AGREE`] frames
 /// have shown it, not more than [`MAX_FRAMES_BETWEEN`] frames apart, and refuses for good as soon
 /// as any frame shows another setup code, or is [`Scan::Ambiguous`].
+///
+/// **What it does not close:** a hostile code shown alone, or beside a real code the decoder never
+/// sees (see [`Scan::Ambiguous`]), for 3 frames is offered. Only the offer screen stops it: it must
+/// show the SSID, the companion's address, whether the code pairs a new companion, and wait for
+/// an explicit tap. The same goes for a compromised worker: the counts it reports protect nothing
+/// then, and only [`setup::parse`] in the camera process and the offer screen stand.
 #[derive(Default)]
 pub struct Session {
     /// The one setup text seen so far.

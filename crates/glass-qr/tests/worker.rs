@@ -134,6 +134,7 @@ fn a_worker_out_of_protocol_is_a_failure() {
         "head -c 307212 >/dev/null; printf '\\011\\000\\000\\002\\000'", // more grids than quircs gives
         "head -c 307212 >/dev/null; printf '\\001\\002\\003\\002\\000'", // more texts than grids
         "head -c 307212 >/dev/null; printf '\\001\\000\\041\\002\\000'", // 33 finder patterns
+        "head -c 307212 >/dev/null; printf '\\002\\000\\005\\002\\000'", // 2 grids, 5 patterns
         "head -c 307212 >/dev/null; printf '\\001\\000\\003\\377\\377'", // 65535 regions
         "head -c 307212 >/dev/null; printf '\\001\\001\\003\\002\\000\\377\\377'", // text too long
         "head -c 307212 >/dev/null; printf '\\001\\001\\003\\002\\000\\005\\000ab'", // cut short

@@ -7,9 +7,9 @@
 
 use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
-    ClientFrame, CompanionState, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus,
-    NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings, Topic,
-    WearState, Welcome, client_frame, location_status, screen_request, service_frame,
+    ClientFrame, CompanionPairingWindow, CompanionState, ErrorCode, FocusState, HeadRequest, Hello,
+    LocationStatus, NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings,
+    Topic, WearState, Welcome, client_frame, location_status, screen_request, service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -53,6 +53,15 @@ pub enum Effect {
     NoteAdd(NoteAdd),
     /// A client asked the companion to read a note aloud.
     NoteSpeak(NoteSpeak),
+    /// A client opened or closed the pairing mode. The owner of the hub holds the link, and
+    /// answers with [`Hub::set_link_pairing`], or with an error to `client`.
+    CompanionPairingWindow {
+        client: ClientId,
+        seq: u32,
+        request: CompanionPairingWindow,
+    },
+    /// A client asked to forget the bonded phone. Answered in the same way.
+    CompanionForgetBond { client: ClientId, seq: u32 },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -243,7 +252,7 @@ fn frame(body: service_frame::Body) -> ServiceFrame {
     ServiceFrame { body: Some(body) }
 }
 
-fn error(code: ErrorCode, message: &str, seq: u32) -> ServiceFrame {
+pub fn error(code: ErrorCode, message: &str, seq: u32) -> ServiceFrame {
     frame(service_frame::Body::Error(ServiceError {
         code: code as i32,
         message: message.into(),
@@ -344,6 +353,24 @@ impl Hub {
                 fx.push(Effect::Send(id, frame(body)));
             }
         }
+    }
+
+    /// The bond and the pairing mode changed on the link that the owner of the hub holds.
+    pub fn set_link_pairing(
+        &mut self,
+        paired: bool,
+        paired_name: String,
+        pairing_until_us: u64,
+    ) -> Vec<Effect> {
+        let now = self.now();
+        let mut fx = Vec::new();
+        if self
+            .relay
+            .link_pairing(paired, paired_name, pairing_until_us, now)
+        {
+            self.broadcast_companion(&mut fx);
+        }
+        fx
     }
 
     fn broadcast_companion(&self, fx: &mut Vec<Effect>) {
@@ -668,6 +695,14 @@ impl Hub {
             }
             Some(B::NoteAdd(note)) => fx.push(Effect::NoteAdd(note)),
             Some(B::NoteSpeak(speak)) => fx.push(Effect::NoteSpeak(speak)),
+            Some(B::CompanionPairingWindow(request)) => fx.push(Effect::CompanionPairingWindow {
+                client: id,
+                seq,
+                request,
+            }),
+            Some(B::CompanionForgetBond(_)) => {
+                fx.push(Effect::CompanionForgetBond { client: id, seq })
+            }
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {

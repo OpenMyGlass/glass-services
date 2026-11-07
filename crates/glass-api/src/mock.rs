@@ -318,7 +318,9 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
             | Effect::Head { .. }
             | Effect::CompanionNotificationAction { .. }
             | Effect::NoteAdd(_)
-            | Effect::NoteSpeak(_) => {}
+            | Effect::NoteSpeak(_)
+            | Effect::CompanionPairingWindow { .. }
+            | Effect::CompanionForgetBond { .. } => {}
         }
     }
 }

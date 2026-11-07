@@ -30,7 +30,10 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use omg_protocol::{Locale, Notification, NotificationChoice, Radio, RadioState, WifiReason};
+use omg_protocol::{
+    ErrorCode, ErrorMsg, Frame, Locale, Notification, NotificationChoice, Radio, RadioState,
+    WifiReason,
+};
 
 use crate::{info, warn};
 use entropy::PoolWait;
@@ -53,6 +56,16 @@ const BLE_RESERVED_CONNS: usize = 1;
 /// advertising. Generous for a BLE link that was measured to stall for 3.6 s. The handshake waits
 /// for no person at either end.
 const HANDSHAKE_MS: u64 = 30_000;
+
+/// How long the pairing mode stays open when no length is asked for, and the longest it can.
+pub const PAIRING_WINDOW_DEFAULT_MS: u32 = 120_000;
+pub const PAIRING_WINDOW_MAX_MS: u32 = 300_000;
+
+/// The pairing window's clock. It keeps running through a suspend, so a window cannot outlast its
+/// time asleep, and nothing a phone can change moves it, unlike the wall clock.
+fn boot_ms() -> u64 {
+    crate::daemon::now().boot_us / 1000
+}
 
 /// Current wall-clock in milliseconds since the Unix epoch (matches the companion's `now_ms`).
 pub fn now_ms() -> u64 {
@@ -133,6 +146,8 @@ pub enum Event {
     WifiTearDown,
     /// Something happened with a note: for `TOPIC_NOTES`.
     Note(glass_api::proto::NoteEvent),
+    /// The bond or the pairing mode changed: the launcher should hear of it.
+    PairingChanged,
 }
 
 struct Conn {
@@ -187,7 +202,9 @@ pub struct Companion {
     conns: BTreeMap<ConnId, Conn>,
     active: Option<ConnId>,
     next_id: ConnId,
-    pairing_enabled: bool,
+    /// A first pairing over BLE may happen until this time ([`boot_ms`]). Never stored: a restart
+    /// closes it.
+    pairing_until_ms: Option<u64>,
     /// The note queue. `None` if it could not be opened: the link works, without notes.
     notes: Option<notes::Notes>,
     /// The live companion advertised note sync.
@@ -254,7 +271,7 @@ impl Companion {
             conns: BTreeMap::new(),
             active: None,
             next_id: 1,
-            pairing_enabled: true,
+            pairing_until_ms: None,
             notes,
             notes_link: false,
         };
@@ -467,21 +484,81 @@ impl Companion {
         self.active.is_some()
     }
 
-    /// Allows or forbids a first pairing (the owner's setup window). Applies to future and
-    /// in-flight handshakes.
-    pub fn set_pairing_enabled(&mut self, enabled: bool) {
-        self.pairing_enabled = enabled;
-        for c in self.conns.values_mut() {
-            c.link.set_pairing_enabled(enabled);
+    /// How much is left of the pairing window, if it is open.
+    pub fn pairing_left_ms(&self) -> Option<u64> {
+        let left = self.pairing_until_ms?.saturating_sub(boot_ms());
+        (left > 0).then_some(left)
+    }
+
+    /// When [`Companion::pairing_tick`] should next run ([`crate::daemon::Now::boot_us`], in ms).
+    pub fn pairing_next_deadline(&self) -> Option<u64> {
+        self.pairing_until_ms
+    }
+
+    /// Closes the pairing window if its time is over.
+    pub fn pairing_tick(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        self.expire_pairing_window(&mut events);
+        events
+    }
+
+    fn expire_pairing_window(&mut self, events: &mut Vec<Event>) {
+        if self.pairing_until_ms.is_some_and(|t| boot_ms() >= t) {
+            info!("companion: the pairing mode timed out");
+            self.set_pairing_window(None, events);
         }
     }
 
-    /// Forgets the bonded companion and drops the live link.
-    pub fn unpair(&mut self) -> Vec<Event> {
+    /// The owner entered the pairing mode on the Glass. `duration_ms`: 0 is the default, and it is
+    /// limited. Opening it again starts the time again. The error says why it stays closed.
+    pub fn open_pairing_window(&mut self, duration_ms: u32) -> Result<Vec<Event>, String> {
+        if matches!(self.rng, Rng::Failed) {
+            return Err("the companion link is disabled".into());
+        }
+        // A bonded Glass refuses any other phone: there is nothing the window could do.
+        if self.paired() {
+            return Err("already bonded: forget the bond first".into());
+        }
+        let ms = match duration_ms {
+            0 => PAIRING_WINDOW_DEFAULT_MS,
+            d => d.min(PAIRING_WINDOW_MAX_MS),
+        };
+        info!("companion: pairing mode open for {ms} ms");
+        let mut events = Vec::new();
+        self.set_pairing_window(Some(boot_ms() + ms as u64), &mut events);
+        Ok(events)
+    }
+
+    /// The owner left the pairing mode.
+    pub fn close_pairing_window(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        self.set_pairing_window(None, &mut events);
+        events
+    }
+
+    fn set_pairing_window(&mut self, until_ms: Option<u64>, events: &mut Vec<Event>) {
+        if self.pairing_until_ms == until_ms {
+            return;
+        }
+        self.pairing_until_ms = until_ms;
+        // Also for handshakes under way.
+        let open = until_ms.is_some();
+        for c in self.conns.values_mut() {
+            c.link.set_pairing_enabled(may_pair(c.transport, open));
+        }
+        events.push(Event::PairingChanged);
+    }
+
+    /// Forgets the bonded companion, ends every link, and closes the pairing mode: pairing again
+    /// takes the owner opening it. Returns the events, and whether the bond is gone from the disk.
+    pub fn unpair(&mut self) -> (Vec<Event>, Result<(), CompanionError>) {
+        let had_bond = self.paired();
         // No store yet means no identity, and so no bond to forget.
-        if let Some(store) = &mut self.store
-            && let Err(e) = store.clear_paired()
-        {
+        let cleared = match &mut self.store {
+            Some(store) => store.clear_paired(),
+            None => Ok(()),
+        };
+        if let Err(e) = &cleared {
             warn!("companion: cannot clear the bond ({e})");
         }
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
@@ -489,7 +566,12 @@ impl Companion {
         for id in ids {
             self.drop_conn(id, "unpaired", &mut events);
         }
-        events
+        self.set_pairing_window(None, &mut events);
+        if had_bond {
+            info!("companion: the bond was forgotten");
+            events.push(Event::PairingChanged);
+        }
+        (events, cleared)
     }
 
     /// The listener fds to add to the poll set, each tagged with its transport.
@@ -508,6 +590,7 @@ impl Companion {
     /// Accepts the pending connections on the listener for `transport`.
     pub fn accept(&mut self, transport: Transport) -> Vec<Event> {
         let mut events = Vec::new();
+        self.expire_pairing_window(&mut events);
         for stream in self.listeners.accept(transport) {
             if self.conns_full_for(transport) {
                 warn!(
@@ -568,7 +651,7 @@ impl Companion {
         let id = self.next_id;
         self.next_id += 1;
         let mut link = Link::new(identity, bond, self.device.clone());
-        link.set_pairing_enabled(self.pairing_enabled);
+        link.set_pairing_enabled(may_pair(transport, self.pairing_until_ms.is_some()));
         if self.notes.is_some() {
             link.advertise(omg_protocol::capability::NOTES_SYNC);
         }
@@ -592,6 +675,8 @@ impl Companion {
     /// A connection is readable: read, decode, and drive the link.
     pub fn on_readable(&mut self, id: ConnId) -> Vec<Event> {
         let mut events = Vec::new();
+        // The timer may not have had its turn yet, right after a resume.
+        self.expire_pairing_window(&mut events);
         let mut buf = [0u8; 8192];
         let mut budget = READ_BUDGET;
         let mut frames = Vec::new();
@@ -843,6 +928,18 @@ impl Companion {
                     });
                 }
                 Out::Persist(rec) => {
+                    // This link was made before the bond was. The first one stays.
+                    if self.bond().is_some_and(|b| b.peer_pub != rec.peer_pub) {
+                        warn!("companion {id}: refusing a second bond");
+                        let refusal = Frame::Error(ErrorMsg {
+                            code: ErrorCode::UnknownPeer,
+                            message: "already bonded to another companion".into(),
+                        });
+                        self.queue_frames(id, vec![refusal]);
+                        self.flush(id, events);
+                        self.drop_conn(id, "already bonded", events);
+                        continue;
+                    }
                     let saved = match &mut self.store {
                         Some(store) => store.set_paired(rec.clone()),
                         None => Err(CompanionError::Store("no store".into())),
@@ -851,6 +948,9 @@ impl Companion {
                         warn!("companion: cannot persist the bond ({e})");
                     } else {
                         info!("companion: paired with {:?}", rec.peer_name);
+                        // One phone per opening.
+                        self.set_pairing_window(None, events);
+                        events.push(Event::PairingChanged);
                     }
                 }
                 Out::Unpair => {
@@ -859,6 +959,7 @@ impl Companion {
                     {
                         warn!("companion: cannot clear the bond ({e})");
                     }
+                    events.push(Event::PairingChanged);
                 }
                 Out::ApplyLocale(l) => events.push(Event::ApplyLocale(l)),
                 Out::SettingsGet => events.push(Event::SettingsGet),
@@ -937,6 +1038,12 @@ impl Companion {
             events.push(Event::Disconnected);
         }
     }
+}
+
+/// Whether an unbonded peer may pair over `transport`. Anyone in radio range reaches BLE, so there
+/// it takes the owner opening the pairing mode. The other transports are as they were: open.
+fn may_pair(transport: Transport, window_open: bool) -> bool {
+    window_open || transport != Transport::Ble
 }
 
 fn log_bond(store: &Store) {

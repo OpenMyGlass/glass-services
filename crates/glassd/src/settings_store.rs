@@ -56,6 +56,10 @@ pub fn encode(s: &Settings) -> String {
     );
     out += &format!("wifi_enabled={}\n", b(s.wifi_enabled, d.wifi_enabled));
     out += &format!(
+        "wifi_setup_ap_enabled={}\n",
+        b(s.wifi_setup_ap_enabled, d.wifi_setup_ap_enabled)
+    );
+    out += &format!(
         "bluetooth_enabled={}\n",
         b(s.bluetooth_enabled, d.bluetooth_enabled)
     );
@@ -143,6 +147,7 @@ pub fn decode(text: &str) -> Settings {
             "screen_timeout_ms" => change.screen_timeout_ms = v.parse().ok(),
             "nudge_sleep_enabled" => change.nudge_sleep_enabled = flag(),
             "wifi_enabled" => change.wifi_enabled = flag(),
+            "wifi_setup_ap_enabled" => change.wifi_setup_ap_enabled = flag(),
             "bluetooth_enabled" => change.bluetooth_enabled = flag(),
             "airplane_mode" => change.airplane_mode = flag(),
             "locale" => change.locale = locale_from_code(v),

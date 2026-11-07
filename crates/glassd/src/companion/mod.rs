@@ -341,6 +341,12 @@ impl Companion {
         Vec::new()
     }
 
+    /// Whether randomness may be used now: the pool passed the same gate as the identity, and the
+    /// `getrandom` crate will not block.
+    pub fn rng_ready(&self) -> bool {
+        matches!(self.rng, Rng::Ready)
+    }
+
     /// When [`Companion::rng_tick`] should next run (wall clock, ms).
     pub fn rng_next_deadline(&self) -> Option<u64> {
         match self.rng {

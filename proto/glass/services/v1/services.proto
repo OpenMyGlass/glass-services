@@ -39,6 +39,8 @@ message ClientFrame {
     // First pairing with a phone, on Model B where glassd holds the link (docs/api.md "Pairing mode"):
     CompanionPairingWindow companion_pairing_window = 20;
     CompanionForgetBond companion_forget_bond = 21;
+    // Set up Wi-Fi from a browser, with no companion (docs/api.md "Wi-Fi setup"):
+    WifiSetupRequest wifi_setup = 22;
   }
 }
 
@@ -68,6 +70,7 @@ enum Topic {
   TOPIC_LOCATION = 8;                        // Location, LocationStatus (milestone 4)
   TOPIC_COMPANION = 9;                       // CompanionState (milestone 3)
   TOPIC_NOTES = 10;                          // NoteEvent
+  TOPIC_WIFI_SETUP = 11;                     // WifiSetupState; has the access point's password
 }
 
 message Subscribe {
@@ -150,6 +153,7 @@ message ServiceFrame {
     CompanionNotification companion_notification = 21;                 // milestone 3
     CompanionNotificationRemoved companion_notification_removed = 22;  // milestone 3
     NoteEvent note_event = 23;
+    WifiSetupState wifi_setup_state = 24;
   }
 }
 
@@ -331,6 +335,7 @@ message Settings {
   optional uint32 timezone_id = 16;          // index into settings_rules::TIME_ZONES; default 2 (Rome)
   optional uint32 off_head_power_off_min = 17; // 0 = never, else 1 to 720; off the head this long powers off; default 30
   optional uint32 audio_volume = 14;         // 0 to 100 percent; default 87 (about 0 dB)
+  optional bool wifi_setup_ap_enabled = 18;  // default false: WifiSetupRequest is refused ("wifi-setup-ap" capability)
   bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }
 
@@ -500,4 +505,31 @@ message NoteEvent {
   bytes audio = 6;
   uint32 pending_notes = 7;
   uint64 pending_bytes = 8;
+}
+
+message WifiSetupRequest {
+  bool start = 1;                            // true: open the access point; false: end the session
+}
+
+enum WifiSetupPhase {
+  WIFI_SETUP_PHASE_UNSPECIFIED = 0;
+  WIFI_SETUP_PHASE_OFF = 1;
+  WIFI_SETUP_PHASE_STARTING = 2;             // the firmware and the access point are coming up
+  WIFI_SETUP_PHASE_SERVING = 3;              // show ssid, password and url to the owner
+  WIFI_SETUP_PHASE_JOINING = 4;              // a network was sent; the access point is going
+  WIFI_SETUP_PHASE_JOINED = 5;               // on the network, and it is stored
+  WIFI_SETUP_PHASE_FAILED = 6;               // see error; the previous network is kept
+  WIFI_SETUP_PHASE_STOPPING = 7;             // a cancel or a failure is taking the access point down
+}
+
+message WifiSetupState {                     // TOPIC_WIFI_SETUP
+  WifiSetupPhase phase = 1;
+  string ssid = 2;                           // SERVING: the access point's name
+  string password = 3;                       // SERVING: its password, for this session only
+  string url = 4;                            // SERVING: the page's address
+  uint32 seconds_left = 5;                   // SERVING: when this frame was sent
+  uint32 clients = 6;                        // SERVING: devices on the access point
+  string network = 7;                        // JOINING, JOINED, FAILED after a join: the network's name
+  string error = 8;                          // FAILED: disabled, airplane, not-ready, no-tools, no-firmware, files, link-up, firmware-mode, serve, ap, timeout, join
+  bool snapshot = 100;                       // sent because of Subscribe or GetState, not because of a change
 }

@@ -173,6 +173,7 @@ Who switches the panel:
 | `airplane_mode` | default false (`radio`): master off-switch over all radios |
 | `locale` | UI language, one of `LOCALE_IT`/`LOCALE_EN`/`LOCALE_FR`/`LOCALE_ES`; absent until chosen (clients then show English, and the launcher offers its first-run picker). Unset/unknown values in a change are ignored (the current language is kept) |
 | `power_saver` | default true (`power`): run the energy policy (dim/cpufreq/runtime-PM when idle) |
+| `wifi_setup_ap_enabled` | default false (`wifi-setup-ap`): allows a Wi-Fi setup session (see "Wi-Fi setup") |
 | `deep_sleep_enabled` | default false (`power`): also suspend-to-RAM when idle |
 | `deep_sleep_idle_ms` | 5000 to 1800000, default 60000 (`power`): idle after screen-off before suspend |
 | `time_24h` | default true: 24-hour clock, else 12-hour |
@@ -184,6 +185,10 @@ The last three exist on Model B (plain Linux), reported by the `radio` capabilit
 `locale` is the UI language. The supported set is European Latin only (owner decision): Italian, English, French, Spanish, with ISO 639-1 codes `it`/`en`/`fr`/`es` that match `omg_protocol::Locale` on the companion. It can be set two ways, both of which land in this one field: the launcher's first-run language picker (`SetSettings { locale }`), and the companion's `SetLocale` over the link (`glassd` persists it and acks with `LocaleChanged`). The launcher reads the active language from the `Settings` snapshot (`GetState` or a `TOPIC_SETTINGS` subscription) like any other setting. `glassd` keeps the companion's reported `Status.locale` in step and, when the language is changed on the Glass side, pushes a `LocaleChanged` to the phone.
 
 The last three settings (`power_saver`, `deep_sleep_enabled`, `deep_sleep_idle_ms`) are the energy policy, on Model B (plain Linux), reported by the `power` capability; on Android (route 1) the framework owns power and `glassd` neither advertises `power` nor acts on them. See **Energy policy** below.
+
+## Wi-Fi setup (`TOPIC_WIFI_SETUP`, the `wifi-setup-ap` capability)
+
+With `wifi_setup_ap_enabled` on, `WifiSetupRequest{start: true}` makes the Glass open its own access point for up to 10 minutes and serve a small page, bound to the Wi-Fi interface only, that takes a network's name and password. `WifiSetupState` reports the session. In `WIFI_SETUP_PHASE_SERVING` it has the access point's name, a password random for this session, and the page's address, for the launcher to show on the prism: subscribers to this topic get the password, which is on no other frame and in no log. The network replaces `wifi.conf` only once it gave a lease; otherwise `FAILED` and the previous one stays. `start: false`, the setting going off or airplane mode end a session. While one runs, the settings do not drive Wi-Fi and the system does not suspend. Design and test plan: `docs/plans/2026-11-07-wifi-setup-ap-design.md`.
 
 ## Energy policy (`power`, Model B)
 

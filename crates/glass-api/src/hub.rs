@@ -9,7 +9,8 @@ use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
     ClientFrame, CompanionPairingWindow, CompanionState, ErrorCode, FocusState, HeadRequest, Hello,
     LocationStatus, NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings,
-    Topic, WearState, Welcome, client_frame, location_status, screen_request, service_frame,
+    Topic, WearState, Welcome, WifiSetupState, client_frame, location_status, screen_request,
+    service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -62,6 +63,8 @@ pub enum Effect {
     },
     /// A client asked to forget the bonded phone. Answered in the same way.
     CompanionForgetBond { client: ClientId, seq: u32 },
+    /// A client asked to start or stop a Wi-Fi setup session.
+    WifiSetup { start: bool },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -118,6 +121,7 @@ pub mod settings_rules {
             // Radios off by default: on Model B the companion is the gateway over Bluetooth and
             // Wi-Fi is brought up on demand (big transfers / fallback); see docs/api.md.
             wifi_enabled: Some(false),
+            wifi_setup_ap_enabled: Some(false),
             bluetooth_enabled: Some(false),
             airplane_mode: Some(false),
             // Unset until someone chooses: the launcher then shows its first-run language picker,
@@ -174,6 +178,9 @@ pub mod settings_rules {
         // radio wish is kept here and restored when airplane_mode goes off.
         if let Some(v) = change.wifi_enabled {
             current.wifi_enabled = Some(v);
+        }
+        if let Some(v) = change.wifi_setup_ap_enabled {
+            current.wifi_setup_ap_enabled = Some(v);
         }
         if let Some(v) = change.bluetooth_enabled {
             current.bluetooth_enabled = Some(v);
@@ -245,6 +252,8 @@ pub struct Hub {
     screen: Option<ScreenState>,
     wear: Option<WearState>,
     settings: Option<Settings>,
+    /// The last Wi-Fi setup state: has the access point's password while it is up.
+    wifi_setup: Option<WifiSetupState>,
     relay: Relay,
     /// The time set by the owner ([`Hub::set_time`]); `None`: `CLOCK_MONOTONIC`.
     time: Option<u64>,
@@ -279,6 +288,7 @@ pub fn topic_of(body: &service_frame::Body) -> Option<Topic> {
         B::Button(_) => Topic::Button,
         B::Location(_) | B::LocationStatus(_) => Topic::Location,
         B::NoteEvent(_) => Topic::Notes,
+        B::WifiSetupState(_) => Topic::WifiSetup,
         B::CompanionState(_) | B::CompanionNotification(_) | B::CompanionNotificationRemoved(_) => {
             Topic::Companion
         }
@@ -304,6 +314,7 @@ impl Hub {
             screen: None,
             wear: None,
             settings: None,
+            wifi_setup: None,
             relay: Relay::default(),
             time: None,
         }
@@ -720,6 +731,7 @@ impl Hub {
             Some(B::CompanionForgetBond(_)) => {
                 fx.push(Effect::CompanionForgetBond { client: id, seq })
             }
+            Some(B::WifiSetup(r)) => fx.push(Effect::WifiSetup { start: r.start }),
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {
@@ -782,6 +794,12 @@ impl Hub {
                     snapshot: true,
                     ..self.relay.companion_state()
                 })),
+                Topic::WifiSetup => self.wifi_setup.as_ref().map(|s| {
+                    service_frame::Body::WifiSetupState(WifiSetupState {
+                        snapshot: true,
+                        ..s.clone()
+                    })
+                }),
                 _ => None,
             };
             if let Some(b) = body {
@@ -867,6 +885,7 @@ impl Hub {
             service_frame::Body::ScreenState(s) => self.screen = Some(s.clone()),
             service_frame::Body::WearState(w) => self.wear = Some(*w),
             service_frame::Body::Settings(s) => self.settings = Some(*s),
+            service_frame::Body::WifiSetupState(s) => self.wifi_setup = Some(s.clone()),
             _ => {}
         }
         if topic == Topic::Gesture {

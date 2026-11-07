@@ -272,6 +272,8 @@ pub struct Radio {
     associating: bool,
     /// Owns Bluetooth when set: see the module docs.
     ble: Option<BleEngine>,
+    /// A Wi-Fi setup session owns the interface: the settings do not drive it for now.
+    wifi_held: bool,
     /// The last states glassd drove the radios to (its view, not a re-query).
     wifi_on: Option<bool>,
     bt_on: Option<bool>,
@@ -448,6 +450,7 @@ impl Radio {
             wifi_conf: None,
             associating: false,
             ble: None,
+            wifi_held: false,
             wifi_on: None,
             bt_on: None,
         }
@@ -619,8 +622,22 @@ impl Radio {
         r
     }
 
-    /// Runs one command; logs and returns false if the tool is absent or the command failed.
-    fn step(&mut self, program: &str, args: &[&str]) -> bool {
+    /// The Wi-Fi interface's name.
+    pub(crate) fn wifi_iface(&self) -> &str {
+        &self.wifi_iface
+    }
+
+    /// Runs one command for its output; `None` if the tool is absent or the command failed.
+    pub(crate) fn query(&mut self, program: &str, args: &[&str]) -> Option<String> {
+        match (self.run)(program, args) {
+            Ok(o) if o.ok => Some(o.stdout),
+            _ => None,
+        }
+    }
+
+    /// Runs one command; logs and returns false if the tool is absent or the command failed. The
+    /// arguments are logged then, so a secret never goes in them.
+    pub(crate) fn step(&mut self, program: &str, args: &[&str]) -> bool {
         match (self.run)(program, args) {
             Ok(o) if o.ok => true,
             Ok(o) => {
@@ -739,7 +756,7 @@ impl Radio {
     /// Brings both radios to the wanted state, writing only what changed since the last call.
     /// `wifi` and `bluetooth` are the effective states (airplane mode already folded in).
     pub fn apply(&mut self, wifi: bool, bluetooth: bool) {
-        if self.wifi_on != Some(wifi) {
+        if !self.wifi_held && self.wifi_on != Some(wifi) {
             self.set_wifi(wifi);
         }
         if self.bt_on != Some(bluetooth) {
@@ -796,7 +813,32 @@ impl Radio {
         info!("radio: joining Wi-Fi on {iface}");
     }
 
-    fn stop_association(&mut self) {
+    /// A Wi-Fi setup session takes the interface: [`Radio::apply`] leaves Wi-Fi alone for now.
+    pub(crate) fn hold_wifi(&mut self) {
+        self.wifi_held = true;
+    }
+
+    /// The session gave the interface back, in an unknown state: the next [`Radio::apply`] drives
+    /// it, whatever it was before.
+    pub(crate) fn release_wifi(&mut self) {
+        self.wifi_held = false;
+        self.wifi_on = None;
+    }
+
+    /// The network tried by [`Radio::join_wifi`] works, and is now stored as `conf`.
+    pub(crate) fn finish_join(&mut self, conf: std::path::PathBuf) {
+        self.wifi_conf = Some(conf);
+        self.wifi_held = false;
+    }
+
+    /// The network tried by [`Radio::join_wifi`] did not work: back to `conf`.
+    pub(crate) fn abandon_join(&mut self, conf: std::path::PathBuf) {
+        self.stop_association();
+        self.wifi_conf = Some(conf);
+        self.release_wifi();
+    }
+
+    pub(crate) fn stop_association(&mut self) {
         if !std::mem::take(&mut self.associating) {
             return;
         }

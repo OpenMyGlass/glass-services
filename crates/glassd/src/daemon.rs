@@ -14,14 +14,15 @@ use crate::radio::Radio;
 use crate::screen::{Change, Now, ScreenPolicy};
 use crate::settings_store::SettingsStore;
 use crate::touch::{ScreenOffInput, Step, TouchGate};
+use crate::wifi_setup::{self, Finished, WifiSetup};
 use crate::{info, warn};
 use glass_api::hub::settings_rules;
 use glass_api::proto::{
     Button, ButtonAction, ButtonId, ClientFrame, CompanionNotification,
     CompanionNotificationActionInfo, CompanionNotificationRemoved, CompanionRegister,
     CompanionStatus, DictationState, ErrorCode, HeadGesture, HeadGestureKind, Hello, Locale,
-    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource, Wink,
-    client_frame, dictation_state, service_frame,
+    Screen, ScreenState, ServiceError, ServiceFrame, Settings, Transcript, Wear, WearSource,
+    WifiSetupPhase, WifiSetupState, Wink, client_frame, dictation_state, service_frame,
 };
 use glass_api::{ClientId, Effect, FrameDecoder, Hub};
 use glass_evdev::Device;
@@ -224,6 +225,8 @@ pub struct Daemon {
     store: Option<SettingsStore>,
     /// Wi-Fi / Bluetooth control (`None`: this build does not manage the radios, e.g. Android).
     radio: Option<Radio>,
+    /// Setting up Wi-Fi from a browser (`None`: no radio control, or nowhere to store a network).
+    wifi_setup: Option<WifiSetup>,
     /// The idle -> suspend decision (always present; inert when the back end is absent).
     power_policy: PowerPolicy,
     /// How long off the head, for the wake alarm and the power-off.
@@ -329,6 +332,66 @@ fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
 
 /// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
 const CAP_COMPANION_BLE: &str = "companion-ble";
+
+/// The session's language, as the launcher's.
+fn wifi_setup_lang(locale: Option<i32>) -> wifi_setup::http::Lang {
+    use wifi_setup::http::Lang;
+    match locale.and_then(|v| Locale::try_from(v).ok()) {
+        Some(Locale::It) => Lang::It,
+        Some(Locale::Fr) => Lang::Fr,
+        Some(Locale::Es) => Lang::Es,
+        _ => Lang::En,
+    }
+}
+
+/// How a Wi-Fi setup session is wired: for real, or with `--mock` on the loopback interface with
+/// stand-in files and a short join. `None` if the stand-ins cannot be made.
+fn wifi_setup_config(opts: &Options, state_dir: &Path) -> Option<wifi_setup::Config> {
+    use wifi_setup::ap::{AP_IP, ApPaths};
+    use wifi_setup::portal::Binding;
+    let wifi_conf = state_dir.join(crate::radio::WIFI_CONF_FILE);
+    if !opts.mock {
+        return Some(wifi_setup::Config {
+            paths: ApPaths::system(),
+            binding: Binding {
+                device: opts.wifi_iface.clone(),
+                ip: AP_IP,
+                port: 80,
+            },
+            wifi_conf,
+            timeouts: wifi_setup::Timeouts::default(),
+            assume_enabled: false,
+        });
+    }
+    let (firmware_param, stock_firmware) = (
+        state_dir.join("mock-firmware-path"),
+        state_dir.join("mock-firmware"),
+    );
+    std::fs::create_dir_all(state_dir).ok()?;
+    std::fs::write(&firmware_param, "").ok()?;
+    std::fs::write(&stock_firmware, "").ok()?;
+    Some(wifi_setup::Config {
+        paths: ApPaths {
+            run_dir: state_dir.join("mock-ap"),
+            firmware_param,
+            stock_firmware,
+        },
+        binding: Binding {
+            device: "lo".into(),
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            port: 0,
+        },
+        wifi_conf,
+        timeouts: wifi_setup::Timeouts {
+            settle_us: 10_000,
+            enable_us: 1_000_000,
+            session_us: 600_000_000,
+            flush_us: 100_000,
+            join_us: 500_000,
+        },
+        assume_enabled: true,
+    })
+}
 
 /// The effective `(wifi, bluetooth)` radio states for the settings: airplane mode forces both
 /// off, keeping the per-radio wishes so they are restored when it is turned off.
@@ -754,6 +817,10 @@ impl Daemon {
                 }
             })
         };
+        let wifi_setup = match (&radio, &opts.state_dir) {
+            (Some(_), Some(dir)) => wifi_setup_config(opts, dir).map(WifiSetup::new),
+            _ => None,
+        };
         // The energy-policy back end: recorded with --mock (never touches the host's power
         // sysfs), real otherwise when --power is on. Android leaves power to the framework.
         let power = if !opts.energy {
@@ -832,6 +899,9 @@ impl Daemon {
             if radio.is_some() {
                 c.push("radio");
             }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
+            }
             if power.is_some() {
                 c.push("power");
             }
@@ -856,6 +926,9 @@ impl Daemon {
             }
             if radio.is_some() {
                 c.push("radio");
+            }
+            if wifi_setup.is_some() {
+                c.push("wifi-setup-ap");
             }
             if power.is_some() {
                 c.push("power");
@@ -914,6 +987,7 @@ impl Daemon {
             touch_sleep: TouchpadSleep::new(touchpad_sysfs),
             store,
             radio,
+            wifi_setup,
             power_policy,
             off_head,
             suspend_offset_us: None,
@@ -951,6 +1025,10 @@ impl Daemon {
             d.wear.on_head(),
             d.policy.screen(),
         );
+        // A session left by a daemon that died must not outlive it: its access point goes first.
+        if let (Some(w), Some(r)) = (&d.wifi_setup, &mut d.radio) {
+            w.cleanup_stale(r);
+        }
         // Bring the radios to the stored (or default: both off) state at start, so Wi-Fi is
         // off by default and a prior run's state does not leak in.
         let s = d.settings();
@@ -992,6 +1070,7 @@ impl Daemon {
                 }),
             self.hub.next_deadline(),
             self.battery_deadline,
+            self.wifi_setup.as_ref().and_then(WifiSetup::next_deadline),
             self.companion.as_ref().and_then(|c| {
                 // Wall clock to the monotonic base, and never a busy loop.
                 let wait_ms = c.notes_next_deadline()?.saturating_sub(companion::now_ms());
@@ -1061,6 +1140,7 @@ impl Daemon {
             CompanionListener(companion::transport::Transport),
             CompanionConn(companion::ConnId),
             BleEngine,
+            WifiSetup,
         }
         let mut fds = Vec::new();
         let mut srcs = Vec::new();
@@ -1125,6 +1205,11 @@ impl Daemon {
         if let Some(fd) = self.radio.as_ref().and_then(Radio::ble_fd) {
             add(fd, libc::POLLIN, Src::BleEngine);
         }
+        if let Some(w) = &self.wifi_setup {
+            for (fd, events) in w.fds() {
+                add(fd, events, Src::WifiSetup);
+            }
+        }
         // SAFETY: `fds` is a valid array of pollfd of the given length.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -1158,6 +1243,12 @@ impl Daemon {
             match src {
                 Src::Listener => self.accept(),
                 Src::Touchpad => self.read_touchpad(),
+                Src::WifiSetup => {
+                    let t = now().mono_us;
+                    if let Some(u) = self.wifi_setup.as_mut().map(|w| w.on_ready(pfd.fd, t)) {
+                        self.wifi_setup_update(u);
+                    }
+                }
                 Src::Stdin => self.read_stdin(),
                 Src::Key(id) => self.read_key(id),
                 Src::DonDoff => {
@@ -1297,13 +1388,18 @@ impl Daemon {
         if self.power_io.is_some() && self.off_head.power_off_due(t.boot_us) {
             self.power_off_if_unplugged(t);
         }
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.tick(r, t.mono_us);
+            self.wifi_setup_update(u);
+        }
         self.run_mock_commands();
     }
 
     /// The off-head time is up. On a cable the Glass stays on, so a charging Glass left on the
     /// desk is not found off: the wait starts again. So it does if powering off failed.
     fn power_off_if_unplugged(&mut self, t: Now) {
-        let cable = companion::battery::cable_connected(&self.power_supply);
+        let busy = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        let cable = busy || companion::battery::cable_connected(&self.power_supply);
         if !cable && let Some(power) = &mut self.power_io {
             power.power_off();
         }
@@ -1495,6 +1591,7 @@ impl Daemon {
                     }
                 }
                 Effect::SettingsChanged(s) => self.settings_changed(&s),
+                Effect::WifiSetup { start } => self.wifi_setup_request(start),
                 Effect::Head { client, request } => {
                     self.head_requests
                         .insert(client, (request.relative_look_up, request.nudge));
@@ -2453,6 +2550,13 @@ impl Daemon {
         let detection = s.on_head_detection_enabled.unwrap_or(false) && self.hub_present();
         let u = self.wear.set_detection(now().mono_us, detection);
         self.wear_update(u);
+        // Airplane mode and the setting going off end a session; the radio follows when it has.
+        if !s.wifi_setup_ap_enabled.unwrap_or(false) || s.airplane_mode.unwrap_or(false) {
+            let t = now().mono_us;
+            if self.wifi_setup.as_ref().is_some_and(WifiSetup::active) {
+                self.wifi_setup_request_stop(t);
+            }
+        }
         self.apply_radio(s);
         self.apply_power(s);
         // Keep the companion's reported UI language in step (idempotent; pushes LocaleChanged to
@@ -2473,6 +2577,66 @@ impl Daemon {
             && let Err(e) = st.save(s)
         {
             warn!("cannot store the settings in {}: {e}", st.path().display());
+        }
+    }
+
+    /// A client asked to start or stop a Wi-Fi setup session.
+    fn wifi_setup_request(&mut self, start: bool) {
+        let t = now().mono_us;
+        if !start {
+            self.wifi_setup_request_stop(t);
+            return;
+        }
+        let s = self.settings();
+        let ctx = wifi_setup::Context {
+            enabled: s.wifi_setup_ap_enabled.unwrap_or(false),
+            airplane: s.airplane_mode.unwrap_or(false),
+            pool_ready: self.mock.is_some()
+                || self.companion.as_ref().is_some_and(|c| c.rng_ready()),
+            lang: wifi_setup_lang(s.locale),
+        };
+        let u = match (&mut self.wifi_setup, &mut self.radio) {
+            (Some(w), Some(r)) => w.start(r, ctx, t),
+            _ => wifi_setup::Update {
+                state: Some(WifiSetupState {
+                    phase: WifiSetupPhase::Failed as i32,
+                    error: wifi_setup::ERR_NO_TOOLS.into(),
+                    ..Default::default()
+                }),
+                finished: None,
+            },
+        };
+        self.wifi_setup_update(u);
+    }
+
+    fn wifi_setup_request_stop(&mut self, t: u64) {
+        if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
+            let u = w.stop(r, t);
+            self.wifi_setup_update(u);
+        }
+    }
+
+    /// Acts on what the session says: the system stays up while it runs, and at its end the radio
+    /// goes back to the settings, or the settings follow the network that worked.
+    fn wifi_setup_update(&mut self, u: wifi_setup::Update) {
+        let active = self.wifi_setup.as_ref().is_some_and(WifiSetup::active);
+        self.power_policy.set_held(active);
+        if active && let Some(power) = &mut self.power_io {
+            power.stay_awake();
+        }
+        if let Some(state) = u.state {
+            self.publish(service_frame::Body::WifiSetupState(state));
+        }
+        match u.finished {
+            Some(Finished::Joined) => self.apply_settings_change(Settings {
+                wifi_enabled: Some(true),
+                ..Default::default()
+            }),
+            Some(Finished::Restore) => {
+                let s = self.settings();
+                self.apply_radio(&s);
+            }
+            None => {}
         }
     }
 

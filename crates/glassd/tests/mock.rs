@@ -1479,3 +1479,145 @@ fn companion_link_pairs_over_tcp_and_surfaces_to_the_launcher() {
     drop(launcher);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn wifi_setup(f: &ServiceFrame) -> Option<glass_api::proto::WifiSetupState> {
+    match &f.body {
+        Some(Body::WifiSetupState(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The whole path through the real socket, with `--mock` standing in for the radio: off by
+/// default, a session on request, the page on the loopback interface, a form, the join's end, and
+/// no password in the daemon's verbose log.
+#[test]
+fn wifi_setup_session_over_the_socket_logs_no_password() {
+    use glass_api::proto::{WifiSetupPhase, WifiSetupRequest};
+    use std::io::Read;
+
+    let dir = test_dir("wifi-setup");
+    let socket = dir.join("glassd.sock");
+    let log_path = dir.join("stderr.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_glassd"))
+            .args(["--mock", "--verbose", "--socket"])
+            .arg(&socket)
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(log),
+    );
+    let _stdin = child.0.stdin.take();
+    let deadline = Instant::now() + T;
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "no socket");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut c = Client::connect_with_timeout(&socket, "it", HANDSHAKE).unwrap();
+    assert!(c.has_capability("wifi-setup-ap"));
+    c.subscribe(&[Topic::WifiSetup, Topic::Settings]).unwrap();
+
+    let ask = |c: &mut Client, start: bool| {
+        c.send(Body2::WifiSetup(WifiSetupRequest { start }))
+            .unwrap();
+    };
+    let wait = |c: &mut Client, phase: WifiSetupPhase| {
+        let f = c
+            .recv_until(T, |f| {
+                wifi_setup(f).is_some_and(|s| s.phase == phase as i32)
+            })
+            .unwrap()
+            .unwrap();
+        wifi_setup(&f).unwrap()
+    };
+
+    // Off by default.
+    ask(&mut c, true);
+    assert_eq!(wait(&mut c, WifiSetupPhase::Failed).error, "disabled");
+
+    set_settings(
+        &mut c,
+        Settings {
+            wifi_setup_ap_enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    ask(&mut c, true);
+    let serving = wait(&mut c, WifiSetupPhase::Serving);
+    assert_eq!(serving.password.len(), 12);
+    let host = serving
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let http = |request: String| {
+        let mut s = std::net::TcpStream::connect(&host).unwrap();
+        s.set_read_timeout(Some(T)).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    };
+    let page = http(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    let token = page
+        .split("name=\"token\" value=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+
+    const TYPED: &str = "typed-network-password";
+    let form = format!("token={token}&ssid=HomeNet&password={TYPED}");
+    let answer = http(format!(
+        "POST /join HTTP/1.1\r\nHost: {host}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    ));
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let joining = wait(&mut c, WifiSetupPhase::Joining);
+    assert_eq!(joining.network, "HomeNet");
+    assert!(joining.password.is_empty());
+
+    // The recording radio never gets a lease.
+    let end = wait(&mut c, WifiSetupPhase::Failed);
+    assert_eq!(end.error, "join");
+    assert!(!dir.join("state").join("wifi.conf").exists());
+    assert!(!dir.join("state").join("wifi.conf.try").exists());
+    assert!(!dir.join("state").join("mock-ap").exists());
+
+    // A cancel, this time, and the setting going off ends a session as well.
+    ask(&mut c, true);
+    wait(&mut c, WifiSetupPhase::Serving);
+    ask(&mut c, false);
+    wait(&mut c, WifiSetupPhase::Off);
+    ask(&mut c, true);
+    let again = wait(&mut c, WifiSetupPhase::Serving);
+    assert_ne!(again.password, serving.password, "a new one per session");
+    set_settings(
+        &mut c,
+        Settings {
+            wifi_setup_ap_enabled: Some(false),
+            ..Default::default()
+        },
+    );
+    wait(&mut c, WifiSetupPhase::Off);
+
+    drop(c);
+    drop(child);
+    let logged = std::fs::read_to_string(&log_path).unwrap();
+    assert!(logged.contains("wifi-setup: serving"), "verbose log is on");
+    for secret in [
+        serving.password.as_str(),
+        again.password.as_str(),
+        TYPED,
+        token,
+    ] {
+        assert!(!logged.contains(secret), "{secret} in the log");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

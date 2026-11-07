@@ -796,7 +796,7 @@ fn raw_peer(glass: &mut Companion, transport: Transport) -> RawPeer {
     far.set_nonblocking(true).unwrap();
     let id = glass.next_id;
     let mut events = Vec::new();
-    glass.add_conn(Box::new(near), transport, &mut events);
+    glass.add_conn(Box::new(near), transport, false, &mut events);
     RawPeer {
         id,
         stream: far,
@@ -863,31 +863,37 @@ fn plain_glass(root: &Path) -> Companion {
     Companion::new(&root.join("g"), DeviceState::default(), None, false).unwrap()
 }
 
+/// Hello, PairRequest and PairResult{ok: true}, as one run of bytes.
+fn takeover_bytes(identity: &Identity, name: &str) -> Vec<u8> {
+    let hello = Frame::Hello(omg_protocol::Hello {
+        protocol_version: omg_protocol::PROTOCOL_VERSION,
+        role: omg_protocol::Role::Companion,
+        app_version: "x".into(),
+        device_name: "x".into(),
+        identity_pub: identity.public_b64(),
+        capabilities: vec![capability::SESSION_CRYPTO.to_string()],
+    });
+    let request = Frame::PairRequest(omg_protocol::PairRequest {
+        companion_name: name.into(),
+        companion_pub: identity.public_b64(),
+        nonce: "AAAA".into(),
+        bootstrap_token: None,
+    });
+    let result = Frame::PairResult(omg_protocol::PairResult {
+        ok: true,
+        message: String::new(),
+    });
+    let mut bytes = Vec::new();
+    for f in [&hello, &request, &result] {
+        bytes.extend(omg_protocol::frame_bytes(f).unwrap());
+    }
+    bytes
+}
+
 impl RawPeer {
     /// The whole takeover in one write, as an attacker would send it, before the Glass reads.
     fn takeover(&mut self, glass: &mut Companion, name: &str) -> Vec<Event> {
-        let hello = Frame::Hello(omg_protocol::Hello {
-            protocol_version: omg_protocol::PROTOCOL_VERSION,
-            role: omg_protocol::Role::Companion,
-            app_version: "x".into(),
-            device_name: "x".into(),
-            identity_pub: self.identity.public_b64(),
-            capabilities: vec![capability::SESSION_CRYPTO.to_string()],
-        });
-        let request = Frame::PairRequest(omg_protocol::PairRequest {
-            companion_name: name.into(),
-            companion_pub: self.identity.public_b64(),
-            nonce: "AAAA".into(),
-            bootstrap_token: None,
-        });
-        let result = Frame::PairResult(omg_protocol::PairResult {
-            ok: true,
-            message: String::new(),
-        });
-        let mut bytes = Vec::new();
-        for f in [&hello, &request, &result] {
-            bytes.extend(omg_protocol::frame_bytes(f).unwrap());
-        }
+        let bytes = takeover_bytes(&self.identity, name);
         self.stream.write_all(&bytes).unwrap();
         glass.on_readable(self.id)
     }
@@ -969,15 +975,14 @@ fn a_window_that_expired_is_seen_on_the_first_read() {
 
 #[test]
 fn a_bond_that_cannot_be_stored_ends_the_link_and_closes_the_window() {
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let mut glass = plain_glass(tmp.path());
     glass.open_pairing_window(0).unwrap();
-    let dir = tmp.path().join("g");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    glass.store.as_mut().unwrap().fail_saves = true;
     let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
     let events = peer.takeover(&mut glass, "phone");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    glass.store.as_mut().unwrap().fail_saves = false;
+    assert!(!plain_glass(tmp.path()).paired(), "on the disk");
     assert!(!glass.paired(), "a bond in memory only");
     assert!(!glass.connected());
     assert_eq!(glass.conn_fds().len(), 0);
@@ -1045,4 +1050,107 @@ fn the_handshake_deadline_is_on_the_boot_clock() {
     // The wall clock is decades ahead of the boot clock: a wall-clock deadline would be there.
     assert!(at >= before + super::HANDSHAKE_MS);
     assert!(at <= super::boot_ms() + super::HANDSHAKE_MS);
+}
+
+/// Reads every connection until the Glass is bonded, or says it never was.
+fn until_paired(glass: &mut Companion) {
+    let start = Instant::now();
+    while !glass.paired() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never paired");
+        for (id, _, _) in glass.conn_fds() {
+            glass.on_readable(id);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn the_owner_s_qr_dial_may_pair_and_a_stranger_meanwhile_may_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .dial_to_pair(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    let (mut phone, _) = listener.accept().unwrap();
+    assert_eq!(
+        glass.pairing_left_ms(),
+        None,
+        "the pairing mode opened for everyone"
+    );
+
+    for transport in [Transport::WifiTcp, Transport::Ble] {
+        let mut stranger = raw_peer(&mut glass, transport);
+        stranger.takeover(&mut glass, "stranger");
+        assert!(!glass.paired(), "a stranger on {transport:?} paired");
+        assert!(refused_not_paired(&mut stranger), "{transport:?}");
+    }
+
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    until_paired(&mut glass);
+    assert_eq!(glass.paired_name(), Some("phone"));
+}
+
+#[test]
+fn a_plain_dial_still_needs_the_pairing_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .connect_tcp(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    let (mut phone, _) = listener.accept().unwrap();
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    let start = Instant::now();
+    while !glass.conn_fds().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "not refused");
+        for (id, _, _) in glass.conn_fds() {
+            glass.on_readable(id);
+        }
+    }
+    assert!(!glass.paired());
+}
+
+#[test]
+fn a_qr_dial_that_waits_for_the_random_pool_may_still_pair_when_it_goes_out() {
+    use super::entropy::testing::FakePool;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(tmp.path());
+    let mut glass = Companion::with_rng_device(
+        &tmp.path().join("g"),
+        DeviceState::default(),
+        None,
+        false,
+        &pool.path,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    assert!(glass.dial_to_pair(&addr).unwrap().is_empty());
+    assert!(
+        glass.conn_fds().is_empty(),
+        "dialed before the pool was seeded"
+    );
+    // Nothing waits on a clock meanwhile, so no length of wait can make the dial lose its right.
+    assert_eq!(glass.pairing_left_ms(), None);
+    assert_eq!(glass.pairing_next_deadline(), None);
+    for _ in 0..100 {
+        glass.on_rng_event();
+        glass.pairing_tick();
+    }
+    assert!(glass.conn_fds().is_empty());
+
+    pool.seed();
+    glass.on_rng_event();
+    assert_eq!(glass.conn_fds().len(), 1, "the dial did not go out");
+    let (mut phone, _) = listener.accept().unwrap();
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    until_paired(&mut glass);
+    assert_eq!(glass.paired_name(), Some("phone"));
 }

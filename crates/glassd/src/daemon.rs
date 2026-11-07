@@ -2222,17 +2222,10 @@ impl Daemon {
         }
         if let Some(addr) = &boot.companion_addr {
             match &mut self.companion {
-                Some(c) => match c.connect_tcp(addr) {
-                    Ok(mut events) => {
-                        // The owner scanned the QR, which is meant for a first pairing: this dial
-                        // may pair. A bonded Glass keeps its bond and refuses to open the mode.
-                        if !c.paired()
-                            && let Ok(opened) = c.open_pairing_window(0)
-                        {
-                            events.extend(opened);
-                        }
-                        self.companion_events(events)
-                    }
+                // The owner scanned the QR, which is meant for a first pairing: this one
+                // connection may pair. A bonded Glass keeps its bond all the same.
+                Some(c) => match c.dial_to_pair(addr) {
+                    Ok(events) => self.companion_events(events),
                     Err(e) => warn!("companion: cannot dial {addr} ({e})"),
                 },
                 None => info!("companion: --companion off; not dialing {addr}"),

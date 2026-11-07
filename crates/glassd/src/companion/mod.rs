@@ -159,6 +159,8 @@ struct Conn {
     closing: bool,
     /// A peer that has not finished the handshake goes at this time ([`boot_ms`]).
     handshake_by_ms: Option<u64>,
+    /// The owner's QR dial made this connection: it may pair, with the pairing mode closed.
+    owner_dial: bool,
 }
 
 /// How often the entropy level is checked while a first identity waits for it. The level grows by
@@ -192,7 +194,8 @@ pub struct Companion {
     /// A trusted seed went in at this start: a first identity need not wait for the level.
     seed_used: bool,
     /// A dial asked for before the pool was seeded.
-    pending_dial: Option<String>,
+    /// With whether it is the owner's dial, that may pair.
+    pending_dial: Option<(String, bool)>,
     tcp_port: Option<u16>,
     bt: bool,
     /// Where `omg-bled` connects, bound with the other listeners.
@@ -450,10 +453,10 @@ impl Companion {
 
     /// The dial asked for while waiting for the pool.
     fn dial_pending(&mut self) -> Vec<Event> {
-        let Some(addr) = self.pending_dial.take() else {
+        let Some((addr, owner_dial)) = self.pending_dial.take() else {
             return Vec::new();
         };
-        self.connect_tcp(&addr).unwrap_or_else(|e| {
+        self.dial(&addr, owner_dial).unwrap_or_else(|e| {
             warn!("companion: cannot dial {addr} ({e})");
             Vec::new()
         })
@@ -545,7 +548,7 @@ impl Companion {
         // Also for handshakes under way.
         let open = until_ms.is_some();
         for c in self.conns.values_mut() {
-            c.link.set_pairing_enabled(open);
+            c.link.set_pairing_enabled(open || c.owner_dial);
         }
         events.push(Event::PairingChanged);
     }
@@ -600,7 +603,7 @@ impl Companion {
                 );
                 continue;
             }
-            self.add_conn(stream, transport, &mut events);
+            self.add_conn(stream, transport, false, &mut events);
         }
         events
     }
@@ -619,11 +622,23 @@ impl Companion {
 
     /// Dials a companion over TCP (the QR bootstrap connect path), then starts the handshake.
     /// The handshake needs randomness, so before the pool is seeded the dial waits for it.
+    /// Pairing on it takes the pairing mode, as on any other connection.
     pub fn connect_tcp(&mut self, addr: &str) -> io::Result<Vec<Event>> {
+        self.dial(addr, false)
+    }
+
+    /// [`Companion::connect_tcp`] for the owner's QR bootstrap: the connection it makes may pair,
+    /// and no other, so the pairing mode stays closed for everyone else. A dial that waits for the
+    /// random pool keeps this, however long the wait.
+    pub fn dial_to_pair(&mut self, addr: &str) -> io::Result<Vec<Event>> {
+        self.dial(addr, true)
+    }
+
+    fn dial(&mut self, addr: &str, owner_dial: bool) -> io::Result<Vec<Event>> {
         match self.rng {
             Rng::Waiting(_) | Rng::Gathering { .. } => {
                 info!("companion: will dial {addr} once the random pool is seeded");
-                self.pending_dial = Some(addr.to_owned());
+                self.pending_dial = Some((addr.to_owned(), owner_dial));
                 return Ok(Vec::new());
             }
             Rng::Failed => return Err(io::Error::other("the link is disabled")),
@@ -637,12 +652,19 @@ impl Companion {
         self.add_conn(
             Box::new(stream) as BoxStream,
             Transport::WifiTcp,
+            owner_dial,
             &mut events,
         );
         Ok(events)
     }
 
-    fn add_conn(&mut self, stream: BoxStream, transport: Transport, events: &mut Vec<Event>) {
+    fn add_conn(
+        &mut self,
+        stream: BoxStream,
+        transport: Transport,
+        owner_dial: bool,
+        events: &mut Vec<Event>,
+    ) {
         // Not reachable: a connection needs Rng::Ready, and that needs a store.
         let Some(store) = &self.store else {
             return;
@@ -652,7 +674,7 @@ impl Companion {
         let id = self.next_id;
         self.next_id += 1;
         let mut link = Link::new(identity, bond, self.device.clone());
-        link.set_pairing_enabled(self.pairing_until_ms.is_some());
+        link.set_pairing_enabled(self.pairing_until_ms.is_some() || owner_dial);
         if self.notes.is_some() {
             link.advertise(omg_protocol::capability::NOTES_SYNC);
         }
@@ -667,6 +689,7 @@ impl Companion {
                 transport,
                 closing: false,
                 handshake_by_ms: Some(boot_ms() + HANDSHAKE_MS),
+                owner_dial,
             },
         );
         // Drive the Hello that start() queued against the now-inserted connection.

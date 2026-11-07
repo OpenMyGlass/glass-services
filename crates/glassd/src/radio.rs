@@ -328,10 +328,10 @@ fn send_one_byte(path: &str) -> io::Result<bool> {
     // SAFETY: termios is plain data, filled by tcgetattr before use, on a descriptor we hold.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut t) == 0 {
+        if tty::get_attr(fd, &mut t) == 0 {
             t.c_cflag &= !libc::CRTSCTS;
             t.c_cflag |= libc::CLOCAL;
-            libc::tcsetattr(fd, libc::TCSANOW, &t);
+            tty::set_attr_now(fd, &t);
         }
     }
     port.write_all(&[0])?;
@@ -345,10 +345,49 @@ fn send_one_byte(path: &str) -> io::Result<bool> {
         }
         if Instant::now() >= end {
             // SAFETY: on a descriptor we hold.
-            unsafe { libc::tcflush(fd, libc::TCOFLUSH) };
+            unsafe { tty::flush(fd, libc::TCOFLUSH) };
             return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The termios calls glassd needs. Bionic before API 21 has them only as inline functions in its
+/// headers, with no symbol to link against, so on Android they are the ioctls those functions wrap.
+mod tty {
+    use std::os::fd::RawFd;
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn get_attr(fd: RawFd, t: &mut libc::termios) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCGETS as _, t as *mut libc::termios) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcgetattr(fd, t) };
+    }
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn set_attr_now(fd: RawFd, t: &libc::termios) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCSETS as _, t as *const libc::termios) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) };
+    }
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn flush(fd: RawFd, queue: libc::c_int) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCFLSH as _, queue as libc::c_ulong) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcflush(fd, queue) };
     }
 }
 

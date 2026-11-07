@@ -390,3 +390,100 @@ fn a_hardware_error_is_fatal() {
         .on_hci(&[hci::H4_EVENT, hci::EV_HARDWARE_ERROR, 1, 7], 0);
     assert!(b.engine.fatal().unwrap().contains("07"));
 }
+
+/// An ACL packet from the phone, past the fake radio, as a peer that breaks the rules can send it.
+fn acl_from_peer(payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![hci::H4_ACL];
+    v.extend_from_slice(&(0x40u16 | (2 << 12)).to_le_bytes());
+    v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+fn l2cap(cid: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = (payload.len() as u16).to_le_bytes().to_vec();
+    v.extend_from_slice(&cid.to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+#[test]
+fn an_oversize_pdu_cuts_the_link_and_a_flood_of_them_writes_one_line() {
+    let mut b = Bench::new();
+    b.radio.phone_connects();
+    b.settle();
+    b.engine.take_logs();
+    let flood = acl_from_peer(&[0xFF, 0xFF, 4, 0]);
+    let mut lines = Vec::new();
+    for _ in 0..1000 {
+        b.engine.on_hci(&flood, b.now);
+        lines.extend(b.engine.take_logs());
+    }
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("over the limit"));
+    b.settle();
+    assert!(!b.radio.connected(), "the link was not cut");
+    assert!(b.radio.advertising);
+}
+
+#[test]
+fn a_peer_coming_back_again_and_again_cannot_flood_the_log() {
+    let mut b = Bench::new();
+    b.engine.take_logs();
+    let flood = acl_from_peer(&[0xFF, 0xFF, 4, 0]);
+    let mut lines = 0;
+    for _ in 0..1000 {
+        b.radio.phone_connects();
+        b.settle();
+        b.engine.on_hci(&flood, b.now);
+        b.settle();
+        lines += b.engine.take_logs().len();
+    }
+    assert!(lines <= LOG_LINES_PER_WINDOW as usize, "{lines} lines");
+
+    // Time passing says how many went, and the budget is back.
+    b.now += LOG_WINDOW_MS;
+    b.engine.tick(b.now);
+    b.settle();
+    let logs = b.engine.take_logs();
+    assert!(
+        logs.iter().any(|l| l.contains("log lines dropped")),
+        "{logs:?}"
+    );
+    b.radio.phone_connects();
+    b.settle();
+    assert!(b.engine.take_logs().iter().any(|l| l.contains("connected")));
+}
+
+#[test]
+fn answers_with_no_credits_are_bounded_and_end_the_link() {
+    let mut b = Bench::new();
+    b.radio.phone_connects();
+    b.settle();
+    // A read by type, which always has an answer. The radio is stalled: nothing returns credits.
+    let request = acl_from_peer(&l2cap(CID_ATT, &[0x08, 6, 0, 11, 0, 0x03, 0x28]));
+    let mut most = 0;
+    for _ in 0..10_000 {
+        b.engine.on_hci(&request, b.now);
+        let out = b.engine.hci_output().to_vec();
+        b.engine.hci_written(out.len());
+        b.radio.from_host(&out);
+        most = most.max(b.engine.control.len());
+    }
+    assert!(most <= CONTROL_QUEUE_MAX, "{most} answers queued");
+    b.settle();
+    assert!(!b.radio.connected(), "the link was not cut");
+    assert_eq!(b.engine.control.len(), 0);
+}
+
+#[test]
+fn a_well_behaved_peer_never_gets_near_the_answer_limit() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    for _ in 0..200 {
+        b.radio.phone_write(b"x");
+        b.air(4);
+        assert!(b.engine.control.len() < CONTROL_QUEUE_MAX);
+    }
+    assert!(b.radio.connected());
+}

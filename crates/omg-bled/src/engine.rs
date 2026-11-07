@@ -60,6 +60,14 @@ const SIG_PARAM_RESPONSE: u8 = 0x13;
 
 /// Longest L2CAP PDU a phone may send: the MTU plus the header.
 const MAX_REASSEMBLY: usize = att::MAX_ATT_PDU + 4;
+/// Answers waiting for controller credits. ATT allows one request at a time, so a peer that gets
+/// this far is not following the protocol while it holds the credits back: the link is cut.
+pub const CONTROL_QUEUE_MAX: usize = 32;
+
+/// At most this many lines per window. A line reaches the console with interrupts off, and what
+/// causes one can be in the hands of whoever is in radio range.
+pub const LOG_LINES_PER_WINDOW: u32 = 20;
+pub const LOG_WINDOW_MS: u64 = 10_000;
 
 /// What the caller must do with the session stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +138,9 @@ pub struct Engine {
     to_session: Vec<u8>,
     actions: Vec<Action>,
     logs: Vec<String>,
+    log_window_ends_ms: u64,
+    log_lines_left: u32,
+    log_lines_dropped: u32,
     fatal: Option<String>,
     started: bool,
     /// Advertising fast, until this time.
@@ -158,6 +169,9 @@ impl Engine {
             to_session: Vec::new(),
             actions: Vec::new(),
             logs: Vec::new(),
+            log_window_ends_ms: now_ms + LOG_WINDOW_MS,
+            log_lines_left: LOG_LINES_PER_WINDOW,
+            log_lines_dropped: 0,
             fatal: None,
             started: false,
             fast_adv_until_ms: None,
@@ -211,6 +225,7 @@ impl Engine {
 
     /// Bytes from the UART.
     pub fn on_hci(&mut self, bytes: &[u8], now_ms: u64) {
+        self.advance_log_window(now_ms);
         self.parser.push(bytes);
         while let Some(packet) = self.parser.next_packet() {
             match packet {
@@ -341,6 +356,7 @@ impl Engine {
 
     /// Time passed.
     pub fn tick(&mut self, now_ms: u64) {
+        self.advance_log_window(now_ms);
         if self.fast_adv_until_ms.is_some_and(|t| now_ms >= t) {
             self.fast_adv_until_ms = None;
             self.cmd(hci::OP_LE_SET_ADV_ENABLE, &[0]);
@@ -370,7 +386,8 @@ impl Engine {
         std::mem::take(&mut self.actions)
     }
 
-    /// Lines for the log. Few: a line reaches the console with interrupts off.
+    /// Lines for the log. Few, and limited per window: a line reaches the console with interrupts
+    /// off.
     pub fn take_logs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.logs)
     }
@@ -391,7 +408,25 @@ impl Engine {
     }
 
     fn log(&mut self, line: String) {
+        if self.log_lines_left == 0 {
+            self.log_lines_dropped += 1;
+            return;
+        }
+        self.log_lines_left -= 1;
         self.logs.push(line);
+    }
+
+    /// Needs no timer: what was dropped is said with the next thing that happens.
+    fn advance_log_window(&mut self, now_ms: u64) {
+        if now_ms < self.log_window_ends_ms {
+            return;
+        }
+        self.log_window_ends_ms = now_ms + LOG_WINDOW_MS;
+        self.log_lines_left = LOG_LINES_PER_WINDOW;
+        let dropped = std::mem::take(&mut self.log_lines_dropped);
+        if dropped > 0 {
+            self.log(format!("{dropped} log lines dropped"));
+        }
     }
 
     /// Moves what may go now to the UART's queue: one command at a time, and ACL against credits.
@@ -462,7 +497,15 @@ impl Engine {
     }
 
     fn send_control(&mut self, cid: u16, payload: &[u8]) {
+        if self.control.len() >= CONTROL_QUEUE_MAX {
+            self.log("too many answers waiting for the radio: cutting the link".to_string());
+            self.cut_link();
+            return;
+        }
         let Some(c) = &self.conn else { return };
+        if c.cutting {
+            return;
+        }
         self.control
             .push_back(hci::acl_fragments(c.handle, cid, payload, self.acl_len));
     }
@@ -624,7 +667,8 @@ impl Engine {
 
     fn on_acl(&mut self, handle_flags: u16, data: &[u8], now_ms: u64) {
         let Some(c) = &mut self.conn else { return };
-        if handle_flags & 0x0FFF != c.handle {
+        // Going anyway: nothing it says now gets an answer, or a line in the log.
+        if handle_flags & 0x0FFF != c.handle || c.cutting {
             return;
         }
         // Packet boundary 01 continues; anything else starts a PDU.
@@ -638,7 +682,8 @@ impl Engine {
         let need = 4 + u16::from_le_bytes([c.reassembly[0], c.reassembly[1]]) as usize;
         if need > MAX_REASSEMBLY {
             c.reassembly.clear();
-            self.log("dropped an L2CAP PDU over the limit".to_string());
+            self.log("an L2CAP PDU over the limit: cutting the link".to_string());
+            self.cut_link();
             return;
         }
         if c.reassembly.len() < need {

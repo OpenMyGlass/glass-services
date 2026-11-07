@@ -4,7 +4,17 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::{Arc, Mutex};
 
-/// What the system answers. `lease`: the address `ip` reports once a supplicant started.
+/// One process of the model.
+struct Proc {
+    cmdline: String,
+    /// It is gone from this time on.
+    gone_at: Option<u64>,
+    /// `SIGTERM` does nothing to it.
+    ignores_term: bool,
+}
+
+/// What the system answers. Processes are kept here: what the shell would start is added, with
+/// its pid file, `kill` ends them, and `ip` shows the lease while a DHCP client runs.
 #[derive(Default)]
 struct World {
     log: Vec<String>,
@@ -14,14 +24,55 @@ struct World {
     lease: Option<String>,
     /// The test's clock.
     now: u64,
-    /// When the old supplicant was told to go. Until it has, it holds the control socket.
-    supplicant_killed_at: Option<u64>,
+    procs: std::collections::BTreeMap<u32, Proc>,
+    next_pid: u32,
 }
 
-/// How long the old supplicant takes to go, in this model. Under the 2 s the session waits.
+/// How long a supplicant takes to go after `SIGTERM`, in this model; until then it holds the
+/// control socket. Under the 2 s the session waits.
 const SUPPLICANT_EXIT_US: u64 = 1_000_000;
 
+impl World {
+    fn alive(&self, pid: u32) -> Option<&Proc> {
+        self.procs
+            .get(&pid)
+            .filter(|p| p.gone_at.is_none_or(|t| self.now < t))
+    }
+
+    fn running(&self, needle: &str) -> bool {
+        self.procs
+            .keys()
+            .any(|&pid| self.alive(pid).is_some_and(|p| p.cmdline.contains(needle)))
+    }
+
+    /// Starts a process; its pid goes into `pid_file`.
+    fn spawn(&mut self, cmdline: &str, pid_file: &str) -> u32 {
+        self.next_pid += 1;
+        let pid = 7000 + self.next_pid;
+        self.procs.insert(
+            pid,
+            Proc {
+                cmdline: cmdline.into(),
+                gone_at: None,
+                ignores_term: false,
+            },
+        );
+        std::fs::write(pid_file, format!("{pid}\n")).unwrap();
+        pid
+    }
+}
+
 type SharedWorld = Arc<Mutex<World>>;
+
+/// The word after `flag` in `line`.
+fn arg_after<'a>(line: &'a str, flag: &str) -> &'a str {
+    line.split(flag)
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+}
 
 fn runner(world: SharedWorld) -> Runner {
     Box::new(move |p, a| {
@@ -35,26 +86,63 @@ fn runner(world: SharedWorld) -> Runner {
             ok: true,
             stdout: String::new(),
         };
+        let now = w.now;
         if line.contains("command -v") {
             out.ok = !w.no_tools;
         } else if line.contains("link set wlan0 up") {
             out.ok = !w.link_up_fails;
-        } else if line.contains("glassd-wpa_supplicant.pid") && line.contains("kill") {
-            w.supplicant_killed_at = Some(w.now);
+        } else if let Some(sig) = line.strip_prefix("kill ") {
+            let mut words = sig.split_whitespace();
+            let signal = words.next().unwrap();
+            for pid in words.map(|p| p.parse::<u32>().unwrap()) {
+                if let Some(proc_) = w.procs.get_mut(&pid) {
+                    let delay = if proc_.cmdline.starts_with("wpa_supplicant") {
+                        SUPPLICANT_EXIT_US
+                    } else {
+                        0
+                    };
+                    if signal == "-KILL" {
+                        proc_.gone_at = Some(now);
+                    } else if !proc_.ignores_term && proc_.gone_at.is_none() {
+                        proc_.gone_at = Some(now + delay);
+                    }
+                }
+            }
         } else if line.starts_with("wpa_supplicant") {
-            out.ok = w
-                .supplicant_killed_at
-                .is_none_or(|at| w.now >= at + SUPPLICANT_EXIT_US);
+            // The control socket is one per interface.
+            out.ok = !w.running("wpa_supplicant");
+            if out.ok {
+                let pid_file = arg_after(&line, "-P ").to_string();
+                w.spawn(&line, &pid_file);
+            }
+        } else if line.starts_with("sh -c udhcpc") {
+            let pid_file = arg_after(&line, "-p ").to_string();
+            w.spawn(line.trim_start_matches("sh -c "), &pid_file);
+        } else if line.contains("hostapd -e") || line.contains("udhcpd -f") {
+            let pid_file = arg_after(&line, "echo $! >").to_string();
+            w.spawn(line.trim_start_matches("sh -c timeout -s TERM "), &pid_file);
         } else if line.contains("dmesg") {
             out.stdout = w.firmware_line.clone().unwrap_or_default();
-        } else if line.starts_with("ip -4 -o addr show") {
-            let started = w.log.iter().any(|c| c.starts_with("wpa_supplicant"));
-            if let (true, Some(ip)) = (started, &w.lease) {
-                out.stdout = format!("3: wlan0 inet {ip}/24 brd x scope global");
-            }
+        } else if line.starts_with("ip -4 -o addr show")
+            && let (true, Some(ip)) = (w.running("udhcpc"), &w.lease)
+        {
+            out.stdout = format!("3: wlan0 inet {ip}/24 brd x scope global");
         }
         Ok(out)
     })
+}
+
+fn processes(world: SharedWorld) -> crate::radio::Processes {
+    Box::new(move |pid| {
+        let w = world.lock().unwrap();
+        w.alive(pid.parse().ok()?).map(|p| p.cmdline.clone())
+    })
+}
+
+fn radio(world: &SharedWorld, root: &std::path::Path) -> Radio {
+    Radio::with_runner("wlan0", runner(world.clone()))
+        .with_wifi_conf(root.join("wifi.conf"))
+        .with_processes(processes(world.clone()), root)
 }
 
 struct Rig {
@@ -97,7 +185,7 @@ impl Rig {
             ..Default::default()
         }));
         let conf = root.join("wifi.conf");
-        let radio = Radio::with_runner("wlan0", runner(world.clone())).with_wifi_conf(conf.clone());
+        let radio = radio(&world, root);
         let setup = WifiSetup::new(config(root));
         Rig {
             _dir: dir,
@@ -111,8 +199,7 @@ impl Rig {
 
     /// The daemon died and started again: a new radio and a new session, knowing only the files.
     fn restart(&mut self) -> Update {
-        self.radio = Radio::with_runner("wlan0", runner(self.world.clone()))
-            .with_wifi_conf(self.conf.clone());
+        self.radio = radio(&self.world, self._dir.path());
         self.setup = WifiSetup::new(config(self._dir.path()));
         self.world.lock().unwrap().log.clear();
         self.setup.cleanup_stale(&mut self.radio, self.now)
@@ -133,6 +220,7 @@ impl Rig {
     }
 
     fn start(&mut self) -> Update {
+        self.world.lock().unwrap().now = self.now;
         self.setup.start(&mut self.radio, Self::ctx(), self.now)
     }
 
@@ -583,16 +671,26 @@ fn hostapd_dying_while_it_starts_ends_the_session() {
 fn a_daemon_that_ignores_term_gets_kill() {
     let mut r = Rig::new();
     r.serve();
-    let me = std::process::id();
-    let pid = r.setup.cfg.paths.run_dir.join("hostapd.pid");
-    std::fs::write(pid, format!("{me}\n")).unwrap();
+    let pid: u32 = std::fs::read_to_string(r.setup.cfg.paths.run_dir.join("hostapd.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    r.world
+        .lock()
+        .unwrap()
+        .procs
+        .get_mut(&pid)
+        .unwrap()
+        .ignores_term = true;
     r.setup.stop(&mut r.radio, r.now);
     r.until(WifiSetupPhase::Off);
     let c = r.cmds();
     let at = |n: &str| c.iter().position(|l| l.contains(n)).expect(n);
-    assert_eq!(c[at("kill -TERM")], format!("kill -TERM {me}"));
-    assert_eq!(c[at("kill -KILL")], format!("kill -KILL {me}"));
+    assert!(c[at("kill -TERM")].contains(&pid.to_string()));
+    assert_eq!(c[at("kill -KILL")], format!("kill -KILL {pid}"));
     assert!(at("kill -TERM") < at("kill -KILL"));
+    assert!(!r.world.lock().unwrap().running("hostapd"));
 }
 
 #[test]
@@ -601,10 +699,6 @@ fn a_network_that_works_is_kept_and_the_access_point_is_gone_first() {
     std::fs::write(&r.conf, "old").unwrap();
     let s = r.serve();
     r.world.lock().unwrap().lease = Some("192.168.1.50".into());
-    // The recording runner starts nothing, so what the shell would have left is put here. The
-    // pid of a process that exists, since the session checks; the kill is only recorded.
-    let pid = r.setup.cfg.paths.run_dir.join("hostapd.pid");
-    std::fs::write(pid, format!("{}\n", std::process::id())).unwrap();
 
     let u = r.send_form(&s, good);
     let joining = u.state.unwrap();
@@ -771,12 +865,9 @@ fn a_session_left_by_a_dead_daemon_is_ended_at_start_with_the_waits() {
             !at_once.iter().any(|l| l.contains("link set wlan0 down")),
             "{stage}: the first wait comes first: {at_once:?}"
         );
-        assert_eq!(
-            at_once
-                .iter()
-                .any(|l| l.contains("glassd-wpa_supplicant.pid")),
-            joining,
-            "{stage}: {at_once:?}"
+        assert!(
+            !joining || at_once.iter().any(|l| l.starts_with("kill -TERM")),
+            "{stage}: the left supplicant is told to go: {at_once:?}"
         );
 
         // The radio stays with the cleanup, whatever the settings say.
@@ -789,6 +880,12 @@ fn a_session_left_by_a_dead_daemon_is_ended_at_start_with_the_waits() {
         let (_, finished) = r.until(WifiSetupPhase::Off);
         assert_eq!(finished, Some(Finished::Restore), "{stage}");
         assert!(r.now >= start + 4_000_000, "{stage}: 2 s and 2 s");
+        {
+            let w = r.world.lock().unwrap();
+            for left in ["hostapd", "udhcpd", "wpa_supplicant", "udhcpc"] {
+                assert!(!w.running(left), "{stage}: {left} still runs");
+            }
+        }
         assert!(!run.exists(), "{stage}");
         assert_eq!(
             std::fs::read_to_string(&r.setup.cfg.paths.firmware_param).unwrap(),
@@ -812,8 +909,6 @@ fn a_session_left_by_a_dead_daemon_is_ended_at_start_with_the_waits() {
     }
     check("serving", |r| {
         r.serve();
-        let run = r.setup.cfg.paths.run_dir.clone();
-        std::fs::write(run.join("hostapd.pid"), "4242\n").unwrap();
     });
     check("starting", |r| {
         r.start();
@@ -842,30 +937,68 @@ fn nothing_left_means_nothing_done_at_start() {
 
 #[test]
 fn an_exit_ends_the_session_at_any_stage() {
-    let mut r = Rig::new();
-    r.setup.cfg.timeouts.settle_us = 1;
-    r.serve();
-    let run = r.setup.cfg.paths.run_dir.clone();
-    r.setup.shutdown(&mut r.radio);
-    assert!(!r.setup.active());
-    assert!(!run.exists());
-
-    let mut r = Rig::new();
-    r.setup.cfg.timeouts.settle_us = 1;
-    let s = r.serve();
-    r.send_form(&s, good);
-    while !matches!(r.setup.phase, Phase::Joining { .. }) {
-        r.step();
+    fn check(stage: &str, prepare: impl Fn(&mut Rig)) {
+        let mut r = Rig::new();
+        std::fs::write(&r.conf, "old").unwrap();
+        prepare(&mut r);
+        r.setup.cfg.timeouts.settle_us = 1;
+        assert!(r.setup.active(), "{stage}");
+        r.setup.shutdown(&mut r.radio);
+        // What the daemon does after it, and what any next start would see.
+        r.radio.set_wifi(false);
+        assert!(!r.setup.active(), "{stage}");
+        assert!(!r.setup.cfg.paths.run_dir.exists(), "{stage}");
+        assert!(!r.setup.tried_conf().exists(), "{stage}");
+        assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old", "{stage}");
+        r.world.lock().unwrap().now += SUPPLICANT_EXIT_US;
+        let w = r.world.lock().unwrap();
+        for left in ["hostapd", "udhcpd", "wpa_supplicant", "udhcpc"] {
+            assert!(!w.running(left), "{stage}: {left} still runs");
+        }
     }
-    let tried = r.setup.tried_conf();
-    assert!(tried.exists());
-    r.setup.shutdown(&mut r.radio);
-    assert!(!tried.exists());
-    assert!(
-        r.cmds()
-            .iter()
-            .any(|l| l.contains("glassd-wpa_supplicant.pid"))
-    );
+    check("settling", |r| {
+        r.start();
+    });
+    check("starting", |r| {
+        r.start();
+        r.step();
+        r.step();
+    });
+    check("serving", |r| {
+        r.serve();
+    });
+    let send = |r: &mut Rig| {
+        let s = r.serve();
+        r.send_form(&s, good);
+    };
+    check("flushing", send);
+    check("leaving to join", |r| {
+        send(r);
+        r.step();
+    });
+    check("joining", |r| {
+        send(r);
+        while !matches!(r.setup.phase, Phase::Joining { .. }) {
+            r.step();
+        }
+        assert!(r.world.lock().unwrap().running("wpa_supplicant"));
+    });
+    check("leaving after a failed join", |r| {
+        send(r);
+        while !matches!(r.setup.phase, Phase::Joining { .. }) {
+            r.step();
+        }
+        while matches!(r.setup.phase, Phase::Joining { .. }) {
+            r.step();
+        }
+        assert!(matches!(
+            r.setup.phase,
+            Phase::Leaving {
+                then: Then::Restore { error: Some(_), .. },
+                ..
+            }
+        ));
+    });
 
     // No session: nothing to do, and no wait.
     let mut r = Rig::new();
@@ -873,11 +1006,96 @@ fn an_exit_ends_the_session_at_any_stage() {
     assert!(r.cmds().is_empty());
 }
 
+/// A supplicant and a DHCP client left by an earlier run (a crash, an update) that this radio
+/// knows only by their pid files.
+fn left_running(r: &mut Rig) {
+    let root = r._dir.path().to_path_buf();
+    let mut w = r.world.lock().unwrap();
+    let wpa = root.join("glassd-wpa_supplicant.pid");
+    let dhcp = root.join("glassd-udhcpc.pid");
+    w.spawn(
+        &format!("wpa_supplicant -B -i wlan0 -c old -P {}", wpa.display()),
+        &wpa.to_string_lossy(),
+    );
+    w.spawn(
+        &format!("udhcpc -b -i wlan0 -p {}", dhcp.display()),
+        &dhcp.to_string_lossy(),
+    );
+}
+
+#[test]
+fn a_supplicant_left_running_is_stopped_and_the_network_is_joined_after_it() {
+    let mut r = Rig::new();
+    std::fs::write(&r.conf, "old").unwrap();
+    left_running(&mut r);
+    r.radio.apply(true, false);
+    let c = r.cmds();
+    assert!(
+        c.iter().any(|l| l.starts_with("kill -TERM 7001 7002")),
+        "{c:?}"
+    );
+    // It fails while the old one goes, and the retry gets it.
+    let mut now = r.now;
+    for _ in 0..5 {
+        r.radio.association_tick(now);
+        now += 1_000_000;
+        r.world.lock().unwrap().now = now;
+    }
+    let w = r.world.lock().unwrap();
+    assert!(!w.alive(7001).is_some(), "the old one is gone");
+    let ours = w
+        .procs
+        .iter()
+        .filter(|(pid, p)| **pid > 7002 && p.cmdline.starts_with("wpa_supplicant"))
+        .count();
+    assert_eq!(ours, 1, "a new one runs");
+}
+
+#[test]
+fn a_session_does_not_run_beside_a_supplicant_left_running() {
+    let mut r = Rig::new();
+    left_running(&mut r);
+    // A stale DHCP client renewing a lease from the old network must not look like the new one.
+    r.world.lock().unwrap().lease = Some("192.168.1.50".into());
+    r.serve();
+    let c = r.cmds();
+    let at = |n: &str| c.iter().position(|l| l.contains(n)).expect(n);
+    assert!(at("kill -TERM 7001 7002") < at("link set wlan0 up"));
+    r.world.lock().unwrap().now = r.now + SUPPLICANT_EXIT_US;
+    assert!(!r.world.lock().unwrap().running("wpa_supplicant"));
+    assert!(!r.world.lock().unwrap().running("udhcpc"));
+}
+
+#[test]
+fn an_address_on_the_access_points_subnet_is_not_a_lease() {
+    let mut r = Rig::new();
+    std::fs::write(&r.conf, "old").unwrap();
+    let s = r.serve();
+    r.world.lock().unwrap().lease = Some("192.168.77.1".into());
+    r.send_form(&s, good);
+    let (end, _) = r.until(WifiSetupPhase::Failed);
+    assert_eq!(end.error, ERR_JOIN);
+    assert_eq!(std::fs::read_to_string(&r.conf).unwrap(), "old");
+}
+
 #[test]
 fn the_pid_files_cannot_be_turned_into_arguments() {
     let mut r = Rig::new();
     r.serve();
     let run = r.setup.cfg.paths.run_dir.clone();
+    let hostapd = format!("hostapd -e x {}", run.join("hostapd.conf").display());
+    let udhcpd = format!(
+        "busybox-extras udhcpd -f {}",
+        run.join("udhcpd.conf").display()
+    );
+    for (pid, cmdline) in [(12, hostapd), (34, udhcpd)] {
+        let p = Proc {
+            cmdline,
+            gone_at: None,
+            ignores_term: false,
+        };
+        r.world.lock().unwrap().procs.insert(pid, p);
+    }
     std::fs::write(run.join("hostapd.pid"), "12 -9 ; x\n").unwrap();
     std::fs::write(run.join("udhcpd.pid"), "34\n").unwrap();
     r.radio.ap_stop_daemons(&r.setup.cfg.paths);

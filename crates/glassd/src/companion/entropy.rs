@@ -53,6 +53,14 @@ pub fn entropy_avail(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Whether a secret may be drawn now with no companion to say so: `/dev/random` readable, so the
+/// `getrandom` crate will not block, and as many credited bits as a first identity needs.
+pub fn ready_for_a_secret() -> bool {
+    let readable =
+        PoolWait::open(Path::new(RANDOM_DEVICE)).is_ok_and(|w| w.seeded().unwrap_or(false));
+    readable && entropy_avail(Path::new(ENTROPY_AVAIL)).is_some_and(|b| b >= MIN_BITS_FOR_IDENTITY)
+}
+
 /// The seed's name in the state directory.
 pub const SEED_FILE: &str = "random-seed";
 /// Where a seed goes in. Writing mixes it into the pool without crediting it.

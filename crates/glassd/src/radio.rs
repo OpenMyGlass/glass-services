@@ -254,6 +254,23 @@ pub struct Outcome {
     pub stdout: String,
 }
 
+/// The command line of a running process, by pid, with its arguments joined by spaces; `None` if
+/// there is no such process. Injected so the tests can say what runs.
+pub type Processes = Box<dyn Fn(&str) -> Option<String> + Send>;
+
+fn system_processes(pid: &str) -> Option<String> {
+    let raw = std::fs::read(std::path::Path::new("/proc").join(pid).join("cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&raw).replace('\0', " "))
+}
+
+/// The whole numbers in a pid file: nothing else may become an argument of `kill`.
+pub(crate) fn pids_in(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Runs a system command `program args...`. An `Err` means the process could not be run at all
 /// (the tool is absent); `Ok` with `ok = false` means it ran and failed.
 pub type Runner = Box<dyn FnMut(&str, &[&str]) -> io::Result<Outcome> + Send>;
@@ -261,6 +278,10 @@ pub type Runner = Box<dyn FnMut(&str, &[&str]) -> io::Result<Outcome> + Send>;
 /// Switches the Wi-Fi and Bluetooth radios.
 pub struct Radio {
     run: Runner,
+    procs: Processes,
+    /// Where `wpa_supplicant` and `udhcpc` write their pids.
+    wpa_pid: std::path::PathBuf,
+    dhcp_pid: std::path::PathBuf,
     wifi_iface: String,
     bt_hci: String,
     /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
@@ -444,10 +465,52 @@ impl Radio {
         self
     }
 
+    /// Reads what runs through `procs` instead of `/proc`, and keeps the pid files in `dir`.
+    pub fn with_processes(mut self, procs: Processes, dir: &std::path::Path) -> Radio {
+        self.procs = procs;
+        self.wpa_pid = dir.join("glassd-wpa_supplicant.pid");
+        self.dhcp_pid = dir.join("glassd-udhcpc.pid");
+        self
+    }
+
+    /// The pids in `file` of processes still running with `marker` in their command line. A pid
+    /// file outlives its process, and the pid can be another process's by now.
+    pub(crate) fn live_pids(&self, file: &std::path::Path, marker: &str) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Vec::new();
+        };
+        pids_in(&text)
+            .into_iter()
+            .filter(|p| (self.procs)(p).is_some_and(|c| c.contains(marker)))
+            .collect()
+    }
+
+    /// Sends `signal` to the live processes of these pid files. Returns whether there were any.
+    pub(crate) fn signal_pid_files(
+        &mut self,
+        signal: &str,
+        files: &[(&std::path::Path, &str)],
+    ) -> bool {
+        let pids: Vec<String> = files
+            .iter()
+            .flat_map(|(f, marker)| self.live_pids(f, marker))
+            .collect();
+        if pids.is_empty() {
+            return false;
+        }
+        let mut args = vec![signal];
+        args.extend(pids.iter().map(String::as_str));
+        self.step("kill", &args);
+        true
+    }
+
     /// A radio with a custom runner.
     pub fn with_runner(wifi_iface: impl Into<String>, run: Runner) -> Radio {
         Radio {
             run,
+            procs: Box::new(system_processes),
+            wpa_pid: WPA_PID_FILE.into(),
+            dhcp_pid: DHCP_PID_FILE.into(),
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
             bt_uart: None,
@@ -800,6 +863,7 @@ impl Radio {
         }
         let iface = self.wifi_iface.clone();
         let conf_arg = conf.to_string_lossy().into_owned();
+        let pid_arg = self.wpa_pid.to_string_lossy().into_owned();
         let started = self.step(
             "wpa_supplicant",
             &[
@@ -811,12 +875,16 @@ impl Radio {
                 "-c",
                 &conf_arg,
                 "-P",
-                WPA_PID_FILE,
+                &pid_arg,
             ],
         );
         // An old one that is still going holds the control socket, and this one exits at once.
-        // Nothing else would ever try again.
+        // One that an earlier run left (a crash, an update, an exit) is not ours to know of but
+        // by its pid file: it goes, and the next try comes after it has.
         if !started {
+            if self.kill_association_by_files() {
+                warn!("radio: stopped a supplicant left by an earlier run");
+            }
             self.assoc_failures += 1;
             return;
         }
@@ -824,7 +892,10 @@ impl Radio {
         self.assoc_retry_at_us = None;
         // Through a shell, with the output closed: the runner waits for its pipe to close, and
         // udhcpc stays in the foreground until it has a lease.
-        let dhcp = format!("udhcpc -b -i {iface} -p {DHCP_PID_FILE} >/dev/null 2>&1 &");
+        let dhcp = format!(
+            "udhcpc -b -i {iface} -p {} >/dev/null 2>&1 &",
+            self.dhcp_pid.display()
+        );
         self.step("sh", &["-c", &dhcp]);
         self.associating = true;
         info!("radio: joining Wi-Fi on {iface}");
@@ -891,21 +962,17 @@ impl Radio {
         self.wifi_conf = Some(conf);
     }
 
-    /// Stops a supplicant and a DHCP client that another run of the daemon left, which this one
-    /// knows of only by their pid files.
-    pub(crate) fn stop_stale_association(&mut self) {
+    /// Stops the supplicant and the DHCP client, by their pid files: also those of an earlier run,
+    /// which this one did not start and would otherwise run beside.
+    pub(crate) fn stop_association(&mut self) {
         self.associating = false;
-        let kill =
-            format!("kill $(cat {WPA_PID_FILE} {DHCP_PID_FILE} 2>/dev/null) 2>/dev/null; true");
-        self.step("sh", &["-c", &kill]);
+        self.kill_association_by_files();
     }
 
-    pub(crate) fn stop_association(&mut self) {
-        if !std::mem::take(&mut self.associating) {
-            return;
-        }
-        let kill = format!("kill $(cat {WPA_PID_FILE} {DHCP_PID_FILE}) 2>/dev/null");
-        self.step("sh", &["-c", &kill]);
+    fn kill_association_by_files(&mut self) -> bool {
+        let (wpa, dhcp) = (self.wpa_pid.clone(), self.dhcp_pid.clone());
+        let (wpa_s, dhcp_s) = (wpa.to_string_lossy(), dhcp.to_string_lossy());
+        self.signal_pid_files("-TERM", &[(&wpa, &wpa_s), (&dhcp, &dhcp_s)])
     }
 
     /// The Wi-Fi interface's IPv4 address, if it has one.
@@ -968,7 +1035,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let conf = d.path().join(WIFI_CONF_FILE);
         let (r, log) = with_log();
-        let mut r = r.with_wifi_conf(&conf);
+        // The supplicant runs once started: its pid file then names it.
+        let pid_dir = d.path().to_path_buf();
+        let mut r = r.with_wifi_conf(&conf).with_processes(
+            Box::new(move |pid| {
+                (pid == "4242").then(|| {
+                    pid_dir
+                        .join("glassd-wpa_supplicant.pid")
+                        .display()
+                        .to_string()
+                })
+            }),
+            d.path(),
+        );
         r.apply(true, false);
         assert!(
             !log.lock()
@@ -996,9 +1075,14 @@ mod tests {
                 .any(|c| c.contains("udhcpc -b -i wlan0") && c.ends_with('&'))
         );
 
+        std::fs::write(d.path().join("glassd-wpa_supplicant.pid"), "4242\n").unwrap();
         log.lock().unwrap().clear();
         r.apply(false, false);
         let stopped = log.lock().unwrap().clone();
+        assert!(
+            stopped.contains(&"kill -TERM 4242".to_string()),
+            "{stopped:?}"
+        );
         let kill = stopped.iter().position(|c| c.contains("kill")).unwrap();
         let down = stopped
             .iter()

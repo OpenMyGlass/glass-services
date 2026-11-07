@@ -45,11 +45,11 @@ Off -> Settling -> Starting -> Serving -> Flushing -> Leaving -> Joining -> Off
 | Serving | Address, DHCP, the page; state with name, password, address | **10 min** |
 | Flushing | A form was accepted: its answer goes out. The password leaves the state at once | 1.5 s |
 | Leaving | `SIGTERM` to the daemons, wait, `SIGKILL` to what is left, address flushed, link down, firmware name restored, files deleted, wait | 2 s + 2 s |
-| Joining | `wpa_supplicant` and `udhcpc` on `wifi.conf.try`; a lease and a stored file mean success | 60 s |
+| Joining | `wpa_supplicant` and `udhcpc` on `wifi.conf.try`; a lease outside `192.168.77.0/24` and a stored file mean success | 60 s |
 
 The end is always one of these:
 - **Joined:** `wifi.conf.try` is renamed to `wifi.conf` and `wifi_enabled` turns on.
-- **Failed:** the tried file is deleted and the previous `wifi.conf` was never touched, so a typo cannot lose a working network. After 2 s for the supplicant to go, the radio goes back to what the settings say. A supplicant started before the old one has gone cannot get the control socket: it exits, and glassd tries again every 2 s, up to 5 times.
+- **Failed:** the tried file is deleted and the previous `wifi.conf` was never touched, so a typo cannot lose a working network. After 2 s for the supplicant to go, the radio goes back to what the settings say. A supplicant started before the old one has gone cannot get the control socket: it exits, and glassd tries again every 2 s, up to 5 times. Stopping the supplicant and the DHCP client always goes by their pid files, so one left by an earlier run of glassd (a crash, an update, an exit) is stopped as well, at the start of a session and on a failed start, instead of holding the control socket for ever or renewing a lease that would look like the new network's.
 - If the network works and the file cannot be stored, that is a failure too (`files`): "joined" says it is kept.
 - A cancel, the setting going off, or airplane mode work at any stage. In the 4 s before a join they stop the join. Airplane mode takes up to about 4 s to reach the Wi-Fi radio, for a clean stop.
 
@@ -58,13 +58,13 @@ While a session runs:
 - the system does not suspend (`PowerPolicy::set_held`) and the off-head power-off waits. The behaviour of AP mode in suspend is unknown and a session is short;
 - the companion's TCP listener and TCP connections are closed (section 4).
 
-**If the daemon goes away.** `SIGTERM` and `SIGINT` end the session, then the daemon. After a `SIGKILL` or a crash nothing tells the daemons, so they are bounded by themselves: `timeout -s TERM {limit}`, a limit of about 660 s, a whole session plus a margin. So the access point can outlive the daemon by at most that, with its password. A restart ends it sooner: the next start finds the session's files (`cleanup_stale`) and ends it, with the same waits, before the settings drive the radio. That includes a crash while joining, which leaves a supplicant with the typed password: the tried file gives it away, and the pid files say which. A timed-out `hostapd` with no daemon leaves the firmware up in AP mode with nothing on it until the next start.
+**If the daemon goes away.** `SIGTERM` and `SIGINT` end the session, stop the supplicant and turn Wi-Fi off, then end the daemon. After a `SIGKILL` or a crash nothing tells the daemons, so they are bounded by themselves: `timeout -s TERM {limit}`, a limit of about 660 s, a whole session plus a margin. So the access point can outlive the daemon by at most that, with its password. A restart ends it sooner: the next start finds the session's files (`cleanup_stale`) and ends it, with the same waits, before the settings drive the radio. That includes a crash while joining, which leaves a supplicant with the typed password: the tried file gives it away, and the pid files say which. Before each signal the pid must be a process with this session's file in its command line (`/proc/<pid>/cmdline`): a pid file can outlive its process, and the pid be another root process's by then. The preflight requires busybox's `timeout`, which becomes the program, so `$!` is hostapd's pid; GNU `timeout` stays as its parent, and is refused (`no-tools`). A timed-out `hostapd` with no daemon leaves the firmware up in AP mode with nothing on it until the next start.
 
 ## 4. Security
 
 **The access point password.** 12 characters from a 31-character alphabet without `0 o 1 l i`, by rejection sampling: about 59 bits. New for each session, never fixed, shown only through `WifiSetupState`. WPA2-PSK can be attacked offline from a captured handshake, and that would expose the typed password if the traffic was recorded too, so it has to resist for good and not just for ten minutes. At an assumed 10^6 PBKDF2 guesses a second (not measured) 59 bits takes about 18,000 years. It stays typable on a phone. The SSID is `OMG-Glass-xxxx`, random per session, not from the MAC.
 
-**Randomness.** On 3.4 the `getrandom` crate would block the whole daemon on an unseeded pool, and the password would be weak on a thin one. A session needs `Companion::rng_ready`, the same gate as the identity. Otherwise `not-ready`. So `--companion off` means no session. Limit: on a later boot with no seed file (after a power cut between using one seed and saving the next) that gate is only "`/dev/random` readable". The link mixes its identity's secret in for that case; this password does not.
+**Randomness.** On 3.4 the `getrandom` crate would block the whole daemon on an unseeded pool, and the password would be weak on a thin one. A session needs `Companion::rng_ready`, the same gate as the identity, or, without the companion or before it is ready, the same test made directly: `/dev/random` readable and at least 256 credited bits. Otherwise `not-ready`. An idle Glass with Wi-Fi off gets there in minutes; one scanning may not (the note in `companion/entropy.rs`). Limit: on a later boot with no seed file (after a power cut between using one seed and saving the next) that gate is only "`/dev/random` readable". The link mixes its identity's secret in for that case; this password does not.
 
 **No logging.**
 - The access point password is in a 0600 file in a 0700 directory in `/var/run`, removed at the end, and never on a command line: `Radio::step` logs arguments on failure and `/proc` shows them.
@@ -102,9 +102,10 @@ There is no second confirmation of the network on the Glass. With the gate, the 
 - `ClientFrame.wifi_setup = WifiSetupRequest{start}`.
 - `TOPIC_WIFI_SETUP`: `WifiSetupState{phase, ssid, password, url, seconds_left, clients, network, error, snapshot}`. See `proto/glass/services/v1/services.proto` for the phases and error codes.
 - `seconds_left` is from when the frame was made, so a snapshot's is as old as the last change.
+- The hostapd log is read from where it got to and never cut while hostapd writes it, which could lose a line; past 4 MiB the session ends (`ap`).
 - `clients` comes from hostapd's log: `iw station dump` lists nothing on this driver (`sta=` empty in `kmsg_ap4`, with a client on).
 
-Image needs: `hostapd` with libnl3 and libssl/libcrypto, `busybox-extras` (Alpine's busybox has no `udhcpd`), a `timeout` applet (in busybox 1.37 on the image; a coreutils one would forward `SIGTERM` but not `SIGKILL`), and the firmware at `/system/vendor/firmware/fw_bcmdhd.bin`. The firmware is not ours to redistribute and this code only links to it.
+Image needs: `hostapd` with libnl3 and libssl/libcrypto, `busybox-extras` (Alpine's busybox has no `udhcpd`), busybox's `timeout` applet (busybox 1.37 is on the image; a GNU one is refused), and the firmware at `/system/vendor/firmware/fw_bcmdhd.bin`. The firmware is not ours to redistribute and this code only links to it.
 
 ## 6. Launcher, not built
 
@@ -153,11 +154,12 @@ After each boot, keep `/proc/last_kmsg` before any other boot.
 | 11 | Session, send nothing, wait 10 min | `FAILED error=timeout`, hostapd and udhcpd gone, phone loses the network, Wi-Fi back to the setting | The timeout |
 | 12 | Session, cable out, screen off, off head, 10 min | No suspend in kmsg; phone still reaches the page; then suspends normally | The hold |
 | 13 | Session, airplane mode on | AP gone in under 5 s, Wi-Fi blocked | Airplane |
-| 14 | Session, `kill -9` glassd, restart. Again, during `JOINING` of a network that will not answer. Each with `wifi_enabled` on and a good old network | hostapd gone within about 2 s of the restart; `/var/run/glassd-ap` and `wifi.conf.try` gone; no supplicant with the tried file; **it rejoins the old network**; a new session works | Stale cleanup, the rejoin |
+| 14 | Session, `kill -9` glassd, restart. Again, during `JOINING` of a network that will not answer. Each with `wifi_enabled` on and a good old network | hostapd gone within about 2 s of the restart; `/var/run/glassd-ap` and `wifi.conf.try` gone; no supplicant with the tried file; **it rejoins the old network**; a new session works. Also: `kill -9` glassd while associated with no session, restart: one `wpa_supplicant` afterwards (`pgrep -a wpa_supplicant`), associated | Stale cleanup, the rejoin, a supplicant left running |
 | 15 | After 9 and 11: `grep` the last password and a typed one in kmsg, `hostapd.log` before it is deleted (copy during a session) and the glassd log | Not found | No logging, for real |
 | 16 | A phone with a SIM and mobile data on, and an iPhone: join, then the page | Page reachable. If not: section 7.1 | **Owner decision** |
 | 17 | `BLE` companion connected during a session | Link survives or drops, note which. Earlier logs show gaps of 3-4 s with Wi-Fi firmware up | Coexistence |
 | 18 | After 9: `CORE OFF` count over 10 min cable out | Same as before a session | Nothing left awake by the AP |
 | 19 | Session, `kill -9` glassd, do not restart, wait 11 min | hostapd and udhcpd gone by themselves at about 660 s; `ps` showed `$!`'s pid as hostapd itself | The bound, and busybox `timeout` |
-| 20 | Session, `kill -TERM` glassd | glassd exits within about 3 s, AP and files gone, socket gone | The signal |
+| 20 | Session, `kill -TERM` glassd | glassd exits within about 3 s, AP and files gone, socket gone, no `wpa_supplicant` or `udhcpc` left | The signal |
 | 21 | Run a client as another uid (`su nobody`, socket group permitting): `wifi-setup start` | `ERROR_CODE_DENIED`, setting unchanged, no state frame | The gate on 3.4 |
+| 22 | glassd with `--companion off`, idle with Wi-Fi off for 10 min, then `wifi-setup start` | `SERVING`; `cat /proc/sys/kernel/random/entropy_avail` noted at the start | Setup without a companion |

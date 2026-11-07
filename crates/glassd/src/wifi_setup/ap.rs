@@ -167,8 +167,11 @@ impl Radio {
         if !paths.stock_firmware.exists() || !paths.firmware_param.exists() {
             return Err(ApError::NoFirmware);
         }
+        // Busybox's `timeout`, which becomes the program: `$!` is then the program's pid. A GNU one
+        // stays as its parent, and the pid file would name it.
         let tools = "command -v hostapd >/dev/null && command -v busybox-extras >/dev/null \
-                     && command -v timeout >/dev/null";
+                     && t=$(command -v timeout) && b=$(command -v busybox) \
+                     && [ \"$(readlink -f \"$t\")\" = \"$(readlink -f \"$b\")\" ]";
         if !self.step("sh", &["-c", tools]) {
             return Err(ApError::NoTools);
         }
@@ -277,24 +280,30 @@ impl Radio {
     }
 
     /// Whether `hostapd` still runs. Without its pid file (not started yet) it counts as running;
-    /// a file with no pid in it does not: `/proc/` itself always exists.
+    /// with one, the pid must be a process with this session's config in its command line.
     pub fn ap_alive(&self, paths: &ApPaths) -> bool {
-        let Ok(text) = fs::read_to_string(paths.hostapd_pid()) else {
+        if !paths.hostapd_pid().exists() {
             return true;
-        };
-        let pids = pids_in(&text);
-        !pids.is_empty() && pids.iter().all(|p| pid_exists(p))
+        }
+        let conf = paths.file("hostapd.conf");
+        !self
+            .live_pids(&paths.hostapd_pid(), &conf.to_string_lossy())
+            .is_empty()
+    }
+
+    /// The session's daemons by pid file, each with what its command line must have: a pid file
+    /// can outlive its process (`timeout` ended it, or a reboot), and the pid be another's.
+    fn ap_signal(&mut self, paths: &ApPaths, signal: &str) {
+        let (hpid, hconf) = (paths.hostapd_pid(), paths.file("hostapd.conf"));
+        let (dpid, dconf) = (paths.file("udhcpd.pid"), paths.file("udhcpd.conf"));
+        let (h, d) = (hconf.to_string_lossy(), dconf.to_string_lossy());
+        self.signal_pid_files(signal, &[(&hpid, &h), (&dpid, &d)]);
     }
 
     /// Stops the daemons, so that `hostapd` can tell the clients and leave the firmware clean.
     /// Then wait, then [`Radio::ap_teardown`].
     pub fn ap_stop_daemons(&mut self, paths: &ApPaths) {
-        let pids = daemon_pids(paths);
-        if !pids.is_empty() {
-            let mut args = vec!["-TERM"];
-            args.extend(pids.iter().map(String::as_str));
-            self.step("kill", &args);
-        }
+        self.ap_signal(paths, "-TERM");
     }
 
     /// Takes the access point down for good and deletes its files: the address (a join would
@@ -302,15 +311,7 @@ impl Radio {
     pub fn ap_teardown(&mut self, paths: &ApPaths) {
         let iface = self.wifi_iface().to_string();
         // What did not take the hint has had its time.
-        let left: Vec<String> = daemon_pids(paths)
-            .into_iter()
-            .filter(|p| pid_exists(p))
-            .collect();
-        if !left.is_empty() {
-            let mut args = vec!["-KILL"];
-            args.extend(left.iter().map(String::as_str));
-            self.step("kill", &args);
-        }
+        self.ap_signal(paths, "-KILL");
         self.step("ip", &["addr", "flush", "dev", &iface]);
         self.step("ip", &["link", "set", &iface, "down"]);
         // As `echo "" > firmware_path` in the experiments. A lone newline, not nothing: on the
@@ -322,26 +323,6 @@ impl Radio {
             warn!("wifi-setup: cannot remove the session's files ({e})");
         }
     }
-}
-
-/// The whole numbers in a pid file: nothing else may become an argument of `kill`.
-fn pids_in(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
-        .map(str::to_string)
-        .collect()
-}
-
-fn pid_exists(pid: &str) -> bool {
-    Path::new("/proc").join(pid).exists()
-}
-
-fn daemon_pids(paths: &ApPaths) -> Vec<String> {
-    [paths.hostapd_pid(), paths.file("udhcpd.pid")]
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .flat_map(|text| pids_in(&text))
-        .collect()
 }
 
 fn remove_run_dir(dir: &Path) -> io::Result<()> {
@@ -387,22 +368,25 @@ impl LogView {
     }
 }
 
-/// The log, read only where it had got to, and cut short when it gets long: a device going on and
-/// off the access point adds to it for as long as a session runs, in RAM.
+/// The log, read only from where it had got to. It is never cut while hostapd writes it, which
+/// could lose a line; it is in RAM, so one past [`LOG_LIMIT`] ends the session instead. A session
+/// adds a line or two per device going on or off the access point.
 #[derive(Debug, Default)]
 pub struct LogReader {
     offset: u64,
     view: LogView,
 }
 
-/// The log is cut at this size.
+/// Read at most this much at a time.
 const LOG_KEEP: u64 = 64 * 1024;
+/// A log this long is no session's: the access point is ended.
+const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 
 impl LogReader {
     /// What the log says, with what was added since the last call.
     pub fn poll(&mut self, path: &Path) -> LogView {
         use std::io::{Read, Seek, SeekFrom};
-        let Ok(mut file) = fs::File::options().read(true).write(true).open(path) else {
+        let Ok(mut file) = fs::File::open(path) else {
             return self.view;
         };
         let mut new = Vec::new();
@@ -418,10 +402,9 @@ impl LogReader {
         };
         self.view.feed(&String::from_utf8_lossy(&new[..whole]));
         self.offset += whole as u64;
-        // Only with nothing left to read, or the cut would lose it.
-        let at_end = file.metadata().is_ok_and(|m| m.len() == self.offset);
-        if self.offset >= LOG_KEEP && at_end && file.set_len(0).is_ok() {
-            self.offset = 0;
+        if self.offset >= LOG_LIMIT {
+            crate::warn!("wifi-setup: the hostapd log is too long: ending the access point");
+            self.view.disabled = true;
         }
         self.view
     }
@@ -455,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn the_log_is_read_from_where_it_got_to_and_stays_short() {
+    fn the_log_is_read_from_where_it_got_to_and_nothing_is_lost() {
         use std::io::Write;
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("log");
@@ -474,43 +457,90 @@ mod tests {
         assert_eq!(r.poll(&path).clients, 1);
         assert_eq!(r.poll(&path).clients, 1, "a line counts once");
 
-        // Much more than the limit, with the count kept across the cuts.
+        // More than one read's worth between two polls: every line counts.
         for i in 0..20_000 {
             let e = if i % 2 == 0 { "DIS" } else { "" };
             writeln!(w, "wlan0: AP-STA-{e}CONNECTED aa:bb:cc:dd:ee:ff").unwrap();
-            if i % 500 == 0 {
-                r.poll(&path);
-            }
         }
         for _ in 0..50 {
             r.poll(&path);
         }
         assert_eq!(r.poll(&path).clients, 1);
-        assert!(r.poll(&path).enabled);
-        assert!(fs::metadata(&path).unwrap().len() < 2 * LOG_KEEP);
+        assert!(!r.poll(&path).disabled);
         writeln!(w, "wlan0: AP-DISABLED ").unwrap();
-        assert!(
-            r.poll(&path).disabled,
-            "written after a cut, and still found"
-        );
+        assert!(r.poll(&path).disabled);
     }
 
     #[test]
-    fn a_pid_file_without_a_pid_is_not_a_running_daemon() {
+    fn a_log_past_the_limit_ends_the_access_point() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("log");
+        let line = "wlan0: AP-STA-CONNECTED aa:bb:cc:dd:ee:ff\n";
+        fs::write(&path, line.repeat((LOG_LIMIT as usize) / line.len() + 1)).unwrap();
+        let mut r = LogReader::default();
+        for _ in 0..(LOG_LIMIT / LOG_KEEP + 2) {
+            r.poll(&path);
+        }
+        assert!(r.poll(&path).disabled);
+    }
+
+    #[test]
+    fn a_pid_file_names_a_daemon_only_with_its_command_line() {
         let d = tempfile::tempdir().unwrap();
         let paths = ApPaths {
             run_dir: d.path().to_path_buf(),
             firmware_param: d.path().join("p"),
             stock_firmware: d.path().join("f"),
         };
-        let r = Radio::recording("wlan0", Default::default());
+        let conf = paths.file("hostapd.conf").display().to_string();
+        let ours = format!("hostapd -e x {conf}");
+        let r = Radio::recording("wlan0", Default::default()).with_processes(
+            Box::new(move |pid| match pid {
+                "10" => Some(ours.clone()),
+                "11" => Some("/sbin/syslogd -n".into()),
+                _ => None,
+            }),
+            d.path(),
+        );
         assert!(r.ap_alive(&paths), "not started yet");
-        for dead in ["", "\n", "x\n"] {
+        for dead in ["", "\n", "x\n", "99\n", "11\n"] {
             fs::write(paths.hostapd_pid(), dead).unwrap();
             assert!(!r.ap_alive(&paths), "{dead:?}");
         }
-        fs::write(paths.hostapd_pid(), format!("{}\n", std::process::id())).unwrap();
+        fs::write(paths.hostapd_pid(), "10\n").unwrap();
         assert!(r.ap_alive(&paths));
+    }
+
+    #[test]
+    fn a_stale_pid_that_is_another_process_now_gets_no_signal() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = ApPaths {
+            run_dir: d.path().join("ap"),
+            firmware_param: d.path().join("p"),
+            stock_firmware: d.path().join("f"),
+        };
+        fs::create_dir(&paths.run_dir).unwrap();
+        fs::write(paths.hostapd_pid(), "11\n").unwrap();
+        fs::write(paths.file("udhcpd.pid"), "12\n").unwrap();
+        let udhcpd = format!(
+            "busybox-extras udhcpd -f {}",
+            paths.file("udhcpd.conf").display()
+        );
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut r = Radio::recording("wlan0", log.clone()).with_processes(
+            Box::new(move |pid| match pid {
+                "11" => Some("/usr/sbin/sshd -D".into()),
+                "12" => Some(udhcpd.clone()),
+                _ => None,
+            }),
+            d.path(),
+        );
+        r.ap_stop_daemons(&paths);
+        r.ap_teardown(&paths);
+        let log = log.lock().unwrap().clone();
+        assert!(log.contains(&"kill -TERM 12".to_string()), "{log:?}");
+        assert!(log.contains(&"kill -KILL 12".to_string()), "{log:?}");
+        assert!(!log.iter().any(|l| l.contains("11")), "{log:?}");
     }
 
     #[test]

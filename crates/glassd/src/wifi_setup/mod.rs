@@ -319,7 +319,7 @@ impl WifiSetup {
         warn!("wifi-setup: ending a session left by an earlier run");
         radio.hold_wifi();
         if joining {
-            radio.stop_stale_association();
+            radio.stop_association();
             // It holds a password, and was never confirmed.
             let _ = std::fs::remove_file(self.tried_conf());
         }
@@ -716,7 +716,12 @@ impl WifiSetup {
         ssid: String,
         now_us: u64,
     ) -> Update {
-        if radio.wifi_ip().is_some() {
+        // Our own subnet is no lease: it is what the access point had, or a stale client's.
+        let on_ap = |ip: &str| {
+            ip.parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.octets()[..3] == ap::AP_IP.octets()[..3])
+        };
+        if radio.wifi_ip().is_some_and(|ip| !on_ap(&ip)) {
             if let Err(e) = ap::install_conf(&self.tried_conf(), &self.cfg.wifi_conf) {
                 // Saying "joined" would be saying it is kept. And the tried file has the password.
                 warn!("wifi-setup: cannot store the network ({e})");

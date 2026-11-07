@@ -1091,6 +1091,10 @@ impl Daemon {
         if let (Some(w), Some(r)) = (&mut self.wifi_setup, &mut self.radio) {
             w.shutdown(r);
         }
+        // A supplicant left running would hold the control socket against the next run.
+        if let Some(r) = &mut self.radio {
+            r.set_wifi(false);
+        }
         Ok(())
     }
 
@@ -2654,8 +2658,11 @@ impl Daemon {
         let ctx = wifi_setup::Context {
             enabled: s.wifi_setup_ap_enabled.unwrap_or(false),
             airplane: s.airplane_mode.unwrap_or(false),
+            // The companion's gate when it runs; the same test without it, for an owner who has
+            // no phone and runs with --companion off.
             pool_ready: self.mock.is_some()
-                || self.companion.as_ref().is_some_and(|c| c.rng_ready()),
+                || self.companion.as_ref().is_some_and(|c| c.rng_ready())
+                || companion::entropy::ready_for_a_secret(),
             lang: wifi_setup_lang(s.locale),
         };
         let u = match (&mut self.wifi_setup, &mut self.radio) {

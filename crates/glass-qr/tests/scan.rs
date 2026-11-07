@@ -324,7 +324,7 @@ fn junk_codes_cannot_crowd_out_the_real_one() {
     // the frame gives nothing; but nothing else was read, so it does not end the scan.
     let frame = grid_of_codes(&[j, r, j]);
     let f = Frame::new(&frame, 1280, 720, 1280).unwrap();
-    assert!(matches!(Scanner::new().scan(f), Scan::Unaccounted));
+    assert!(matches!(Scanner::new().scan(f), Scan::Unaccounted(Some(t)) if &t[..] == r));
 }
 
 #[test]
@@ -641,7 +641,9 @@ fn outcome(frame: &[u8]) -> &'static str {
         Scan::Setup(t) if t[..] == *full_text().as_bytes() => "real",
         Scan::Setup(_) => "HOSTILE",
         Scan::Ambiguous => "ambiguous",
-        Scan::Unaccounted => "unaccounted",
+        Scan::Unaccounted(None) => "unaccounted",
+        Scan::Unaccounted(Some(t)) if t[..] == *full_text().as_bytes() => "unaccounted, real read",
+        Scan::Unaccounted(Some(_)) => "unaccounted, HOSTILE read",
         Scan::NoCode => "nocode",
         Scan::Refused(_) => "refused",
     }
@@ -654,19 +656,20 @@ fn outcome(frame: &[u8]) -> &'static str {
 fn a_row_of_finder_patterns_cannot_hide_the_real_code() {
     let both = hostile_band_real(|_| {});
     assert_eq!(outcome(&both), "ambiguous", "both codes seen");
-    for lone in [20, 26, 29, 31] {
+    for (lone, want) in [
+        (20, "ambiguous"),
+        (26, "unaccounted, HOSTILE read"),
+        (29, "unaccounted, HOSTILE read"),
+        (31, "unaccounted, HOSTILE read"),
+    ] {
         let frame = hostile_band_real(|f| {
             for i in 0..lone {
                 lone_finder(f, 10 + i * 40, 330, 4);
             }
         });
-        // Ambiguous when both codes are still read, Unaccounted when the row hides the real one;
-        // never an offer.
-        let got = outcome(&frame);
-        assert!(
-            matches!(got, "ambiguous" | "unaccounted"),
-            "{lone} lone: {got}"
-        );
+        // Ambiguous while both codes are still read; Unaccounted once the row hides the real one,
+        // with the hostile text kept as evidence for the session. Never an offer.
+        assert_eq!(outcome(&frame), want, "{lone} lone finder patterns");
     }
 }
 
@@ -719,8 +722,7 @@ fn a_frame_that_uses_up_the_region_labels_is_refused() {
         glass_qr::scan::DECODER_MAX_REGIONS,
         "labels used up"
     );
-    let got = outcome(&frame);
-    assert!(matches!(got, "ambiguous" | "unaccounted"), "{got}");
+    assert_eq!(outcome(&frame), "unaccounted");
 }
 
 fn setup_scan(text: &str) -> Scan {
@@ -790,7 +792,7 @@ fn a_session_that_ever_sees_two_setup_codes_is_refused() {
 }
 
 /// An unaccounted frame neither adds to the streak, nor resets it, nor counts towards the gap,
-/// nor ends the scan.
+/// nor ends the scan, when it holds no other setup text.
 #[test]
 fn a_session_skips_unaccounted_frames() {
     let real = full_text();
@@ -799,10 +801,15 @@ fn a_session_skips_unaccounted_frames() {
         s.feed(setup_scan(&real)),
         SessionStep::Agreeing(1)
     ));
-    for _ in 0..3 * MAX_FRAMES_BETWEEN {
+    for i in 0..3 * MAX_FRAMES_BETWEEN {
+        let skipped = if i % 2 == 0 {
+            None
+        } else {
+            Some(text_of(&real))
+        };
         assert!(matches!(
-            s.feed(Scan::Unaccounted),
-            SessionStep::Scanning(Scan::Unaccounted)
+            s.feed(Scan::Unaccounted(skipped)),
+            SessionStep::Scanning(Scan::Unaccounted(_))
         ));
     }
     assert!(matches!(
@@ -810,10 +817,107 @@ fn a_session_skips_unaccounted_frames() {
         SessionStep::Agreeing(2)
     ));
     assert!(matches!(
-        s.feed(Scan::Unaccounted),
+        s.feed(Scan::Unaccounted(None)),
         SessionStep::Scanning(_)
     ));
     assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Offer(_)));
+}
+
+fn text_of(text: &str) -> zeroize::Zeroizing<Vec<u8>> {
+    zeroize::Zeroizing::new(text.as_bytes().to_vec())
+}
+
+/// The real code read only in a frame that does not count, and another setup code in a frame that
+/// does, in either order: the scan is refused.
+#[test]
+fn a_setup_text_from_an_unaccounted_frame_is_still_evidence() {
+    let (real, hostile) = (full_text(), hostile_text());
+    // Real unaccounted first, then the hostile one counted.
+    let mut s = Session::new();
+    assert!(matches!(
+        s.feed(Scan::Unaccounted(Some(text_of(&real)))),
+        SessionStep::Scanning(_)
+    ));
+    assert!(matches!(s.feed(setup_scan(&hostile)), SessionStep::Refused));
+    // Hostile counted first, then the real one unaccounted.
+    let mut s = Session::new();
+    assert!(matches!(
+        s.feed(setup_scan(&hostile)),
+        SessionStep::Agreeing(1)
+    ));
+    assert!(matches!(
+        s.feed(Scan::Unaccounted(Some(text_of(&real)))),
+        SessionStep::Refused
+    ));
+    // Both only in frames that do not count.
+    let mut s = Session::new();
+    s.feed(Scan::Unaccounted(Some(text_of(&hostile))));
+    assert!(matches!(
+        s.feed(Scan::Unaccounted(Some(text_of(&real)))),
+        SessionStep::Refused
+    ));
+}
+
+/// A hostile streak of 2 built while the real code is hidden; then the real code shows, but only in
+/// frames that do not count. The streak must not be completed.
+#[test]
+fn a_hostile_streak_ends_when_the_real_code_shows_unaccounted() {
+    let (real, hostile) = (full_text(), hostile_text());
+    let mut s = Session::new();
+    assert!(matches!(
+        s.feed(setup_scan(&hostile)),
+        SessionStep::Agreeing(1)
+    ));
+    assert!(matches!(
+        s.feed(setup_scan(&hostile)),
+        SessionStep::Agreeing(2)
+    ));
+    assert!(matches!(
+        s.feed(Scan::Unaccounted(Some(text_of(&real)))),
+        SessionStep::Refused
+    ));
+    assert!(matches!(s.feed(setup_scan(&hostile)), SessionStep::Refused));
+}
+
+/// A streak older than MAX_STREAK_FRAMES, kept alive by skipped frames, is not completed: the
+/// count starts again.
+#[test]
+fn a_stale_streak_is_not_completed() {
+    let real = full_text();
+    let mut s = Session::new();
+    s.feed(setup_scan(&real));
+    s.feed(setup_scan(&real));
+    for _ in 0..MAX_STREAK_FRAMES {
+        s.feed(Scan::Unaccounted(None));
+    }
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(1)
+    ));
+    assert!(matches!(
+        s.feed(setup_scan(&real)),
+        SessionStep::Agreeing(2)
+    ));
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Offer(_)));
+    // Just inside the limit, it is.
+    let mut s = Session::new();
+    s.feed(setup_scan(&real));
+    s.feed(setup_scan(&real));
+    for _ in 0..MAX_STREAK_FRAMES - 3 {
+        s.feed(Scan::Unaccounted(None));
+    }
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Offer(_)));
+}
+
+/// A session ends after MAX_SESSION_FRAMES frames, whatever they held.
+#[test]
+fn a_session_runs_out() {
+    let real = full_text();
+    let mut s = Session::new();
+    for _ in 0..MAX_SESSION_FRAMES {
+        assert!(!matches!(s.feed(Scan::NoCode), SessionStep::Refused));
+    }
+    assert!(matches!(s.feed(setup_scan(&real)), SessionStep::Refused));
 }
 
 /// One stray finder pattern up and left of the real code's top-left corner: `quircs` puts it in a
@@ -845,7 +949,11 @@ fn a_stray_finder_pattern_cannot_steal_the_real_code() {
             "the stray at ({x},{y}) still steals"
         );
         assert_eq!(&codes.texts[0][..], hostile_text().as_bytes());
-        assert_eq!(outcome(&frame), "unaccounted", "stray at ({x},{y})");
+        assert_eq!(
+            outcome(&frame),
+            "unaccounted, HOSTILE read",
+            "stray at ({x},{y})"
+        );
     }
 }
 

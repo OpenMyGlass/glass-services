@@ -111,7 +111,7 @@ fn a_scripted_answer_in_protocol_is_taken() {
     assert!(matches!(w.scan(f), Ok(Scan::NoCode)));
     let mut w = sh("head -c 307212 >/dev/null; printf '\\005\\000\\017\\002\\000'; sleep 5");
     assert!(
-        matches!(w.scan(f), Ok(Scan::Unaccounted)),
+        matches!(w.scan(f), Ok(Scan::Unaccounted(None))),
         "more grids than MAX_CODES"
     );
     // At the caps, which the protocol allows, the frame gives nothing.
@@ -122,7 +122,7 @@ fn a_scripted_answer_in_protocol_is_taken() {
             c.args(["-c", &script]);
             c
         });
-        assert!(matches!(w.scan(f), Ok(Scan::Unaccounted)), "{answer}");
+        assert!(matches!(w.scan(f), Ok(Scan::Unaccounted(None))), "{answer}");
     }
 }
 

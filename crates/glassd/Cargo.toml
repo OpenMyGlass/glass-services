@@ -34,4 +34,6 @@ linux-bt = []
 omg-protocol.workspace = true
 omg-core.workspace = true
 omg-bled = { path = "../omg-bled" }
+# To hold the setup QR's validation and the supplicant config together, without the decoder.
+glass-qr = { path = "../glass-qr", default-features = false }
 tempfile = "3"

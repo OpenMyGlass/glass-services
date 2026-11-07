@@ -1,0 +1,34 @@
+[package]
+name = "glass-qr"
+description = "Setup QR for Glass: decode a QR from a grayscale frame and validate its text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["decoder"]
+# The QR decoder, for the process that handles camera frames. The side that only validates a
+# decoded text (glassd) turns this off, so it links no image code.
+decoder = ["dep:quircs", "dep:libc"]
+
+[dependencies]
+base64.workspace = true
+# 1.9 or later: the secrets are wiped on drop, which this code relies on.
+zeroize = "1.9"
+# Exact version: this code reads whatever is in front of the camera, so a new decoder is a
+# decision, not an update. Why this one: see src/scan.rs.
+quircs = { version = "=0.10.3", optional = true }
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+qrcode = { version = "0.14", default-features = false }
+
+[[bin]]
+name = "glass-qr-worker"
+required-features = ["decoder"]
+
+[[example]]
+name = "qr_bench"
+required-features = ["decoder"]

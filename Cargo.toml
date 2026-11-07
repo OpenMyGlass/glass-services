@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/glass-api", "crates/glass-gesture", "crates/glass-evdev", "crates/glass-head", "crates/glass-hub", "crates/glassd", "crates/omg-bled"]
+exclude = ["vendor"]
+members = ["crates/glass-api", "crates/glass-gesture", "crates/glass-evdev", "crates/glass-head", "crates/glass-hub", "crates/glass-qr", "crates/glassd", "crates/omg-bled"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,6 +31,10 @@ getrandom = "0.2"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The QR decoder, with one fix for its worst case: see vendor/quircs/VENDORED.md.
+[patch.crates-io]
+quircs = { path = "vendor/quircs" }
 
 [profile.release]
 opt-level = "s"

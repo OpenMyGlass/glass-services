@@ -1,0 +1,51 @@
+# Vendored from crates.io quircs 0.10.3 (the normalized manifest it shipped with), changed only as
+# VENDORED.md says. The version is kept so that Cargo's [patch] takes it in place of the registry one.
+
+[package]
+edition = "2018"
+rust-version = "1.68"
+name = "quircs"
+version = "0.10.3"
+authors = ["dignifiedquire <me@dignifiedquire.com>"]
+build = false
+exclude = ["tests"]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "QR code detection and scanning. Pure Rust."
+homepage = "https://github.com/dignifiedquire/quircs"
+documentation = "https://docs.rs/qurics/"
+readme = "README.md"
+keywords = [
+    "qr",
+    "scanner",
+]
+categories = [
+    "encoding",
+    "multimedia",
+]
+license = "MIT"
+repository = "https://github.com/dignifiedquire/quircs"
+
+[lib]
+name = "quircs"
+crate-type = [
+    "staticlib",
+    "rlib",
+]
+path = "src/lib.rs"
+
+[[example]]
+name = "qrtest"
+path = "examples/qrtest.rs"
+
+[dependencies.num-derive]
+version = "0.4.0"
+
+[dependencies.num-traits]
+version = "0.2.11"
+
+[dependencies.thiserror]
+version = "2.0"

@@ -212,6 +212,9 @@ pub struct Daemon {
     /// Readable when a termination signal came in: see [`catch_termination`].
     term_fd: Option<RawFd>,
     terminating: bool,
+    /// The client that last opened the pairing mode: when it disconnects, the mode closes, so
+    /// a launcher that crashed or lost its connection does not leave it open behind it.
+    pairing_opener: Option<ClientId>,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -1039,6 +1042,7 @@ impl Daemon {
             wifi_wish: WishDuringSetup::default(),
             term_fd: None,
             terminating: false,
+            pairing_opener: None,
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -1646,6 +1650,14 @@ impl Daemon {
         self.policy.client_gone(now(), id);
         self.head_requests.remove(&id);
         self.effects(fx);
+        if self.pairing_opener == Some(id) {
+            self.pairing_opener = None;
+            if let Some(c) = &mut self.companion {
+                info!("companion: client {id} that opened the pairing mode is gone: closing it");
+                let events = c.close_pairing_window();
+                self.companion_events(events);
+            }
+        }
     }
 
     fn flush(&mut self, t: Now) {
@@ -2271,11 +2283,15 @@ impl Daemon {
             return self.refuse_client(client, code, "glassd does not hold the phone link", seq);
         };
         if !request.open {
+            self.pairing_opener = None;
             let events = c.close_pairing_window();
             return self.companion_events(events);
         }
         match c.open_pairing_window(request.duration_ms) {
-            Ok(events) => self.companion_events(events),
+            Ok(events) => {
+                self.pairing_opener = Some(client);
+                self.companion_events(events)
+            }
             Err(why) => self.refuse_client(client, ErrorCode::Unavailable, &why, seq),
         }
     }
@@ -3246,6 +3262,86 @@ mod tests {
         daemon.step().unwrap();
         assert!(identity.exists());
         assert_eq!(daemon.companion.as_ref().unwrap().listener_fds().len(), 1);
+    }
+
+    /// A launcher that goes away with the pairing mode open does not leave it open; another
+    /// client that goes away leaves it as it is.
+    #[test]
+    fn the_pairing_mode_closes_when_the_client_that_opened_it_goes() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionPairingWindow, ServiceFrame, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let connect = || {
+                let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+                c.subscribe(&[Topic::Companion]).unwrap();
+                c
+            };
+            let until = |c: &mut glass_api::Client| {
+                let f: ServiceFrame = c
+                    .recv_until(wait, |f| {
+                        matches!(f.body, Some(service_frame::Body::CompanionState(_)))
+                    })
+                    .unwrap()
+                    .unwrap();
+                match f.body {
+                    Some(service_frame::Body::CompanionState(s)) => s.pairing_until_us,
+                    _ => unreachable!(),
+                }
+            };
+            let open = client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            });
+            let mut watcher = connect();
+            assert_eq!(until(&mut watcher), 0, "the snapshot");
+
+            // The opener goes: the mode closes.
+            let mut launcher = connect();
+            assert_eq!(until(&mut launcher), 0);
+            launcher.send(open.clone()).unwrap();
+            assert!(until(&mut watcher) > 0);
+            drop(launcher);
+            assert_eq!(until(&mut watcher), 0, "closed with its opener");
+
+            // Another client goes: the mode stays open.
+            let mut launcher = connect();
+            assert_eq!(until(&mut launcher), 0);
+            launcher.send(open).unwrap();
+            assert!(until(&mut watcher) > 0);
+            let mut other = connect();
+            assert!(until(&mut other) > 0);
+            drop(other);
+            // Nothing changes: closing it now, by its opener, is the next state anyone sees.
+            launcher
+                .send(client_frame::Body::CompanionPairingWindow(
+                    CompanionPairingWindow {
+                        open: false,
+                        duration_ms: 0,
+                    },
+                ))
+                .unwrap();
+            assert_eq!(until(&mut watcher), 0);
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
     }
 
     /// What a launcher does for the pairing card, against the real daemon.

@@ -11,8 +11,8 @@
 //!   brought up on demand for big transfers or as a fallback.
 //! - **Bluetooth, with a BLE engine configured:** `rfkill unblock bluetooth`, then `omg-bled`
 //!   starts, and owns the chip and its UART while it runs. Disabling stops it first and blocks the
-//!   chip after. If it dies the chip is blocked too, so a dead engine cannot hold the UART awake.
-//!   See [`BleEngine`].
+//!   chip after. If it dies, or cannot start, the chip is blocked too, so a dead engine cannot hold
+//!   the UART awake. See [`BleEngine`].
 //! - **Bluetooth, without one:** `rfkill unblock bluetooth` then bring the HCI controller up
 //!   (`hciconfig <hci> up`, else `bluetoothctl power on`); the reverse to disable. Pairing/bonding
 //!   is bluez's (`/var/lib/bluetooth`); glassd only switches the radio.
@@ -53,6 +53,21 @@ const BLE_STABLE_MS: u64 = 600_000;
 /// How long to give the engine after its leash is cut, before killing it. The UART must be closed
 /// before the chip goes off.
 const BLE_STOP_MS: u64 = 300;
+/// How long to wait after killing it. A process still there after this is held by the kernel, in
+/// the close of the port (`closing_wait`, 30 s by default, with the chip holding CTS).
+const BLE_KILLED_WAIT_MS: u64 = 200;
+/// Its output ended: how long it gets to become a process that can be reaped. It usually takes far
+/// less, and this is the daemon's loop waiting, so it is short.
+const BLE_REAP_SPIN_MS: u64 = 20;
+/// Then it is looked at again after this long, and twice as long each time, up to the most.
+const BLE_REAP_FIRST_MS: u64 = 100;
+const BLE_REAP_MAX_MS: u64 = 30_000;
+/// A start that finds the port still held tries again after this long.
+const BLE_PORT_BUSY_MS: u64 = 1_000;
+/// How long the daemon's loop waits for the kick. It takes a millisecond when nothing is wrong.
+const KICK_WAIT_MS: u64 = 200;
+/// How long the kick's byte gets to leave before it is thrown away.
+const KICK_DRAIN_MS: u64 = 50;
 
 /// A running `omg-bled`.
 struct BleChild {
@@ -64,6 +79,40 @@ struct BleChild {
     started_ms: u64,
 }
 
+/// An engine that was told to go, or killed, and has not gone. It may still hold the port.
+struct Leaving {
+    child: Child,
+    check_at_ms: u64,
+    wait_ms: u64,
+}
+
+impl std::fmt::Debug for Leaving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Leaving")
+            .field("pid", &self.child.id())
+            .finish()
+    }
+}
+
+enum Reap {
+    /// It ended, with this exit code if it had one.
+    Gone(Option<i32>),
+    Stuck,
+}
+
+/// Waits for `child`, this long at the most.
+fn reap_within(child: &mut Child, ms: u64) -> Reap {
+    let end = Instant::now() + Duration::from_millis(ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Reap::Gone(status.code()),
+            Err(_) => return Reap::Gone(None),
+            Ok(None) if Instant::now() >= end => return Reap::Stuck,
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 /// Runs `omg-bled` as a child, whose standard output says when it is ready and whose end shows as
 /// the end of that output. So this adds one descriptor to the daemon's poll set, and no timer
 /// unless the engine died.
@@ -71,6 +120,8 @@ struct BleChild {
 pub struct BleEngine {
     command: Vec<OsString>,
     child: Option<BleChild>,
+    /// Nothing starts while this is here: the port may be held.
+    leaving: Option<Leaving>,
     /// It said it is advertising, and has not ended since.
     running: bool,
     /// When to try again after a death, in the daemon's monotonic milliseconds.
@@ -78,6 +129,9 @@ pub struct BleEngine {
     deaths: usize,
     /// It reported something a new try cannot mend.
     given_up: bool,
+    /// Stands for a process the kernel holds, which a host test cannot make.
+    #[cfg(test)]
+    unkillable: bool,
 }
 
 impl std::fmt::Debug for BleChild {
@@ -94,20 +148,41 @@ impl BleEngine {
         BleEngine {
             command,
             child: None,
+            leaving: None,
             running: false,
             retry_at_ms: None,
             deaths: 0,
             given_up: false,
+            #[cfg(test)]
+            unkillable: false,
         }
     }
 
-    fn start(&mut self, now_ms: u64) {
-        self.retry_at_ms = None;
-        if self.given_up || self.child.is_some() {
+    fn kill(&self, child: &mut Child) {
+        #[cfg(test)]
+        if self.unkillable {
             return;
         }
+        let _ = child.kill();
+    }
+
+    /// To be reaped later, by [`Radio::ble_tick`].
+    fn leave(&mut self, child: Child, now_ms: u64) {
+        self.leaving = Some(Leaving {
+            child,
+            check_at_ms: now_ms + BLE_REAP_FIRST_MS,
+            wait_ms: BLE_REAP_FIRST_MS,
+        });
+    }
+
+    /// Returns false if it could not be started: the chip then has nobody at the port.
+    fn start(&mut self, now_ms: u64) -> bool {
+        self.retry_at_ms = None;
+        if self.given_up || self.child.is_some() {
+            return true;
+        }
         let Some((program, args)) = self.command.split_first() else {
-            return;
+            return false;
         };
         let spawned = Command::new(program)
             .args(args)
@@ -117,7 +192,9 @@ impl BleEngine {
         match spawned {
             Ok(mut child) => {
                 let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-                    return;
+                    self.kill(&mut child);
+                    self.leave(child, now_ms);
+                    return false;
                 };
                 // SAFETY: fcntl on a pipe we hold.
                 unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
@@ -129,17 +206,19 @@ impl BleEngine {
                     said: Vec::new(),
                     started_ms: now_ms,
                 });
+                true
             }
             Err(e) => {
                 warn!("radio: cannot start the BLE engine ({e})");
-                self.given_up = true;
+                false
             }
         }
     }
 
     /// Ends it, and returns once the UART is closed, or as good as: a killed process that does not
-    /// go is stuck in the kernel, and waiting longer would stop the daemon's loop.
-    fn stop(&mut self) {
+    /// go is stuck in the kernel, and waiting longer would stop the daemon's loop. It is then left
+    /// to [`Radio::ble_tick`], and nothing starts or kicks the port until it has gone.
+    fn stop(&mut self, now_ms: u64) {
         self.retry_at_ms = None;
         self.running = false;
         let Some(c) = self.child.take() else {
@@ -150,17 +229,13 @@ impl BleEngine {
             mut child, _stdin, ..
         } = c;
         drop(_stdin);
-        let end = Instant::now() + Duration::from_millis(BLE_STOP_MS);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
-                _ => {
-                    warn!("radio: the BLE engine did not stop: killing it");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
+        if let Reap::Stuck = reap_within(&mut child, BLE_STOP_MS) {
+            warn!("radio: the BLE engine did not stop: killing it");
+            self.kill(&mut child);
+            if let Reap::Stuck = reap_within(&mut child, BLE_KILLED_WAIT_MS) {
+                warn!("radio: the BLE engine is stuck in the kernel: not waiting for it");
+                self.leave(child, now_ms);
+                return;
             }
         }
         info!("radio: BLE engine stopped");
@@ -187,6 +262,10 @@ pub struct Radio {
     bt_hci: String,
     /// Still to be kicked once after the chip is powered off (see `kick_bt_uart`).
     bt_uart: Option<String>,
+    /// What the kick does, on its own thread.
+    kick_port: fn(&str),
+    /// A kick that is taking long. Until it ends it may still be at the port.
+    kicking: Option<std::thread::JoinHandle<()>>,
     /// The supplicant config to associate with when Wi-Fi is on.
     wifi_conf: Option<std::path::PathBuf>,
     /// `wpa_supplicant` and `udhcpc` were started and not stopped yet.
@@ -224,6 +303,92 @@ fn write_private(path: &std::path::Path, content: &str) -> io::Result<()> {
         .mode(0o600)
         .open(path)?
         .write_all(content.as_bytes())
+}
+
+/// The kick itself: see [`Radio::kick_bt_uart`]. Safe with the port in any state: no flow control,
+/// so that CTS cannot hold the byte, and nothing left queued, so that the close has nothing to
+/// wait for. What it leaves behind is the flow control off, and the engine sets its own.
+fn kick_port(path: &str) {
+    match send_one_byte(path) {
+        Ok(true) => info!("radio: one byte sent on {path} so that the idle port can sleep"),
+        Ok(false) => warn!("radio: the byte on {path} did not leave: deep sleep may be blocked"),
+        Err(e) => warn!("radio: cannot write to {path} ({e}): deep sleep may be blocked"),
+    }
+}
+
+/// Returns whether the byte left. Not a terminal (a test's file) is fine.
+fn send_one_byte(path: &str) -> io::Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut port = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)?;
+    let fd = port.as_raw_fd();
+    // SAFETY: termios is plain data, filled by tcgetattr before use, on a descriptor we hold.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if tty::get_attr(fd, &mut t) == 0 {
+            t.c_cflag &= !libc::CRTSCTS;
+            t.c_cflag |= libc::CLOCAL;
+            tty::set_attr_now(fd, &t);
+        }
+    }
+    port.write_all(&[0])?;
+    let end = Instant::now() + Duration::from_millis(KICK_DRAIN_MS);
+    loop {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ fills one int.
+        let r = unsafe { libc::ioctl(fd, libc::TIOCOUTQ as _, &mut queued) };
+        if r != 0 || queued == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= end {
+            // SAFETY: on a descriptor we hold.
+            unsafe { tty::flush(fd, libc::TCOFLUSH) };
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The termios calls glassd needs. Bionic before API 21 has them only as inline functions in its
+/// headers, with no symbol to link against, so on Android they are the ioctls those functions wrap.
+mod tty {
+    use std::os::fd::RawFd;
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn get_attr(fd: RawFd, t: &mut libc::termios) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCGETS as _, t as *mut libc::termios) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcgetattr(fd, t) };
+    }
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn set_attr_now(fd: RawFd, t: &libc::termios) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCSETS as _, t as *const libc::termios) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) };
+    }
+
+    /// # Safety
+    /// `fd` must be an open descriptor.
+    pub unsafe fn flush(fd: RawFd, queue: libc::c_int) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::ioctl(fd, libc::TCFLSH as _, queue as libc::c_ulong) };
+        #[cfg(not(target_os = "android"))]
+        // SAFETY: as the caller promises.
+        return unsafe { libc::tcflush(fd, queue) };
+    }
 }
 
 fn run_system(program: &str, args: &[&str]) -> io::Result<Outcome> {
@@ -278,6 +443,8 @@ impl Radio {
             wifi_iface: wifi_iface.into(),
             bt_hci: DEFAULT_BT_HCI.into(),
             bt_uart: None,
+            kick_port,
+            kicking: None,
             wifi_conf: None,
             associating: false,
             ble: None,
@@ -341,11 +508,32 @@ impl Radio {
     fn ble_ended(&mut self, now_ms: u64) {
         let Some(b) = self.ble.as_mut() else { return };
         b.running = false;
-        let Some(mut c) = b.child.take() else { return };
-        let code = c.child.wait().ok().and_then(|s| s.code());
-        if now_ms.saturating_sub(c.started_ms) >= BLE_STABLE_MS {
+        let Some(c) = b.child.take() else { return };
+        let BleChild {
+            mut child,
+            started_ms,
+            ..
+        } = c;
+        // Its output closes before its other descriptors. The port is one of them, and its close
+        // can last as long as the kernel's closing_wait: the daemon's loop does not wait for that.
+        let code = match reap_within(&mut child, BLE_REAP_SPIN_MS) {
+            Reap::Gone(code) => code,
+            Reap::Stuck => {
+                warn!("radio: the BLE engine is slow to end: killing it");
+                b.kill(&mut child);
+                b.leave(child, now_ms);
+                None
+            }
+        };
+        if now_ms.saturating_sub(started_ms) >= BLE_STABLE_MS {
             b.deaths = 0;
         }
+        self.ble_failed(now_ms, code);
+    }
+
+    /// There is no engine, and there should be: what its death or a failed start lead to.
+    fn ble_failed(&mut self, now_ms: u64, code: Option<i32>) {
+        let Some(b) = self.ble.as_mut() else { return };
         if code == Some(BLE_EXIT_CONFIG) {
             warn!("radio: the BLE engine cannot run: BLE stays off");
             b.given_up = true;
@@ -363,11 +551,14 @@ impl Radio {
 
     /// When [`Radio::ble_tick`] should next run, in the daemon's monotonic milliseconds.
     pub fn ble_next_deadline(&self) -> Option<u64> {
-        self.ble.as_ref()?.retry_at_ms
+        let b = self.ble.as_ref()?;
+        let reap = b.leaving.as_ref().map(|l| l.check_at_ms);
+        [b.retry_at_ms, reap].into_iter().flatten().min()
     }
 
-    /// Starts the engine again when its wait is over.
+    /// Reaps an engine that was slow to go, and starts it again when its wait is over.
     pub fn ble_tick(&mut self, now_ms: u64) {
+        self.ble_reap(now_ms);
         if self
             .ble
             .as_ref()
@@ -376,10 +567,56 @@ impl Radio {
         {
             return;
         }
-        self.step("rfkill", &["unblock", "bluetooth"]);
-        if let Some(b) = self.ble.as_mut() {
-            b.start(now_ms);
+        self.ble_bring_up(now_ms);
+    }
+
+    fn ble_reap(&mut self, now_ms: u64) {
+        let Some(b) = self.ble.as_mut() else { return };
+        let Some(l) = b.leaving.as_mut() else { return };
+        if now_ms < l.check_at_ms {
+            return;
         }
+        match l.child.try_wait() {
+            Ok(None) => {
+                l.wait_ms = (l.wait_ms * 2).min(BLE_REAP_MAX_MS);
+                l.check_at_ms = now_ms + l.wait_ms;
+                return;
+            }
+            Ok(Some(status)) if status.code() == Some(BLE_EXIT_CONFIG) => {
+                warn!("radio: the BLE engine cannot run: BLE stays off");
+                b.given_up = true;
+                b.retry_at_ms = None;
+            }
+            _ => {}
+        }
+        b.leaving = None;
+        info!("radio: the BLE engine has gone");
+        // The chip is off whenever no engine runs, and the port is free now.
+        if b.child.is_none() {
+            self.kick_bt_uart();
+        }
+    }
+
+    /// Whether something may still hold the Bluetooth port.
+    fn ble_port_busy(&self) -> bool {
+        self.ble.as_ref().is_some_and(|b| b.leaving.is_some())
+            || self.kicking.as_ref().is_some_and(|k| !k.is_finished())
+    }
+
+    /// Powers the chip and starts the engine. With the port still held neither happens yet, so that
+    /// the chip is not on with nobody at the port. Returns whether the rfkill step succeeded.
+    fn ble_bring_up(&mut self, now_ms: u64) -> bool {
+        if self.ble_port_busy() {
+            if let Some(b) = self.ble.as_mut() {
+                b.retry_at_ms = Some(now_ms + BLE_PORT_BUSY_MS);
+            }
+            return true;
+        }
+        let r = self.step("rfkill", &["unblock", "bluetooth"]);
+        if !self.ble.as_mut().is_some_and(|b| b.start(now_ms)) {
+            self.ble_failed(now_ms, None);
+        }
+        r
     }
 
     /// Runs one command; logs and returns false if the tool is absent or the command failed.
@@ -428,17 +665,13 @@ impl Radio {
         let hci = self.bt_hci.clone();
         let ok = if let Some(b) = self.ble.as_mut() {
             if on {
-                let r = self.step("rfkill", &["unblock", "bluetooth"]);
                 // The owner asked: whatever made the engine give up gets another chance.
-                if let Some(b) = self.ble.as_mut() {
-                    b.given_up = false;
-                    b.deaths = 0;
-                    b.start(mono_ms());
-                }
-                r
+                b.given_up = false;
+                b.deaths = 0;
+                self.ble_bring_up(mono_ms())
             } else {
                 // The UART closes before the chip goes off, and only then is it free to kick.
-                b.stop();
+                b.stop(mono_ms());
                 let r = self.step("rfkill", &["block", "bluetooth"]);
                 self.kick_bt_uart();
                 r
@@ -470,20 +703,36 @@ impl Radio {
     /// boots), and that keeps the CORE power domain out of deep sleep. After one transmitted byte
     /// it went back to 3 and stayed there through later block/unblock cycles. The chip is off,
     /// so nothing receives the byte.
+    ///
+    /// An engine that failed its bring-up has left its settings on the port, and it is not known
+    /// what CTS does with the chip off. So [`kick_port`] drops the flow control, and it runs on its
+    /// own thread, so that whatever the kernel does with this port cannot stop the daemon's loop.
     fn kick_bt_uart(&mut self) {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        // It stays due: an engine on its way out still owns the port.
+        if self.ble_port_busy() {
+            return;
+        }
         let Some(path) = self.bt_uart.take() else {
             return;
         };
-        let r = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(&path)
-            .and_then(|mut f| f.write_all(&[0]));
-        match r {
-            Ok(()) => info!("radio: one byte sent on {path} so that the idle port can sleep"),
-            Err(e) => warn!("radio: cannot write to {path} ({e}): deep sleep may be blocked"),
+        let kick = self.kick_port;
+        let thread = std::thread::Builder::new()
+            .name("bt-kick".into())
+            .spawn(move || kick(&path));
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("radio: cannot kick the Bluetooth port ({e}): deep sleep may be blocked");
+                return;
+            }
+        };
+        let end = Instant::now() + Duration::from_millis(KICK_WAIT_MS);
+        while !thread.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !thread.is_finished() {
+            warn!("radio: the Bluetooth port is slow to take a byte: not waiting for it");
+            self.kicking = Some(thread);
         }
     }
 
@@ -905,5 +1154,228 @@ mod tests {
         std::fs::write(d.path().join("die"), "").unwrap();
         wait_engine(&mut r, |r| !r.ble_running());
         assert!(r.ble_next_deadline().is_some());
+    }
+
+    /// Ticks at each deadline until the slow engine has been reaped.
+    fn until_reaped(r: &mut Radio) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while r.ble_port_busy() {
+            assert!(Instant::now() < end, "timed out");
+            let at = r
+                .ble
+                .as_ref()
+                .unwrap()
+                .leaving
+                .as_ref()
+                .unwrap()
+                .check_at_ms;
+            r.ble_reap(at);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_spawn_that_fails_turns_the_chip_off_kicks_the_port_and_is_retried() {
+        let d = tempfile::tempdir().unwrap();
+        let uart = d.path().join("uart");
+        std::fs::write(&uart, "").unwrap();
+        let (r, log) = recording();
+        let mut r = r.with_ble_engine(vec![d.path().join("absent").into()]);
+        r.bt_uart = Some(uart.to_string_lossy().into_owned());
+        r.set_bluetooth(true);
+        assert_eq!(
+            cmds(&log),
+            vec!["rfkill unblock bluetooth", "rfkill block bluetooth"]
+        );
+        assert_eq!(std::fs::read(&uart).unwrap(), [0], "no kick");
+        let mut tries = 1;
+        while let Some(at) = r.ble_next_deadline() {
+            r.ble_tick(at);
+            assert_eq!(
+                cmds(&log),
+                vec!["rfkill unblock bluetooth", "rfkill block bluetooth"]
+            );
+            tries += 1;
+        }
+        assert_eq!(tries, BLE_RESTART_MS.len() + 1);
+        assert!(!r.ble_running());
+    }
+
+    #[test]
+    fn an_engine_that_is_slow_to_end_is_killed_without_stopping_the_loop() {
+        // Its output closes and it stays, as when the close of the port waits for the chip.
+        let (mut r, log, _d) = with_engine("exec >&-; exec sleep 30");
+        r.set_bluetooth(true);
+        cmds(&log);
+        let t = Instant::now();
+        wait_engine(&mut r, |r| r.ble_fd().is_none());
+        assert!(t.elapsed() < Duration::from_secs(5), "the loop waited");
+        assert!(cmds(&log).iter().any(|c| c == "rfkill block bluetooth"));
+        until_reaped(&mut r);
+    }
+
+    #[test]
+    fn an_engine_the_kernel_holds_stops_nothing_and_blocks_the_next_start() {
+        let d = tempfile::tempdir().unwrap();
+        let uart = d.path().join("uart");
+        std::fs::write(&uart, "").unwrap();
+        let (r, log) = recording();
+        let script = "exec >&-; while [ ! -e go ]; do sleep 0.01; done";
+        let mut r = r.with_ble_engine(engine_script(d.path(), script));
+        r.bt_uart = Some(uart.to_string_lossy().into_owned());
+        r.ble.as_mut().unwrap().unkillable = true;
+        r.set_bluetooth(true);
+        cmds(&log);
+
+        let t = Instant::now();
+        wait_engine(&mut r, |r| r.ble_fd().is_none());
+        assert!(t.elapsed() < Duration::from_secs(5), "the loop waited");
+        assert_eq!(
+            cmds(&log),
+            vec!["rfkill block bluetooth"],
+            "the chip stayed on"
+        );
+        assert_eq!(std::fs::read(&uart).unwrap(), b"", "kicked a port in use");
+
+        // The retry comes, and finds the port held: the chip stays off, and it waits.
+        let at = r.ble.as_ref().unwrap().retry_at_ms.unwrap();
+        r.ble_tick(at);
+        assert!(cmds(&log).is_empty(), "powered with the port held");
+        assert!(r.ble_next_deadline().is_some());
+        assert_eq!(r.ble_fd(), None);
+
+        // The same when the owner asks for it.
+        r.set_bluetooth(false);
+        cmds(&log);
+        r.set_bluetooth(true);
+        assert!(cmds(&log).is_empty(), "powered with the port held");
+        assert_eq!(r.ble_fd(), None);
+
+        std::fs::write(d.path().join("go"), "").unwrap();
+        until_reaped(&mut r);
+        assert_eq!(std::fs::read(&uart).unwrap(), [0], "the kick stayed due");
+        r.ble.as_mut().unwrap().unkillable = false;
+        let at = r.ble.as_ref().unwrap().retry_at_ms.unwrap();
+        r.ble_tick(at);
+        assert_eq!(cmds(&log), vec!["rfkill unblock bluetooth"]);
+        // Not left behind for the temporary directory to go from under it.
+        r.set_bluetooth(false);
+    }
+
+    #[test]
+    fn stopping_an_engine_the_kernel_holds_is_bounded_and_it_is_reaped_later() {
+        let (mut r, log, d) = with_engine("trap '' TERM; while [ ! -e go ]; do sleep 0.01; done");
+        r.ble.as_mut().unwrap().unkillable = true;
+        r.set_bluetooth(true);
+        cmds(&log);
+        let t = Instant::now();
+        r.set_bluetooth(false);
+        assert!(t.elapsed() < Duration::from_secs(2), "the loop waited");
+        assert_eq!(cmds(&log), vec!["rfkill block bluetooth"]);
+        assert!(r.ble_next_deadline().is_some(), "nobody will reap it");
+        std::fs::write(d.path().join("go"), "").unwrap();
+        until_reaped(&mut r);
+        assert_eq!(r.ble_next_deadline(), None, "a timer stayed");
+    }
+
+    #[test]
+    fn the_kick_turns_off_the_flow_control_a_failed_bring_up_left_and_the_byte_leaves() {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain calls on the descriptor just opened.
+        let (master, slave) = unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK);
+            assert!(m >= 0);
+            assert_eq!(libc::grantpt(m), 0);
+            assert_eq!(libc::unlockpt(m), 0);
+            let mut name = [0 as libc::c_char; 128];
+            assert_eq!(libc::ptsname_r(m, name.as_mut_ptr(), name.len()), 0);
+            let path = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_str()
+                .unwrap()
+                .to_string();
+            (std::fs::File::from_raw_fd(m), path)
+        };
+        // Held open, so that the terminal's settings last from one open to the next.
+        let holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&slave)
+            .unwrap();
+        // SAFETY: termios is plain data, filled by tcgetattr before use.
+        let flags = |set: bool| unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(holder.as_raw_fd(), &mut t), 0);
+            if set {
+                libc::cfmakeraw(&mut t);
+                t.c_cflag |= libc::CRTSCTS;
+                assert_eq!(libc::tcsetattr(holder.as_raw_fd(), libc::TCSANOW, &t), 0);
+            }
+            t.c_cflag
+        };
+        assert_ne!(flags(true) & libc::CRTSCTS, 0);
+
+        assert!(send_one_byte(&slave).unwrap());
+
+        assert_eq!(flags(false) & libc::CRTSCTS, 0, "flow control left on");
+        let mut got = [9u8; 4];
+        assert_eq!((&master).read(&mut got).unwrap(), 1);
+        assert_eq!(got[0], 0);
+    }
+
+    #[test]
+    fn a_kick_the_kernel_holds_stops_neither_the_loop_nor_the_order_of_things() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LET_GO: AtomicBool = AtomicBool::new(false);
+        let (r, log, _d) = {
+            let d = tempfile::tempdir().unwrap();
+            let (r, log) = recording();
+            let command = engine_script(d.path(), "cat >/dev/null");
+            (r.with_ble_engine(command), log, d)
+        };
+        let mut r = r;
+        r.bt_uart = Some("unused".into());
+        r.kick_port = |_| {
+            while !LET_GO.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let t = Instant::now();
+        r.set_bluetooth(false);
+        assert!(t.elapsed() < Duration::from_secs(2), "the loop waited");
+        cmds(&log);
+
+        // The engine must not meet a kick at the port: the chip waits with it.
+        r.set_bluetooth(true);
+        assert!(cmds(&log).is_empty(), "started with a kick at the port");
+        assert_eq!(r.ble_fd(), None);
+        let at = r.ble_next_deadline().unwrap();
+        r.ble_tick(at);
+        assert!(cmds(&log).is_empty());
+
+        LET_GO.store(true, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(10);
+        while r.ble_port_busy() {
+            assert!(Instant::now() < end, "timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let at = r.ble_next_deadline().unwrap();
+        r.ble_tick(at);
+        assert_eq!(cmds(&log), vec!["rfkill unblock bluetooth"]);
+        r.set_bluetooth(false);
+    }
+
+    #[test]
+    fn a_late_exit_that_says_it_cannot_run_cancels_the_retry() {
+        let (mut r, log, d) =
+            with_engine("exec >&-; while [ ! -e go ]; do sleep 0.01; done; exit 78");
+        r.ble.as_mut().unwrap().unkillable = true;
+        r.set_bluetooth(true);
+        wait_engine(&mut r, |r| r.ble_fd().is_none());
+        assert!(r.ble.as_ref().unwrap().retry_at_ms.is_some());
+        cmds(&log);
+        std::fs::write(d.path().join("go"), "").unwrap();
+        until_reaped(&mut r);
+        assert_eq!(r.ble_next_deadline(), None);
+        assert!(cmds(&log).is_empty());
     }
 }

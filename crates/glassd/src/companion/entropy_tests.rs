@@ -34,7 +34,9 @@ fn no_identity_and_no_listener_before_the_pool_is_seeded() {
     assert!(!state_file(&state).exists());
 
     // Forgetting a bond that cannot exist yet is harmless.
-    assert!(c.unpair().is_empty());
+    let (events, cleared) = c.unpair();
+    assert!(events.is_empty());
+    assert!(cleared.is_ok());
     pool.seed();
     c.on_rng_event();
     assert!(c.rng_fd().is_none());

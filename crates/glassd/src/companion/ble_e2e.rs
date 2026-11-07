@@ -126,6 +126,9 @@ struct Phone {
     chunks: u32,
     battery_seen_at: Option<u64>,
     running: bool,
+    /// A test that expects the Glass to refuse it.
+    may_be_refused: bool,
+    ended: Option<String>,
 }
 
 impl Phone {
@@ -155,6 +158,8 @@ impl Phone {
             chunks: 0,
             battery_seen_at: None,
             running: false,
+            may_be_refused: false,
+            ended: None,
         };
         let start = phone.link.start();
         phone.carry_out(start);
@@ -191,7 +196,12 @@ impl Phone {
                         frames.iter().for_each(|f| self.send(f));
                     }
                 }
-                LinkOut::Closed(end) => assert_eq!(end, Ok(())),
+                LinkOut::Closed(end) => {
+                    if !self.may_be_refused {
+                        assert_eq!(end, Ok(()));
+                    }
+                    self.ended = Some(format!("{end:?}"));
+                }
             }
         }
     }
@@ -225,7 +235,14 @@ struct Bench {
 }
 
 impl Bench {
+    /// The owner has opened the pairing mode, as these tests are mostly about what comes after.
     fn new() -> Bench {
+        let mut b = Bench::closed();
+        b.glass.open_pairing_window(0).unwrap();
+        b
+    }
+
+    fn closed() -> Bench {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let socket = root.join("ble.sock");
@@ -268,6 +285,11 @@ impl Bench {
         }
         let events = self.glass.notes_tick();
         self.take(events);
+    }
+
+    fn step_air_and_glass(&mut self) {
+        self.glass_step();
+        self.air.step(8);
     }
 
     fn step(&mut self, phone: &mut Phone) {
@@ -527,7 +549,7 @@ fn a_peer_that_says_nothing_is_dropped_and_advertising_comes_back() {
     }
     b.glass_step();
     let at = b.glass.handshake_next_deadline().unwrap();
-    assert!(at > super::now_ms());
+    assert!(at > super::boot_ms());
     assert!(b.glass.handshake_tick().is_empty());
     for c in b.glass.conns.values_mut() {
         c.handshake_by_ms = Some(0);
@@ -548,4 +570,587 @@ fn a_finished_handshake_has_no_deadline_left() {
     let mut b = Bench::new();
     let _phone = pair(&mut b);
     assert_eq!(b.glass.handshake_next_deadline(), None);
+}
+
+/// A Glass with TCP and BLE, and how to reach each.
+fn glass_with_tcp_and_ble(root: &Path) -> (Companion, u16, PathBuf) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let socket = root.join("ble.sock");
+    let mut glass =
+        Companion::new(&root.join("g"), DeviceState::default(), Some(port), false).unwrap();
+    glass.set_ble_socket(socket.clone());
+    (glass, port, socket)
+}
+
+/// Accepts until `want` connections are there, or says what it got.
+fn accept_until(glass: &mut Companion, transport: Transport, want: usize) {
+    let start = Instant::now();
+    while glass.conn_fds().len() < want && start.elapsed() < Duration::from_secs(5) {
+        glass.accept(transport);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(glass.conn_fds().len(), want);
+}
+
+#[test]
+fn idle_tcp_peers_cannot_lock_the_phone_out_of_ble() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut glass, port, socket) = glass_with_tcp_and_ble(tmp.path());
+    let _peers: Vec<_> = (0..5)
+        .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    accept_until(&mut glass, Transport::WifiTcp, 3);
+    // The other two knocked and were turned away.
+    for _ in 0..50 {
+        glass.accept(Transport::WifiTcp);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(glass.conn_fds().len(), 3);
+
+    let _phone = UnixStream::connect(&socket).unwrap();
+    accept_until(&mut glass, Transport::Ble, 4);
+}
+
+#[test]
+fn without_ble_tcp_keeps_all_its_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut glass = Companion::new(
+        &tmp.path().join("g"),
+        DeviceState::default(),
+        Some(port),
+        false,
+    )
+    .unwrap();
+    let _peers: Vec<_> = (0..4)
+        .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+    accept_until(&mut glass, Transport::WifiTcp, 4);
+}
+
+#[test]
+fn a_tcp_peer_that_says_nothing_is_dropped_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut glass, port, _socket) = glass_with_tcp_and_ble(tmp.path());
+    let _peer = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    accept_until(&mut glass, Transport::WifiTcp, 1);
+    assert!(glass.handshake_next_deadline().unwrap() > super::boot_ms());
+    assert!(glass.handshake_tick().is_empty());
+    assert_eq!(glass.conn_fds().len(), 1, "before its time");
+    for c in glass.conns.values_mut() {
+        c.handshake_by_ms = Some(0);
+    }
+    assert!(glass.handshake_tick().is_empty());
+    assert_eq!(glass.conn_fds().len(), 0);
+    assert_eq!(glass.handshake_next_deadline(), None);
+}
+
+#[test]
+fn a_dial_has_the_same_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass =
+        Companion::new(&tmp.path().join("g"), DeviceState::default(), None, false).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .connect_tcp(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    assert!(glass.handshake_next_deadline().is_some());
+}
+
+/// Runs a real phone against the Glass until it gives up, and returns why.
+fn refused(b: &mut Bench, bond: Option<PairingRecord>) -> String {
+    let mut phone = b.phone_connects(bond, PHONE_BLE);
+    phone.may_be_refused = true;
+    b.until(&mut phone, "the refusal", |_, p| p.ended.is_some());
+    phone.ended.unwrap()
+}
+
+#[test]
+fn a_first_pairing_over_ble_fails_with_a_clear_reason_unless_the_owner_opened_the_mode() {
+    let mut b = Bench::closed();
+    let why = refused(&mut b, None);
+    assert!(why.contains("NotPaired"), "{why}");
+    assert!(!b.glass.paired());
+    assert!(!b.glass.connected());
+    // Nothing of this stays in the way.
+    for _ in 0..50 {
+        b.step_air_and_glass();
+    }
+    assert!(!b.air.radio.connected());
+    assert!(b.air.radio.advertising);
+
+    // The same phone, once the owner has opened it.
+    b.glass.open_pairing_window(0).unwrap();
+    assert!(b.glass.pairing_left_ms().is_some());
+    pair(&mut b);
+}
+
+#[test]
+fn a_bond_closes_the_pairing_mode_and_the_next_phone_is_refused() {
+    let mut b = Bench::new();
+    let phone = pair(&mut b);
+    assert_eq!(b.glass.pairing_left_ms(), None, "one phone per opening");
+    assert_eq!(b.glass.pairing_next_deadline(), None);
+    assert!(b.glass.open_pairing_window(0).is_err(), "bonded");
+    drop(phone);
+    b.air.radio.disconnect(0x13);
+    b.air.step(8);
+    b.glass_step();
+
+    let first = b.glass.paired_name().unwrap().to_string();
+    b.identity = Identity::generate();
+    let why = refused(&mut b, None);
+    assert!(
+        why.contains("UnknownPeer") || why.contains("another"),
+        "{why}"
+    );
+    assert_eq!(b.glass.paired_name(), Some(first.as_str()));
+}
+
+#[test]
+fn the_pairing_mode_ends_by_itself_and_stops_whoever_was_on_the_way() {
+    let mut b = Bench::new();
+    assert!(b.glass.pairing_next_deadline().is_some());
+    assert!(b.glass.pairing_tick().is_empty(), "before its time");
+    b.glass.pairing_until_ms = Some(0);
+    assert_eq!(b.glass.pairing_tick(), vec![Event::PairingChanged]);
+    assert_eq!(b.glass.pairing_next_deadline(), None);
+    let why = refused(&mut b, None);
+    assert!(why.contains("NotPaired"), "{why}");
+}
+
+#[test]
+fn an_expired_window_is_seen_when_the_next_phone_is_accepted() {
+    let mut b = Bench::new();
+    b.glass.pairing_until_ms = Some(0);
+    // No pairing_tick: accepting the connection is enough.
+    let why = refused(&mut b, None);
+    assert!(why.contains("NotPaired"), "{why}");
+    assert!(!b.glass.paired());
+}
+
+#[test]
+fn the_length_of_the_pairing_mode_is_limited() {
+    let mut b = Bench::closed();
+    b.glass.open_pairing_window(u32::MAX).unwrap();
+    assert!(b.glass.pairing_left_ms().unwrap() <= super::PAIRING_WINDOW_MAX_MS as u64);
+    b.glass.open_pairing_window(0).unwrap();
+    let left = b.glass.pairing_left_ms().unwrap();
+    assert!(left <= super::PAIRING_WINDOW_DEFAULT_MS as u64);
+    assert!(left > super::PAIRING_WINDOW_DEFAULT_MS as u64 / 2);
+    assert_eq!(b.glass.close_pairing_window(), vec![Event::PairingChanged]);
+    assert!(b.glass.close_pairing_window().is_empty(), "nothing changed");
+}
+
+#[test]
+fn a_restart_closes_the_pairing_mode() {
+    let b = Bench::new();
+    let again = Companion::new(&b.root.join("g"), DeviceState::default(), None, false).unwrap();
+    assert_eq!(again.pairing_left_ms(), None);
+}
+
+#[test]
+fn forgetting_the_bond_ends_the_link_lasts_and_opens_nothing() {
+    let mut b = Bench::new();
+    let phone = pair(&mut b);
+    let (events, cleared) = b.glass.unpair();
+    assert!(cleared.is_ok());
+    assert!(events.contains(&Event::Disconnected));
+    assert!(events.contains(&Event::PairingChanged));
+    assert!(!b.glass.paired());
+    assert!(!b.glass.connected());
+    assert_eq!(b.glass.pairing_left_ms(), None);
+    for _ in 0..50 {
+        b.step_air_and_glass();
+    }
+    assert!(!b.air.radio.connected());
+    assert!(b.air.radio.advertising);
+
+    let again = Companion::new(&b.root.join("g"), DeviceState::default(), None, false).unwrap();
+    assert!(!again.paired(), "still on the disk");
+    drop(again);
+
+    // The old phone is not let back in by a Glass with no bond, and nor is anyone else.
+    let why = refused(&mut b, phone.bond.clone());
+    assert!(!b.glass.paired(), "{why}");
+}
+
+/// A peer written by hand, over a socket that stands for any transport.
+struct RawPeer {
+    id: super::ConnId,
+    stream: UnixStream,
+    identity: Identity,
+}
+
+fn raw_peer(glass: &mut Companion, transport: Transport) -> RawPeer {
+    let (near, far) = UnixStream::pair().unwrap();
+    near.set_nonblocking(true).unwrap();
+    far.set_nonblocking(true).unwrap();
+    let id = glass.next_id;
+    let mut events = Vec::new();
+    glass.add_conn(Box::new(near), transport, false, &mut events);
+    RawPeer {
+        id,
+        stream: far,
+        identity: Identity::generate(),
+    }
+}
+
+impl RawPeer {
+    fn say(&mut self, glass: &mut Companion, frame: &Frame) {
+        self.stream
+            .write_all(&omg_protocol::frame_bytes(frame).unwrap())
+            .unwrap();
+        glass.on_readable(self.id);
+    }
+
+    fn hello(&mut self, glass: &mut Companion) {
+        let frame = Frame::Hello(omg_protocol::Hello {
+            protocol_version: omg_protocol::PROTOCOL_VERSION,
+            role: omg_protocol::Role::Companion,
+            app_version: "x".into(),
+            device_name: "x".into(),
+            identity_pub: self.identity.public_b64(),
+            capabilities: vec![capability::SESSION_CRYPTO.to_string()],
+        });
+        self.say(glass, &frame);
+    }
+
+    fn pair_request(&mut self, glass: &mut Companion, name: &str) {
+        let frame = Frame::PairRequest(omg_protocol::PairRequest {
+            companion_name: name.into(),
+            companion_pub: self.identity.public_b64(),
+            nonce: "AAAA".into(),
+            bootstrap_token: None,
+        });
+        self.say(glass, &frame);
+    }
+
+    fn pair_result(&mut self, glass: &mut Companion) {
+        let frame = Frame::PairResult(omg_protocol::PairResult {
+            ok: true,
+            message: String::new(),
+        });
+        self.say(glass, &frame);
+    }
+
+    fn last_frame(&mut self) -> Frame {
+        let mut decoder = FrameDecoder::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = self.stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            decoder.push(&buf[..n]);
+        }
+        let mut last = None;
+        while let Some(f) = decoder.next_frame().unwrap() {
+            last = Some(f);
+        }
+        last.unwrap()
+    }
+}
+
+fn plain_glass(root: &Path) -> Companion {
+    Companion::new(&root.join("g"), DeviceState::default(), None, false).unwrap()
+}
+
+/// Hello, PairRequest and PairResult{ok: true}, as one run of bytes.
+fn takeover_bytes(identity: &Identity, name: &str) -> Vec<u8> {
+    let hello = Frame::Hello(omg_protocol::Hello {
+        protocol_version: omg_protocol::PROTOCOL_VERSION,
+        role: omg_protocol::Role::Companion,
+        app_version: "x".into(),
+        device_name: "x".into(),
+        identity_pub: identity.public_b64(),
+        capabilities: vec![capability::SESSION_CRYPTO.to_string()],
+    });
+    let request = Frame::PairRequest(omg_protocol::PairRequest {
+        companion_name: name.into(),
+        companion_pub: identity.public_b64(),
+        nonce: "AAAA".into(),
+        bootstrap_token: None,
+    });
+    let result = Frame::PairResult(omg_protocol::PairResult {
+        ok: true,
+        message: String::new(),
+    });
+    let mut bytes = Vec::new();
+    for f in [&hello, &request, &result] {
+        bytes.extend(omg_protocol::frame_bytes(f).unwrap());
+    }
+    bytes
+}
+
+impl RawPeer {
+    /// The whole takeover in one write, as an attacker would send it, before the Glass reads.
+    fn takeover(&mut self, glass: &mut Companion, name: &str) -> Vec<Event> {
+        let bytes = takeover_bytes(&self.identity, name);
+        self.stream.write_all(&bytes).unwrap();
+        glass.on_readable(self.id)
+    }
+}
+
+fn refused_not_paired(peer: &mut RawPeer) -> bool {
+    matches!(
+        peer.last_frame(),
+        Frame::Error(e) if e.code == omg_protocol::ErrorCode::NotPaired
+            && e.message.contains("pairing mode is off")
+    )
+}
+
+#[test]
+fn the_three_frames_of_the_takeover_bond_nothing_on_any_transport() {
+    for transport in [Transport::Ble, Transport::WifiTcp, Transport::BtRfcomm] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut glass = plain_glass(tmp.path());
+        let mut stranger = raw_peer(&mut glass, transport);
+        stranger.takeover(&mut glass, "stranger");
+        assert!(!glass.paired(), "bonded over {transport:?}");
+        assert_eq!(
+            glass.conn_fds().len(),
+            0,
+            "still connected over {transport:?}"
+        );
+        // The words are on the wire. omg-core reduces them to the code, for the app's own.
+        assert!(refused_not_paired(&mut stranger), "{transport:?}");
+        // Nothing is stored either.
+        assert!(!plain_glass(tmp.path()).paired());
+    }
+}
+
+#[test]
+fn pairing_over_tcp_needs_the_window_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let mut early = raw_peer(&mut glass, Transport::WifiTcp);
+    early.takeover(&mut glass, "pc");
+    assert!(!glass.paired());
+
+    glass.open_pairing_window(0).unwrap();
+    let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
+    peer.takeover(&mut glass, "pc");
+    assert_eq!(glass.paired_name(), Some("pc"));
+    assert_eq!(glass.pairing_left_ms(), None, "one phone per opening");
+}
+
+#[test]
+fn right_after_forgetting_the_bond_nobody_pairs_without_the_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    raw_peer(&mut glass, Transport::WifiTcp).takeover(&mut glass, "owner");
+    assert!(glass.paired());
+    let (_, cleared) = glass.unpair();
+    cleared.unwrap();
+    let mut stranger = raw_peer(&mut glass, Transport::WifiTcp);
+    stranger.takeover(&mut glass, "stranger");
+    assert!(!glass.paired());
+    assert!(refused_not_paired(&mut stranger));
+}
+
+#[test]
+fn a_window_that_expired_is_seen_on_the_first_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    // Connected while the window was open: its link was told it may pair.
+    let mut peer = raw_peer(&mut glass, Transport::Ble);
+    glass.pairing_until_ms = Some(0);
+    // No pairing_tick and no accept, as right after a resume: only the read.
+    let events = peer.takeover(&mut glass, "late");
+    assert!(events.contains(&Event::PairingChanged), "{events:?}");
+    assert!(!glass.paired());
+    assert!(refused_not_paired(&mut peer));
+    assert_eq!(glass.pairing_left_ms(), None);
+}
+
+#[test]
+fn a_bond_that_cannot_be_stored_ends_the_link_and_closes_the_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    glass.store.as_mut().unwrap().fail_saves = true;
+    let mut peer = raw_peer(&mut glass, Transport::WifiTcp);
+    let events = peer.takeover(&mut glass, "phone");
+    glass.store.as_mut().unwrap().fail_saves = false;
+    assert!(!plain_glass(tmp.path()).paired(), "on the disk");
+    assert!(!glass.paired(), "a bond in memory only");
+    assert!(!glass.connected());
+    assert_eq!(glass.conn_fds().len(), 0);
+    assert_eq!(glass.pairing_left_ms(), None, "the window stayed open");
+    assert!(events.contains(&Event::PairingChanged), "{events:?}");
+    assert!(matches!(
+        peer.last_frame(),
+        Frame::Error(e) if e.code == omg_protocol::ErrorCode::Internal
+    ));
+}
+
+#[test]
+fn a_window_that_closes_stops_a_pairing_under_way_at_every_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+
+    glass.open_pairing_window(0).unwrap();
+    let mut before_request = raw_peer(&mut glass, Transport::Ble);
+    before_request.hello(&mut glass);
+    let mut before_result = raw_peer(&mut glass, Transport::Ble);
+    before_result.hello(&mut glass);
+    before_result.pair_request(&mut glass, "x");
+    glass.close_pairing_window();
+
+    before_request.pair_request(&mut glass, "x");
+    before_result.pair_result(&mut glass);
+    assert!(!glass.paired());
+    assert_eq!(glass.conn_fds().len(), 0);
+    assert!(matches!(
+        before_result.last_frame(),
+        Frame::Error(e) if e.code == omg_protocol::ErrorCode::NotPaired
+    ));
+}
+
+#[test]
+fn a_link_older_than_the_bond_cannot_replace_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    glass.open_pairing_window(0).unwrap();
+    // A stranger gets ready and waits, on a transport that needs no window.
+    let mut stranger = raw_peer(&mut glass, Transport::WifiTcp);
+    stranger.hello(&mut glass);
+    stranger.pair_request(&mut glass, "stranger");
+    // The owner pairs.
+    let mut owner = raw_peer(&mut glass, Transport::WifiTcp);
+    owner.hello(&mut glass);
+    owner.pair_request(&mut glass, "owner");
+    owner.pair_result(&mut glass);
+    assert_eq!(glass.paired_name(), Some("owner"));
+
+    stranger.pair_result(&mut glass);
+    assert_eq!(glass.paired_name(), Some("owner"), "the bond was replaced");
+    assert_eq!(glass.conn_fds().len(), 1, "the stranger is still here");
+    // The bond closed the window, which stops it first. Were the window open, the bond would.
+    assert!(refused_not_paired(&mut stranger));
+}
+
+#[test]
+fn the_handshake_deadline_is_on_the_boot_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let before = super::boot_ms();
+    let _peer = raw_peer(&mut glass, Transport::WifiTcp);
+    let at = glass.handshake_next_deadline().unwrap();
+    // The wall clock is decades ahead of the boot clock: a wall-clock deadline would be there.
+    assert!(at >= before + super::HANDSHAKE_MS);
+    assert!(at <= super::boot_ms() + super::HANDSHAKE_MS);
+}
+
+/// Reads every connection until the Glass is bonded, or says it never was.
+fn until_paired(glass: &mut Companion) {
+    let start = Instant::now();
+    while !glass.paired() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never paired");
+        for (id, _, _) in glass.conn_fds() {
+            glass.on_readable(id);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn the_owner_s_qr_dial_may_pair_and_a_stranger_meanwhile_may_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .dial_to_pair(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    let (mut phone, _) = listener.accept().unwrap();
+    assert_eq!(
+        glass.pairing_left_ms(),
+        None,
+        "the pairing mode opened for everyone"
+    );
+
+    for transport in [Transport::WifiTcp, Transport::Ble] {
+        let mut stranger = raw_peer(&mut glass, transport);
+        stranger.takeover(&mut glass, "stranger");
+        assert!(!glass.paired(), "a stranger on {transport:?} paired");
+        assert!(refused_not_paired(&mut stranger), "{transport:?}");
+    }
+
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    until_paired(&mut glass);
+    assert_eq!(glass.paired_name(), Some("phone"));
+}
+
+#[test]
+fn a_plain_dial_still_needs_the_pairing_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut glass = plain_glass(tmp.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    glass
+        .connect_tcp(&listener.local_addr().unwrap().to_string())
+        .unwrap();
+    let (mut phone, _) = listener.accept().unwrap();
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    let start = Instant::now();
+    while !glass.conn_fds().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "not refused");
+        for (id, _, _) in glass.conn_fds() {
+            glass.on_readable(id);
+        }
+    }
+    assert!(!glass.paired());
+}
+
+#[test]
+fn a_qr_dial_that_waits_for_the_random_pool_may_still_pair_when_it_goes_out() {
+    use super::entropy::testing::FakePool;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pool = FakePool::new(tmp.path());
+    let mut glass = Companion::with_rng_device(
+        &tmp.path().join("g"),
+        DeviceState::default(),
+        None,
+        false,
+        &pool.path,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    assert!(glass.dial_to_pair(&addr).unwrap().is_empty());
+    assert!(
+        glass.conn_fds().is_empty(),
+        "dialed before the pool was seeded"
+    );
+    // Nothing waits on a clock meanwhile, so no length of wait can make the dial lose its right.
+    assert_eq!(glass.pairing_left_ms(), None);
+    assert_eq!(glass.pairing_next_deadline(), None);
+    for _ in 0..100 {
+        glass.on_rng_event();
+        glass.pairing_tick();
+    }
+    assert!(glass.conn_fds().is_empty());
+
+    pool.seed();
+    glass.on_rng_event();
+    assert_eq!(glass.conn_fds().len(), 1, "the dial did not go out");
+    let (mut phone, _) = listener.accept().unwrap();
+    phone
+        .write_all(&takeover_bytes(&Identity::generate(), "phone"))
+        .unwrap();
+    until_paired(&mut glass);
+    assert_eq!(glass.paired_name(), Some("phone"));
 }

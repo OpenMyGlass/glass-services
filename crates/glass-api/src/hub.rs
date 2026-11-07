@@ -7,9 +7,9 @@
 
 use crate::companion::{Out, Refusal, Relay};
 use crate::proto::{
-    ClientFrame, CompanionState, ErrorCode, FocusState, HeadRequest, Hello, LocationStatus,
-    NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings, Topic,
-    WearState, Welcome, client_frame, location_status, screen_request, service_frame,
+    ClientFrame, CompanionPairingWindow, CompanionState, ErrorCode, FocusState, HeadRequest, Hello,
+    LocationStatus, NoteAdd, NoteSpeak, ScreenState, Scroll, ServiceError, ServiceFrame, Settings,
+    Topic, WearState, Welcome, client_frame, location_status, screen_request, service_frame,
 };
 use std::collections::BTreeMap;
 
@@ -53,6 +53,15 @@ pub enum Effect {
     NoteAdd(NoteAdd),
     /// A client asked the companion to read a note aloud.
     NoteSpeak(NoteSpeak),
+    /// A client opened or closed the pairing mode. The owner of the hub holds the link, and
+    /// answers with [`Hub::set_link_pairing`], or with an error to `client`.
+    CompanionPairingWindow {
+        client: ClientId,
+        seq: u32,
+        request: CompanionPairingWindow,
+    },
+    /// A client asked to forget the bonded phone. Answered in the same way.
+    CompanionForgetBond { client: ClientId, seq: u32 },
 }
 
 /// Bounds and merge rule for `SetSettings` (docs/api.md, "Settings").
@@ -202,6 +211,8 @@ struct ClientState {
     hello: bool,
     name: String,
     topics: Vec<Topic>,
+    /// May act for the owner: see [`Hub::allow_privileged`].
+    privileged: bool,
 }
 
 impl ClientState {
@@ -243,7 +254,7 @@ fn frame(body: service_frame::Body) -> ServiceFrame {
     ServiceFrame { body: Some(body) }
 }
 
-fn error(code: ErrorCode, message: &str, seq: u32) -> ServiceFrame {
+pub fn error(code: ErrorCode, message: &str, seq: u32) -> ServiceFrame {
     frame(service_frame::Body::Error(ServiceError {
         code: code as i32,
         message: message.into(),
@@ -346,6 +357,24 @@ impl Hub {
         }
     }
 
+    /// The bond and the pairing mode changed on the link that the owner of the hub holds.
+    pub fn set_link_pairing(
+        &mut self,
+        paired: bool,
+        paired_name: String,
+        pairing_until_us: u64,
+    ) -> Vec<Effect> {
+        let now = self.now();
+        let mut fx = Vec::new();
+        if self
+            .relay
+            .link_pairing(paired, paired_name, pairing_until_us, now)
+        {
+            self.broadcast_companion(&mut fx);
+        }
+        fx
+    }
+
     fn broadcast_companion(&self, fx: &mut Vec<Effect>) {
         let st = self.relay.companion_state();
         for (&id, c) in &self.clients {
@@ -396,6 +425,15 @@ impl Hub {
         self.next_id += 1;
         self.clients.insert(id, ClientState::default());
         id
+    }
+
+    /// Lets `id` send what acts for the owner and is no app's business: the pairing mode and the
+    /// bond. Whoever can do that can bond a phone of their own. The owner of the hub decides, by
+    /// the peer's identity.
+    pub fn allow_privileged(&mut self, id: ClientId) {
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.privileged = true;
+        }
     }
 
     /// Ids of the connected clients.
@@ -668,6 +706,20 @@ impl Hub {
             }
             Some(B::NoteAdd(note)) => fx.push(Effect::NoteAdd(note)),
             Some(B::NoteSpeak(speak)) => fx.push(Effect::NoteSpeak(speak)),
+            Some(B::CompanionPairingWindow(_) | B::CompanionForgetBond(_)) if !state.privileged => {
+                fx.push(Effect::Send(
+                    id,
+                    error(ErrorCode::Denied, "pairing is for the launcher", seq),
+                ));
+            }
+            Some(B::CompanionPairingWindow(request)) => fx.push(Effect::CompanionPairingWindow {
+                client: id,
+                seq,
+                request,
+            }),
+            Some(B::CompanionForgetBond(_)) => {
+                fx.push(Effect::CompanionForgetBond { client: id, seq })
+            }
             // Location comes from the phone (milestone 4); with no companion link there is none.
             Some(B::LocationRequest(_)) => {
                 let status = LocationStatus {
@@ -945,6 +997,41 @@ mod tests {
             S::Error(e) => Some((ErrorCode::try_from(e.code).unwrap(), e.seq)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn only_a_privileged_client_touches_the_pairing_mode_or_the_bond() {
+        use crate::proto::{CompanionForgetBond, CompanionPairingWindow};
+        let mut hub = Hub::new("9.9", &["mock"]);
+        let app = hub.add_client();
+        let launcher = hub.add_client();
+        hub.allow_privileged(launcher);
+        hub.on_frame(app, hello_frame(1));
+        hub.on_frame(launcher, hello_frame(1));
+        let open = cf(C::CompanionPairingWindow(CompanionPairingWindow {
+            open: true,
+            duration_ms: 0,
+        }));
+        let forget = cf(C::CompanionForgetBond(CompanionForgetBond {}));
+        for ask in [open.clone(), forget.clone()] {
+            let fx = hub.on_frame(app, ask);
+            assert_eq!(fx.len(), 1, "{fx:?}");
+            assert!(matches!(
+                &fx[0],
+                Effect::Send(to, ServiceFrame { body: Some(S::Error(e)) })
+                    if *to == app && e.code == ErrorCode::Denied as i32
+            ));
+        }
+        assert!(matches!(
+            hub.on_frame(launcher, open)[..],
+            [Effect::CompanionPairingWindow { client, .. }] if client == launcher
+        ));
+        assert!(matches!(
+            hub.on_frame(launcher, forget)[..],
+            [Effect::CompanionForgetBond { client, .. }] if client == launcher
+        ));
+        // The app is still connected: the refusal is of the request, not of the peer.
+        assert!(hub.clients().any(|c| c == app));
     }
 
     #[test]

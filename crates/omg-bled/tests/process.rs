@@ -313,3 +313,26 @@ fn nobody_listening_drops_the_phone_and_the_next_try_works() {
     b.radio.phone_subscribe(true);
     let _session = b.accept_session();
 }
+
+#[test]
+fn a_controller_that_goes_silent_ends_the_process_with_a_failure() {
+    let mut b = Bench::new();
+    b.wait_ready();
+    // A link comes and goes, and the chip then answers nothing: the command that turns the
+    // advertising back on stays unanswered.
+    b.radio.phone_connects();
+    b.radio.disconnect(0x13);
+    b.uart();
+    let start = Instant::now();
+    let code = loop {
+        // Drained so that the bytes leave, as they would with a chip that takes them and hangs.
+        let mut buf = [0u8; 256];
+        let _ = b.pty.master.read(&mut buf);
+        if let Some(code) = b.child.try_wait().unwrap() {
+            break code;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "it stayed alive");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(code.code(), Some(1));
+}

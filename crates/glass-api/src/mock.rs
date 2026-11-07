@@ -227,6 +227,8 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
         let id = {
             let mut st = shared.lock();
             let id = st.hub.add_client();
+            // A mock for development: every client is the launcher.
+            st.hub.allow_privileged(id);
             st.writers.insert(id, writer);
             id
         };
@@ -319,6 +321,18 @@ fn run_effects(st: &mut State, fx: Vec<Effect>) {
             | Effect::CompanionNotificationAction { .. }
             | Effect::NoteAdd(_)
             | Effect::NoteSpeak(_) => {}
+            // No phone link here: answered as a glassd that does not hold it answers.
+            Effect::CompanionPairingWindow { client, seq, .. }
+            | Effect::CompanionForgetBond { client, seq } => {
+                pending.push_back(Effect::Send(
+                    client,
+                    crate::hub::error(
+                        crate::proto::ErrorCode::Unsupported,
+                        "no phone link in the mock",
+                        seq,
+                    ),
+                ));
+            }
         }
     }
 }
@@ -344,6 +358,32 @@ mod tests {
                 velocity: 0.0,
                 timestamp_us: 1,
             })),
+        }
+    }
+
+    #[test]
+    fn the_pairing_requests_are_answered_unsupported_as_without_a_phone_link() {
+        use crate::proto::{CompanionForgetBond, CompanionPairingWindow};
+        let m = MockService::start().unwrap();
+        let mut c = Client::connect(m.path()).unwrap();
+        let asks = [
+            client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            }),
+            client_frame::Body::CompanionForgetBond(CompanionForgetBond {}),
+        ];
+        for ask in asks {
+            let seq = c.send(ask).unwrap();
+            let f = c
+                .recv_until(T, |f| matches!(f.body, Some(S::Error(_))))
+                .unwrap()
+                .expect("no answer");
+            let Some(S::Error(e)) = f.body else {
+                unreachable!()
+            };
+            assert_eq!(e.code, ErrorCode::Unsupported as i32);
+            assert_eq!(e.seq, seq);
         }
     }
 

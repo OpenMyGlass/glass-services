@@ -65,6 +65,10 @@ pub struct Relay {
     paired: bool,
     /// The live link transport ("bt-rfcomm" / "wifi-tcp"), empty if none.
     transport: String,
+    /// The bonded companion's name, and until when a first pairing may happen (0: closed).
+    /// Reported when glassd itself holds the link.
+    paired_name: String,
+    pairing_until_us: u64,
     changed_us: u64,
     links: BTreeMap<u32, Link>,
     next_link: u32,
@@ -105,12 +109,35 @@ impl Relay {
             snapshot: false,
             timestamp_us: self.changed_us,
             paired: self.paired,
+            paired_name: self.paired_name.clone(),
+            pairing_until_us: self.pairing_until_us,
             transport: if self.provider.is_some() {
                 self.transport.clone()
             } else {
                 String::new()
             },
         }
+    }
+
+    /// The bond and the pairing mode, from glassd's own link: these exist with no provider, which
+    /// registers only once a phone has connected. Returns whether the state changed.
+    pub fn link_pairing(
+        &mut self,
+        paired: bool,
+        paired_name: String,
+        pairing_until_us: u64,
+        now_us: u64,
+    ) -> bool {
+        let changed = paired != self.paired
+            || paired_name != self.paired_name
+            || pairing_until_us != self.pairing_until_us;
+        self.paired = paired;
+        self.paired_name = paired_name;
+        self.pairing_until_us = pairing_until_us;
+        if changed {
+            self.changed_us = now_us;
+        }
+        changed
     }
 
     /// `client` registers as the provider; false if another one is registered.

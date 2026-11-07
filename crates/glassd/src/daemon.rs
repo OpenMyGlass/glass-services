@@ -108,6 +108,9 @@ pub struct Options {
     pub iio_dev: Option<PathBuf>,
     /// Which peers may connect (docs/api.md, "Who may connect").
     pub peers: PeerPolicy,
+    /// The uids, besides glassd's own, that may act for the owner (docs/api.md, "Privileged
+    /// clients"): the launcher's, if it runs as another. Never an app's.
+    pub privileged_uids: Vec<u32>,
     /// Grab the touchpad (`EVIOCGRAB`), so Android's input reader does not also turn its
     /// touches into navigation keys (docs/api.md, "Android glue").
     pub grab_touchpad: bool,
@@ -196,6 +199,7 @@ pub struct Daemon {
     /// passed by Android's init.
     owns_socket: bool,
     peers: PeerPolicy,
+    privileged_uids: Vec<u32>,
     mock_companion: Option<MockCompanion>,
     conns: BTreeMap<ClientId, Conn>,
     device: Option<Device>,
@@ -314,6 +318,13 @@ fn ble_command(ble: &BleOptions, opts: &Options) -> Vec<std::ffi::OsString> {
         "--firmware".into(),
         ble.firmware.clone().into(),
     ]
+}
+
+/// Whether a peer with `uid` may act for the owner: glassd's own uid, and those it was given.
+/// Holds only as far as uids differ: on an image that runs everything as root, everything is.
+fn is_privileged(uid: u32, allowed: &[u32]) -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    uid == unsafe { libc::geteuid() } || allowed.contains(&uid)
 }
 
 /// The capability that says the BLE engine is up, so that a phone can reach this Glass over BLE.
@@ -702,7 +713,8 @@ impl Daemon {
             None => settings_rules::defaults(),
         };
         // On BLE the phone reaches the Glass through Bluetooth, so that is what a new Glass does,
-        // on an image that asks for it. After that it is the owner's setting like any other.
+        // on an image that asks for it. After that it is the owner's setting like any other. The
+        // radio being on bonds nobody: first pairing over BLE takes the owner's pairing mode.
         if ble.is_some() && first_run {
             settings.bluetooth_enabled = Some(true);
         }
@@ -880,6 +892,7 @@ impl Daemon {
             socket_path: opts.socket.clone(),
             owns_socket,
             peers: opts.peers.clone(),
+            privileged_uids: opts.privileged_uids.clone(),
             mock_companion: None,
             conns: BTreeMap::new(),
             device,
@@ -918,6 +931,7 @@ impl Daemon {
         };
         if d.companion.is_some() {
             d.battery_deadline = Some(now().mono_us);
+            d.publish_link_pairing();
         }
         // A previous run may have left the touchpad asleep.
         if d.mock.is_none() {
@@ -988,10 +1002,16 @@ impl Daemon {
                 Some(now().mono_us + wait_ms * 1000)
             }),
             self.companion.as_ref().and_then(|c| {
+                let t = now();
+                let wait_ms = c.pairing_next_deadline()?.saturating_sub(t.boot_us / 1000);
+                Some(t.mono_us + wait_ms * 1000)
+            }),
+            self.companion.as_ref().and_then(|c| {
+                let t = now();
                 let wait_ms = c
                     .handshake_next_deadline()?
-                    .saturating_sub(companion::now_ms());
-                Some(now().mono_us + wait_ms * 1000)
+                    .saturating_sub(t.boot_us / 1000);
+                Some(t.mono_us + wait_ms * 1000)
             }),
             self.radio
                 .as_ref()
@@ -1256,6 +1276,12 @@ impl Daemon {
             .map(|c| c.handshake_tick())
             .unwrap_or_default();
         self.companion_events(events);
+        let events = self
+            .companion
+            .as_mut()
+            .map(|c| c.pairing_tick())
+            .unwrap_or_default();
+        self.companion_events(events);
         if let Some(radio) = &mut self.radio {
             radio.ble_tick(t.mono_us / 1000);
         }
@@ -1323,7 +1349,15 @@ impl Daemon {
                         continue;
                     }
                     let id = self.hub.add_client();
-                    info!("client {id} connected ({who})");
+                    let privileged =
+                        cred.is_some_and(|(uid, _)| is_privileged(uid, &self.privileged_uids));
+                    if privileged {
+                        self.hub.allow_privileged(id);
+                    }
+                    info!(
+                        "client {id} connected ({who}{})",
+                        if privileged { ", privileged" } else { "" }
+                    );
                     self.conns.insert(
                         id,
                         Conn {
@@ -1493,6 +1527,14 @@ impl Daemon {
                         None => companion::notes::refused_speak(&speak),
                     };
                     self.companion_events(events);
+                }
+                Effect::CompanionPairingWindow {
+                    client,
+                    seq,
+                    request,
+                } => self.companion_pairing_window(client, seq, request),
+                Effect::CompanionForgetBond { client, seq } => {
+                    self.companion_forget_bond(client, seq)
                 }
             }
         }
@@ -1930,6 +1972,7 @@ impl Daemon {
                 // settings_changed pushes the result back to the companion.
                 E::SettingsSet(s) => self.apply_settings_change(settings_from_companion(&s)),
                 E::Note(event) => self.publish(service_frame::Body::NoteEvent(event)),
+                E::PairingChanged => self.publish_link_pairing(),
                 E::Notification(n) => self.publish(service_frame::Body::CompanionNotification(
                     to_proto_notification(n),
                 )),
@@ -2007,6 +2050,57 @@ impl Daemon {
             None => Vec::new(),
         };
         self.companion_events(events);
+    }
+
+    fn refuse_client(&mut self, client: ClientId, code: ErrorCode, message: &str, seq: u32) {
+        let frame = glass_api::hub::error(code, message, seq);
+        self.effects(vec![Effect::Send(client, frame)]);
+    }
+
+    fn companion_pairing_window(
+        &mut self,
+        client: ClientId,
+        seq: u32,
+        request: glass_api::proto::CompanionPairingWindow,
+    ) {
+        let Some(c) = &mut self.companion else {
+            let code = ErrorCode::Unsupported;
+            return self.refuse_client(client, code, "glassd does not hold the phone link", seq);
+        };
+        if !request.open {
+            let events = c.close_pairing_window();
+            return self.companion_events(events);
+        }
+        match c.open_pairing_window(request.duration_ms) {
+            Ok(events) => self.companion_events(events),
+            Err(why) => self.refuse_client(client, ErrorCode::Unavailable, &why, seq),
+        }
+    }
+
+    fn companion_forget_bond(&mut self, client: ClientId, seq: u32) {
+        let Some(c) = &mut self.companion else {
+            let code = ErrorCode::Unsupported;
+            return self.refuse_client(client, code, "glassd does not hold the phone link", seq);
+        };
+        let (events, cleared) = c.unpair();
+        self.companion_events(events);
+        if let Err(e) = cleared {
+            let why = format!("the bond is still on disk: {e}");
+            self.refuse_client(client, ErrorCode::Unavailable, &why, seq);
+        }
+    }
+
+    /// Tells the launcher about the bond and the pairing mode. These exist with no provider
+    /// registered, and with no phone connected.
+    fn publish_link_pairing(&mut self) {
+        let Some(c) = &self.companion else { return };
+        let until_us = c
+            .pairing_left_ms()
+            .map_or(0, |left| now().mono_us + left * 1000);
+        let paired = c.paired();
+        let name = c.paired_name().unwrap_or_default().to_string();
+        let fx = self.hub.set_link_pairing(paired, name, until_us);
+        self.effects(fx);
     }
 
     /// A companion authenticated: register as the hub's companion provider (if not already) and
@@ -2128,7 +2222,9 @@ impl Daemon {
         }
         if let Some(addr) = &boot.companion_addr {
             match &mut self.companion {
-                Some(c) => match c.connect_tcp(addr) {
+                // The owner scanned the QR, which is meant for a first pairing: this one
+                // connection may pair. A bonded Glass keeps its bond all the same.
+                Some(c) => match c.dial_to_pair(addr) {
                     Ok(events) => self.companion_events(events),
                     Err(e) => warn!("companion: cannot dial {addr} ({e})"),
                 },
@@ -2623,6 +2719,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -2673,6 +2770,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: true,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -2804,6 +2902,7 @@ mod tests {
             iio: None,
             iio_dev: None,
             peers: PeerPolicy::open(),
+            privileged_uids: Vec::new(),
             grab_touchpad: false,
             radio: false,
             wifi_iface: crate::radio::DEFAULT_WIFI_IFACE.into(),
@@ -2841,6 +2940,138 @@ mod tests {
         daemon.step().unwrap();
         assert!(identity.exists());
         assert_eq!(daemon.companion.as_ref().unwrap().listener_fds().len(), 1);
+    }
+
+    /// What a launcher does for the pairing card, against the real daemon.
+    #[test]
+    fn a_client_clears_the_bond_and_opens_and_closes_the_pairing_mode() {
+        use crate::companion::entropy::testing::FakePool;
+        use glass_api::proto::{CompanionForgetBond, CompanionPairingWindow, ServiceFrame, Topic};
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let store_path = companion::state_file(&state);
+        let mut store = companion::store::Store::create(&store_path).unwrap();
+        store
+            .set_paired(companion::store::record("key".into(), "Telefono".into()))
+            .unwrap();
+        let mut pool = FakePool::new(d.path());
+        pool.seed();
+        let socket = d.path().join("glassd.sock");
+        let opts = Options {
+            mock: false,
+            device: Some(d.path().join("no-touchpad")),
+            radio: false,
+            companion_rng_device: pool.path.clone(),
+            ..ble_opts(d.path(), None)
+        };
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+            let state = |f: ServiceFrame| match f.body {
+                Some(service_frame::Body::CompanionState(s)) => s,
+                other => panic!("{other:?}"),
+            };
+            let is_state =
+                |f: &ServiceFrame| matches!(f.body, Some(service_frame::Body::CompanionState(_)));
+            c.subscribe(&[Topic::Companion]).unwrap();
+            // Known from the start, with no phone and no provider.
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(s.paired && !s.provider);
+            assert_eq!(s.paired_name, "Telefono");
+            assert_eq!(s.pairing_until_us, 0);
+
+            let open = client_frame::Body::CompanionPairingWindow(CompanionPairingWindow {
+                open: true,
+                duration_ms: 0,
+            });
+            // With a bond it would do nothing, and says so.
+            let seq = c.send(open.clone()).unwrap();
+            let f = c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::Error(_)))
+                })
+                .unwrap()
+                .unwrap();
+            let Some(service_frame::Body::Error(e)) = f.body else {
+                unreachable!()
+            };
+            assert_eq!(e.code, ErrorCode::Unavailable as i32);
+            assert_eq!(e.seq, seq);
+
+            c.send(client_frame::Body::CompanionForgetBond(
+                CompanionForgetBond {},
+            ))
+            .unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(!s.paired);
+            assert_eq!(s.paired_name, "");
+            assert_eq!(s.pairing_until_us, 0, "forgetting opens nothing");
+
+            c.send(open).unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert!(s.pairing_until_us > s.timestamp_us);
+
+            c.send(client_frame::Body::CompanionPairingWindow(
+                CompanionPairingWindow {
+                    open: false,
+                    duration_ms: 0,
+                },
+            ))
+            .unwrap();
+            let s = state(c.recv_until(wait, is_state).unwrap().unwrap());
+            assert_eq!(s.pairing_until_us, 0);
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+        // Gone from the disk too.
+        let store = companion::store::Store::load(&store_path).unwrap().unwrap();
+        assert!(store.paired().is_none());
+    }
+
+    #[test]
+    fn a_glassd_that_does_not_hold_the_link_says_so() {
+        use glass_api::proto::CompanionForgetBond;
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join("glassd.sock");
+        let opts = ble_opts(d.path(), None);
+        let mut daemon = Daemon::new(&opts, Box::new(crate::display::LoggingDisplay)).unwrap();
+        let client = std::thread::spawn(move || {
+            let wait = Duration::from_secs(10);
+            let mut c = glass_api::Client::connect_with_timeout(&socket, "t", wait).unwrap();
+            c.send(client_frame::Body::CompanionForgetBond(
+                CompanionForgetBond {},
+            ))
+            .unwrap();
+            let f = c
+                .recv_until(wait, |f| {
+                    matches!(f.body, Some(service_frame::Body::Error(_)))
+                })
+                .unwrap()
+                .unwrap();
+            let Some(service_frame::Body::Error(e)) = f.body else {
+                unreachable!()
+            };
+            assert_eq!(e.code, ErrorCode::Unsupported as i32);
+        });
+        while !client.is_finished() {
+            daemon.step().unwrap();
+        }
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn glassd_s_own_uid_and_the_listed_ones_are_privileged() {
+        // SAFETY: `geteuid` has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(4242);
+        assert!(is_privileged(me, &[]));
+        assert!(!is_privileged(other, &[]));
+        assert!(is_privileged(other, &[other]));
     }
 
     #[test]

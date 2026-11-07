@@ -50,9 +50,10 @@ Deep sleep depends on UART2 idling. What changes:
 | Off | `rfkill block`, then one byte on the port, once per run | The same. Nothing opens the port |
 | On | `rfkill unblock`, `hciconfig` | `rfkill unblock`, then the engine power-cycles the chip and **holds the port open**, with the chip in `Write Sleep Mode` so that BT_WAKE and HOST_WAKE let the UART idle between events |
 | On to off | `rfkill block`, kick | Engine stops first and the port closes, then `rfkill block`, then the kick if it is still due |
-| Engine dies | | `rfkill block` and the kick at once, then up to 3 tries at 5 s, 30 s, 120 s. A missing firmware gets no try. A chip with nobody at the port must not hold the deep sleep back |
+| Engine dies, or cannot start | | `rfkill block` and the kick at once, then up to 3 tries at 5 s, 30 s, 120 s. A missing firmware gets no try. A chip with nobody at the port must not hold the deep sleep back |
+| Engine stuck in the close of the port | | glassd waits 20 ms at most, or 500 ms when stopping it, then kills it and reaps it later. The chip goes off anyway. The kick, the chip coming on and the next start all wait until it has gone |
 
-- **The kick** (`kick_bt_uart`) is for a port that has never transmitted. An engine that came up has transmitted, so the kick is dropped then. It must also never land while the engine owns the port, because a stray byte would break its HCI stream, and it runs only after the engine has gone.
+- **The kick** (`kick_bt_uart`) is for a port that has never transmitted. An engine that came up has transmitted, so the kick is dropped then. It must also never land while the engine owns the port, because a stray byte would break its HCI stream, and it runs only after the engine has gone. A failed bring-up can leave RTS/CTS on the port, so the kick turns flow control off first, throws its byte away if it has not left after 50 ms, and runs on its own thread. Whether CTS and the saved termios really behave that way on this kernel has not been checked on a Glass.
 - **Whether CORE OFF still happens with the port open and the chip on is not known**, and that is why `--companion-ble` is off by default (experiment E5). The prototype measured throughput, not power, and no run of it crossed a suspend.
 - **`omg-bled` asks for 285-300 ms, latency 5** after 5 s of quiet, and for 15-30 ms when more than 200 bytes wait. Whether a phone agrees is its choice, and a refusal is not repeated on that link.
 - **A wake** goes HOST_WAKE, UART, `omg-bled`, socket, glassd's `poll`, then `resume_from_suspend` as on a Wi-Fi wake. Not run yet (E6).
@@ -60,8 +61,9 @@ Deep sleep depends on UART2 idling. What changes:
 
 ## Limits, on purpose
 
-- **Pairing stays as it is:** open, trust on first use, on every transport.
-- One phone at a time. A central that does not subscribe goes after 30 s, and one that does not finish the handshake after 30 s, because a connected stranger stops the advertising. A stranger coming back again and again can still keep the owner out.
+- **First pairing over BLE takes the pairing mode** the owner opens on the Glass ([`api.md`](api.md), "Pairing mode"). Without it a phone is refused with the reason, on BLE as on TCP and RFCOMM. Until the launcher has its card, the `companion-pairing` example of `glass-api` opens the mode. Inside the window the first phone wins, and no code is compared yet.
+- One phone at a time. A central that does not subscribe goes after 30 s, and one that does not finish the handshake after 30 s, because a connected stranger stops the advertising. A stranger coming back again and again can still keep the owner out. A peer that breaks the rules (an L2CAP PDU over the limit, more than 32 answers waiting for the radio) has its link cut, and the engine writes at most 20 log lines per 10 s.
+- A lost controller ends the process, and glassd treats that as any other death of the engine: a command unanswered for 5 s, a UART that takes no bytes for 5 s, a link not ended 40 s after `Disconnect`, or more than 64 garbage bytes in a minute.
 - The address is static and random, kept in `<state-dir>/ble-address`, so the Glass can be recognised by anyone in range.
 - No Bluetooth bonding: SMP is refused, and nothing relies on it.
 

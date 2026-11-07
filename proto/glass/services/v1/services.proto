@@ -36,8 +36,20 @@ message ClientFrame {
     // Notes taken on the Glass, synced to the companion when it is there (docs/api.md "Notes"):
     NoteAdd note_add = 18;
     NoteSpeak note_speak = 19;
+    // First pairing with a phone, on Model B where glassd holds the link (docs/api.md "Pairing mode"):
+    CompanionPairingWindow companion_pairing_window = 20;
+    CompanionForgetBond companion_forget_bond = 21;
   }
 }
+
+// Opens or closes the pairing mode. The result shows in CompanionState.pairing_until_us.
+message CompanionPairingWindow {
+  bool open = 1;
+  uint32 duration_ms = 2;                    // when opening: 0 = 120 s; at most 300 s
+}
+
+// Forgets the bonded phone and ends its link. The result shows in CompanionState.paired.
+message CompanionForgetBond {}
 
 message Hello {
   uint32 api_version = 1;                    // 1; 0 is invalid
@@ -155,7 +167,7 @@ enum ErrorCode {
   ERROR_CODE_INVALID_ARGUMENT = 3;           // a known request with an invalid value
   ERROR_CODE_UNAVAILABLE = 4;                // the source exists but failed (device removed, ...)
   ERROR_CODE_NO_COMPANION = 5;               // dictation without a companion link
-  ERROR_CODE_DENIED = 6;                     // the peer is not allowed on the socket; connection closed
+  ERROR_CODE_DENIED = 6;                     // the peer is not allowed on the socket (connection closed), or not on this request (it stays)
 }
 
 message ServiceError {
@@ -403,7 +415,9 @@ message CompanionState {                     // TOPIC_COMPANION
   bool snapshot = 5;                         // sent because of Subscribe or GetState
   uint64 timestamp_us = 6;                   // time of the change (for a snapshot: of the last change)
   bool paired = 7;                           // a companion is bonded (persisted)
-  string transport = 8;                      // the live link transport: "bt-rfcomm" or "wifi-tcp" (empty if none)
+  string transport = 8;                      // the live link transport: "ble", "bt-rfcomm" or "wifi-tcp" (empty if none)
+  uint64 pairing_until_us = 9;               // the pairing mode is open until this time, on timestamp_us's clock; 0 = closed
+  string paired_name = 10;                   // the bonded phone's name, whether connected or not (empty if none)
 }
 
 // A phone notification relayed to the Glass timeline (glassd -> clients on TOPIC_COMPANION). The

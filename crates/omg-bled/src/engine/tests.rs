@@ -304,6 +304,129 @@ fn a_second_connection_racing_the_advertising_is_refused() {
     );
 }
 
+/// The controller's report of a phone connecting, for a test that decides when it arrives.
+fn connection_complete() -> Vec<u8> {
+    let mut ev = vec![hci::H4_EVENT, hci::EV_LE_META, 19, 1, 0, 0x40, 0];
+    ev.extend_from_slice(&[1, 1, 1, 2, 3, 4, 5, 6, 36, 0, 0, 0, 0xF4, 1, 0]);
+    ev
+}
+
+fn adv_enables(b: &Bench) -> Vec<u8> {
+    b.radio
+        .commands
+        .iter()
+        .filter(|(op, _)| *op == hci::OP_LE_SET_ADV_ENABLE)
+        .map(|(_, p)| p[0])
+        .collect()
+}
+
+/// Up to the point where the UART holds the command `op` of the move to slow advertising, which
+/// the controller has not seen. Returns its bytes.
+fn slow_down_until_in_flight(b: &mut Bench, op: u16, param: Option<u8>) -> Vec<u8> {
+    b.radio.commands.clear();
+    b.now = b.engine.next_deadline().unwrap();
+    b.engine.tick(b.now);
+    loop {
+        let out = b.engine.hci_output().to_vec();
+        assert!(!out.is_empty(), "the command never went out");
+        b.engine.hci_written(out.len());
+        let sent = u16::from_le_bytes([out[1], out[2]]);
+        if sent == op && param.is_none_or(|v| out.get(4) == Some(&v)) {
+            return out;
+        }
+        b.radio.from_host(&out);
+        let back = b.radio.take_to_host();
+        b.engine.on_hci(&back, b.now);
+    }
+}
+
+#[test]
+fn a_connection_stops_the_advertising_by_itself_so_nothing_turns_it_off() {
+    let mut b = Bench::new();
+    b.radio.commands.clear();
+    b.engine.take_logs();
+    b.radio.phone_connects();
+    b.settle();
+    assert_eq!(adv_enables(&b), Vec::<u8>::new());
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn an_enable_in_flight_when_a_phone_connects_is_turned_off_again() {
+    let mut b = Bench::new();
+    let enable = slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(1));
+    // The connection overtakes the enable, which the controller then accepts.
+    b.engine.on_hci(&connection_complete(), b.now);
+    b.radio.from_host(&enable);
+    assert!(b.radio.advertising);
+    b.settle();
+    assert!(!b.radio.advertising, "still advertising on a connection");
+    assert_eq!(adv_enables(&b), vec![0, 1, 0]);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn an_enable_refused_because_of_the_connection_leaves_nothing_to_report_but_itself() {
+    let mut b = Bench::new();
+    slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(1));
+    b.engine.on_hci(&connection_complete(), b.now);
+    b.engine.take_logs();
+    // The enable is refused, so the disable that follows finds it off and is refused too.
+    let op = hci::OP_LE_SET_ADV_ENABLE.to_le_bytes();
+    let refused = [
+        hci::H4_EVENT,
+        hci::EV_COMMAND_COMPLETE,
+        4,
+        1,
+        op[0],
+        op[1],
+        hci::STATUS_COMMAND_DISALLOWED,
+    ];
+    b.engine.on_hci(&refused, b.now);
+    b.settle();
+    assert_eq!(adv_enables(&b), vec![0, 0]);
+    assert!(!b.radio.advertising);
+    assert_eq!(
+        b.engine.take_logs(),
+        vec!["command 200a (01) failed with status 0c".to_string()]
+    );
+    assert_eq!(b.engine.fatal(), None);
+}
+
+#[test]
+fn a_disable_crossing_a_connection_is_not_a_failure() {
+    let mut b = Bench::new();
+    let disable = slow_down_until_in_flight(&mut b, hci::OP_LE_SET_ADV_ENABLE, Some(0));
+    // The phone got in first: the controller stopped, and says so to the disable.
+    b.radio.phone_connects();
+    let connected = b.radio.take_to_host();
+    b.engine.take_logs();
+    b.engine.on_hci(&connected, b.now);
+    b.radio.from_host(&disable);
+    b.settle();
+    // Nothing that was queued to bring the advertising back went out.
+    assert_eq!(adv_enables(&b), vec![0]);
+    assert!(!b.radio.advertising);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
+#[test]
+fn advertising_comes_back_after_a_link_without_a_refused_command() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.take_logs();
+    b.radio.commands.clear();
+    b.radio.disconnect(0x13);
+    b.settle();
+    assert_eq!(adv_enables(&b), vec![1]);
+    assert!(b.radio.advertising);
+    let logs = b.engine.take_logs();
+    assert!(!logs.iter().any(|l| l.contains("failed")), "{logs:?}");
+}
+
 #[test]
 fn advertising_slows_down_once_and_stays_quiet() {
     let mut b = Bench::new();
@@ -389,4 +512,363 @@ fn a_hardware_error_is_fatal() {
     b.engine
         .on_hci(&[hci::H4_EVENT, hci::EV_HARDWARE_ERROR, 1, 7], 0);
     assert!(b.engine.fatal().unwrap().contains("07"));
+}
+
+/// An ACL packet from the phone, past the fake radio, as a peer that breaks the rules can send it.
+fn acl_from_peer(payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![hci::H4_ACL];
+    v.extend_from_slice(&(0x40u16 | (2 << 12)).to_le_bytes());
+    v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+fn l2cap(cid: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = (payload.len() as u16).to_le_bytes().to_vec();
+    v.extend_from_slice(&cid.to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+#[test]
+fn an_oversize_pdu_cuts_the_link_and_a_flood_of_them_writes_one_line() {
+    let mut b = Bench::new();
+    b.radio.phone_connects();
+    b.settle();
+    b.engine.take_logs();
+    let flood = acl_from_peer(&[0xFF, 0xFF, 4, 0]);
+    let mut lines = Vec::new();
+    for _ in 0..1000 {
+        b.engine.on_hci(&flood, b.now);
+        lines.extend(b.engine.take_logs());
+    }
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("over the limit"));
+    b.settle();
+    assert!(!b.radio.connected(), "the link was not cut");
+    assert!(b.radio.advertising);
+}
+
+#[test]
+fn a_peer_coming_back_again_and_again_cannot_flood_the_log() {
+    let mut b = Bench::new();
+    b.engine.take_logs();
+    let flood = acl_from_peer(&[0xFF, 0xFF, 4, 0]);
+    let mut lines = 0;
+    for _ in 0..1000 {
+        b.radio.phone_connects();
+        b.settle();
+        b.engine.on_hci(&flood, b.now);
+        b.settle();
+        lines += b.engine.take_logs().len();
+    }
+    assert!(lines <= LOG_LINES_PER_WINDOW as usize, "{lines} lines");
+
+    // Time passing says how many went, and the budget is back.
+    b.now += LOG_WINDOW_MS;
+    b.engine.tick(b.now);
+    b.settle();
+    let logs = b.engine.take_logs();
+    assert!(
+        logs.iter().any(|l| l.contains("log lines dropped")),
+        "{logs:?}"
+    );
+    b.radio.phone_connects();
+    b.settle();
+    assert!(b.engine.take_logs().iter().any(|l| l.contains("connected")));
+}
+
+#[test]
+fn answers_with_no_credits_are_bounded_and_end_the_link() {
+    let mut b = Bench::new();
+    b.radio.phone_connects();
+    b.settle();
+    // A read by type, which always has an answer. The radio is stalled: nothing returns credits.
+    let request = acl_from_peer(&l2cap(CID_ATT, &[0x08, 6, 0, 11, 0, 0x03, 0x28]));
+    let mut most = 0;
+    for _ in 0..10_000 {
+        b.engine.on_hci(&request, b.now);
+        let out = b.engine.hci_output().to_vec();
+        b.engine.hci_written(out.len());
+        b.radio.from_host(&out);
+        most = most.max(b.engine.control.len());
+    }
+    assert!(most <= CONTROL_QUEUE_MAX, "{most} answers queued");
+    b.settle();
+    assert!(!b.radio.connected(), "the link was not cut");
+    assert_eq!(b.engine.control.len(), 0);
+}
+
+#[test]
+fn a_well_behaved_peer_never_gets_near_the_answer_limit() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    for _ in 0..200 {
+        b.radio.phone_write(b"x");
+        b.air(4);
+        assert!(b.engine.control.len() < CONTROL_QUEUE_MAX);
+    }
+    assert!(b.radio.connected());
+}
+
+/// Takes what the engine wrote, as a controller that has gone silent would.
+fn swallow(b: &mut Bench) {
+    let out = b.engine.hci_output().to_vec();
+    b.engine.hci_written(out.len());
+}
+
+#[test]
+fn a_command_with_no_answer_is_fatal_at_its_deadline() {
+    let mut e = Engine::new("t", [1, 2, 3, 4, 5, 0xC6], ACL_LEN, CREDITS, 1000);
+    let out = e.hci_output().len();
+    e.hci_written(out);
+    assert_eq!(e.next_deadline(), Some(1000 + COMMAND_TIMEOUT_MS));
+    e.tick(1000 + COMMAND_TIMEOUT_MS - 1);
+    assert_eq!(e.fatal(), None);
+    e.tick(1000 + COMMAND_TIMEOUT_MS);
+    assert!(e.fatal().unwrap().contains("did not answer"));
+}
+
+#[test]
+fn an_answered_command_leaves_no_deadline() {
+    let mut b = Bench::new();
+    // Only the slowing of the advertising is left.
+    assert_eq!(b.engine.next_deadline(), Some(FAST_ADV_FOR_MS));
+    b.now = 1_000_000;
+    b.engine.tick(b.now);
+    b.settle();
+    assert_eq!(b.engine.next_deadline(), None);
+    b.engine.tick(b.now + 10 * COMMAND_TIMEOUT_MS);
+    assert_eq!(b.engine.fatal(), None);
+}
+
+#[test]
+fn a_uart_that_takes_nothing_is_fatal() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    // No command in flight: only the stream's bytes are waiting for the UART.
+    b.engine.session_data(&data(20), b.now);
+    assert!(!b.engine.hci_output().is_empty());
+    b.engine.tick(OUTPUT_STALL_MS - 1);
+    // Part of it moves: that buys time.
+    b.engine.hci_written(1);
+    b.engine.tick(2 * OUTPUT_STALL_MS - 2);
+    assert_eq!(b.engine.fatal(), None, "it moved a moment ago");
+    b.engine.tick(2 * OUTPUT_STALL_MS - 1);
+    assert!(b.engine.fatal().unwrap().contains("took no bytes"));
+}
+
+#[test]
+fn a_link_that_is_never_confirmed_ended_is_fatal() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    // Nothing left to send, so glassd closing cuts the link at once.
+    b.engine.session_closed(b.now);
+    // The controller takes the Disconnect, says it started, and then nothing more.
+    swallow(&mut b);
+    let mut status = vec![hci::H4_EVENT, hci::EV_COMMAND_STATUS, 4, 0, 1];
+    status.extend_from_slice(&hci::OP_DISCONNECT.to_le_bytes());
+    b.engine.on_hci(&status, b.now);
+    assert_eq!(b.engine.next_deadline(), Some(CUT_TIMEOUT_MS));
+    b.engine.tick(CUT_TIMEOUT_MS - 1);
+    assert_eq!(b.engine.fatal(), None);
+    b.engine.tick(CUT_TIMEOUT_MS);
+    assert!(b.engine.fatal().unwrap().contains("did not end the link"));
+}
+
+#[test]
+fn a_cut_that_the_controller_refuses_is_fatal_at_once() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.session_closed(b.now);
+    swallow(&mut b);
+    let event = [
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0x0C,
+        0x40,
+        0,
+        0x13,
+    ];
+    b.engine.on_hci(&event, b.now);
+    assert!(b.engine.fatal().unwrap().contains("could not end the link"));
+}
+
+#[test]
+fn a_failed_disconnect_nobody_asked_for_is_only_logged() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    b.engine.take_logs();
+    let event = [
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0x0C,
+        0x40,
+        0,
+        0x13,
+    ];
+    b.engine.on_hci(&event, b.now);
+    assert_eq!(b.engine.fatal(), None);
+    assert_eq!(b.engine.take_logs().len(), 1);
+    assert!(b.radio.connected());
+}
+
+#[test]
+fn a_lost_byte_is_survived_and_a_stream_of_garbage_is_not() {
+    let mut b = Bench::new();
+    b.engine.on_hci(&[0x7F; DESYNC_MAX as usize], b.now);
+    assert_eq!(b.engine.fatal(), None);
+    // A new window forgives what came before.
+    b.now = DESYNC_WINDOW_MS;
+    b.engine.on_hci(&[0x7F; DESYNC_MAX as usize], b.now);
+    assert_eq!(b.engine.fatal(), None);
+    b.engine.on_hci(&[0x7F; 1], b.now);
+    assert!(b.engine.fatal().unwrap().contains("no packet"));
+}
+
+fn connection_complete_on(handle: u16) -> Vec<u8> {
+    let mut ev = connection_complete();
+    ev[5..7].copy_from_slice(&handle.to_le_bytes());
+    ev
+}
+
+fn ltk_request(handle: u16) -> Vec<u8> {
+    let h = handle.to_le_bytes();
+    vec![hci::H4_EVENT, hci::EV_LE_META, 3, 5, h[0], h[1]]
+}
+
+fn disconnect_complete(handle: u16) -> Vec<u8> {
+    let h = handle.to_le_bytes();
+    vec![
+        hci::H4_EVENT,
+        hci::EV_DISCONNECT_COMPLETE,
+        4,
+        0,
+        h[0],
+        h[1],
+        0x13,
+    ]
+}
+
+/// Leaves a command in flight that the controller has not answered, so what follows queues.
+fn hold_a_command_in_flight(b: &mut Bench) -> u16 {
+    b.engine.on_hci(&ltk_request(0x40), b.now);
+    swallow(b);
+    hci::OP_LE_LTK_NEGATIVE
+}
+
+/// Answers the command in flight, then each one that follows, and returns what went out.
+fn answer_commands(b: &mut Bench, in_flight: u16) -> Vec<(u16, Vec<u8>)> {
+    let complete = |op: u16| {
+        let o = op.to_le_bytes();
+        vec![hci::H4_EVENT, hci::EV_COMMAND_COMPLETE, 4, 1, o[0], o[1], 0]
+    };
+    b.engine.on_hci(&complete(in_flight), b.now);
+    let mut sent = Vec::new();
+    loop {
+        let out = b.engine.hci_output().to_vec();
+        if out.is_empty() {
+            return sent;
+        }
+        b.engine.hci_written(out.len());
+        assert_eq!(out[0], hci::H4_COMMAND);
+        let op = u16::from_le_bytes([out[1], out[2]]);
+        sent.push((op, out[4..].to_vec()));
+        b.engine.on_hci(&complete(op), b.now);
+    }
+}
+
+#[test]
+fn what_is_queued_for_a_second_connection_survives_the_end_of_the_first() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.on_hci(&connection_complete_on(0x41), b.now);
+    b.engine.on_hci(&ltk_request(0x41), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert_eq!(
+        sent[0],
+        (hci::OP_DISCONNECT, vec![0x41, 0, 0x13]),
+        "{sent:?}"
+    );
+    assert_eq!(
+        sent[1],
+        (hci::OP_LE_LTK_NEGATIVE, vec![0x41, 0]),
+        "{sent:?}"
+    );
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
+}
+
+#[test]
+fn what_is_queued_for_a_second_connection_survives_a_new_first_one() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.on_hci(&connection_complete_on(0x41), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    b.engine.on_hci(&connection_complete_on(0x42), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert_eq!(sent, vec![(hci::OP_DISCONNECT, vec![0x41, 0, 0x13])]);
+}
+
+#[test]
+fn nothing_queued_for_a_link_that_ended_goes_out_where_its_handle_may_be_reused() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    b.engine.session_closed(b.now);
+    b.engine.on_hci(&ltk_request(0x40), b.now);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held);
+    assert!(
+        sent.iter()
+            .all(|(op, _)| *op != hci::OP_DISCONNECT && *op != hci::OP_LE_LTK_NEGATIVE),
+        "{sent:?}"
+    );
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
+}
+
+#[test]
+fn an_answer_to_another_command_leaves_the_one_in_flight_waiting() {
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held = hold_a_command_in_flight(&mut b);
+    // Something else to send, behind the command in flight.
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let by = b.engine.next_deadline();
+    let reset = hci::OP_RESET.to_le_bytes();
+    let stray = [
+        hci::H4_EVENT,
+        hci::EV_COMMAND_COMPLETE,
+        4,
+        1,
+        reset[0],
+        reset[1],
+        0,
+    ];
+    b.engine.on_hci(&stray, b.now);
+    let credits_only = [hci::H4_EVENT, hci::EV_COMMAND_COMPLETE, 3, 1, 0, 0];
+    b.engine.on_hci(&credits_only, b.now);
+    assert!(
+        b.engine.hci_output().is_empty(),
+        "the next command went out early"
+    );
+    assert_eq!(b.engine.next_deadline(), by, "the deadline moved");
+    b.engine.tick(b.now + COMMAND_TIMEOUT_MS);
+    assert!(
+        b.engine.fatal().is_some(),
+        "the unanswered command was forgotten"
+    );
+
+    // The right answer lets the next one go.
+    let mut b = Bench::new();
+    b.connect_and_subscribe();
+    let held2 = hold_a_command_in_flight(&mut b);
+    assert_eq!(held, held2);
+    b.engine.on_hci(&disconnect_complete(0x40), b.now);
+    let sent = answer_commands(&mut b, held2);
+    assert_eq!(sent.last().unwrap(), &(hci::OP_LE_SET_ADV_ENABLE, vec![1]));
 }
